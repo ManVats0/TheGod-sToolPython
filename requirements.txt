@@ -25,3 +25,16 @@ boto3>=1.34.0
 google-analytics-data>=0.14.0
 google-api-python-client>=2.70.0
 google-auth>=2.20.0
+fastapi
+uvicorn
+python-multipart
+httpx
+aiohttp
+aiomysql
+anthropic
+pandas
+numpy
+scikit-learn
+python-dotenv
+requests
+google-auth-oauthlib
