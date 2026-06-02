@@ -28,7 +28,7 @@ SMTP_EMAIL = os.getenv("SMTP_EMAIL", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
-GOOGLE_REDIRECT_URI  = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/api/auth/google/callback")
+GOOGLE_REDIRECT_URI  = os.getenv("GOOGLE_REDIRECT_URI", "https://bubbly-empathy-production-7977.up.railway.app/api/auth/google/callback")
 import asyncio
 import secrets
 import secrets as _secrets
@@ -113,8 +113,8 @@ app = FastAPI()
 import os as _os
 
 _allowed_origins = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
+    "https://www.thegodstool.com",
+    "https://thegodstool.com",
 ]
 _frontend_url = _os.getenv("FRONTEND_URL", "")
 if _frontend_url:
