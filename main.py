@@ -2071,9 +2071,6 @@ def check_and_refresh_google(request: Request):
     tokens = _get_session_tokens(session_id)
     if "access_token" not in tokens:
         return {"authenticated": False, "email": ""}
-    creds = _get_valid_credentials(session_id)
-    if not creds:
-        return {"authenticated": False, "email": ""}
     return {
         "authenticated": True,
         "email": tokens.get("email", ""),
