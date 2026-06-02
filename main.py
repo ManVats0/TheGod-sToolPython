@@ -115,9 +115,12 @@ import os as _os
 _allowed_origins = [
     "https://www.thegodstool.com",
     "https://thegodstool.com",
+    "https://www.thegodstool.com/",
+    "http://www.thegodstool.com",
 ]
 _frontend_url = _os.getenv("FRONTEND_URL", "")
-if _frontend_url:
+_frontend_url = _os.getenv("FRONTEND_URL", "")
+if _frontend_url and _frontend_url not in _allowed_origins:
     _allowed_origins.append(_frontend_url)
 
 app.add_middleware(
