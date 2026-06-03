@@ -2427,7 +2427,7 @@ async def ai_custom_clean_route(
     try:
         client = anthropic.Anthropic(api_key=api_key)
         message = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model="claude-haiku-4-5",
             max_tokens=1024,
             messages=[{
                 "role": "user",
@@ -2469,6 +2469,10 @@ Reply with ONLY the Python code, nothing else, no markdown, no backticks."""
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+@app.post("/api/ai-clean")
+async def ai_clean_route(body: dict):
     import anthropic
     csv_preview = body.get("csv_preview", "")[:3000]
     instructions = body.get("instructions", "")
