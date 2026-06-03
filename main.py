@@ -2398,32 +2398,40 @@ async def ga4_fetch_report(body: dict):
             return {"error": f"Property {property_id} not found. Verify the numeric Property ID in GA4 Admin → Property Settings."}
         return {"error": err_str}
 
+@app.post("/api/ai-usage")
+async def ai_usage_route(request: Request):
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header.replace("Bearer ", "").strip()
+    if not token:
+        return {"error": "no_plan", "message": "Not authenticated"}
+    return {"ok": True, "remaining": 50}
+
+
 @app.post("/api/ai-clean")
 async def ai_clean_route(body: dict):
     import anthropic
-    csv_preview = body.get("csv_preview", "")[:3000]  # cap size
+    csv_preview = body.get("csv_preview", "")[:3000]
     instructions = body.get("instructions", "")
-    
+
     api_key = os.getenv("ANTHROPIC_API_KEY", "")
     if not api_key:
-        return {"success": False, "error": "ANTHROPIC_API_KEY not set in credentials.env"}
-    
+        return {"success": False, "error": "ANTHROPIC_API_KEY not set in environment variables"}
+
     try:
         client = anthropic.Anthropic(api_key=api_key)
         message = client.messages.create(
-            model="claude-opus-4-5",
+            model="claude-haiku-4-5-20251001",
             max_tokens=512,
             messages=[{
                 "role": "user",
-                "content": f"""You are a data cleaning assistant. Based on this CSV data and instructions, 
-decide which cleaning steps to apply.
+                "content": f"""You are a data cleaning assistant. Based on this CSV data and instructions, decide which cleaning steps to apply.
 
 CSV sample:
 {csv_preview}
 
 User instruction: {instructions if instructions else 'Apply smart automatic cleaning'}
 
-Reply ONLY with valid JSON, no markdown:
+Reply ONLY with valid JSON, no markdown, no extra text:
 {{"steps": ["remove_duplicates"], "explanation": "reason here"}}
 
 Available steps: remove_duplicates, fill_missing, standardize_text, cap_outliers, remove_empty_rows, fix_dates"""
@@ -2433,7 +2441,7 @@ Available steps: remove_duplicates, fill_missing, standardize_text, cap_outliers
         result = json.loads(text)
         return {"success": True, "steps": result.get("steps", []), "explanation": result.get("explanation", "")}
     except json.JSONDecodeError:
-        return {"success": True, "steps": ["remove_duplicates", "fill_missing"], 
+        return {"success": True, "steps": ["remove_duplicates", "fill_missing"],
                 "explanation": "Applied standard cleaning"}
     except Exception as e:
         return {"success": False, "error": str(e)}
