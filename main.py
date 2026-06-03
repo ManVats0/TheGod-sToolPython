@@ -2407,8 +2407,68 @@ async def ai_usage_route(request: Request):
     return {"ok": True, "remaining": 50}
 
 
-@app.post("/api/ai-clean")
-async def ai_clean_route(body: dict):
+@app.post("/api/ai-custom-clean")
+async def ai_custom_clean_route(
+    file: UploadFile = File(...),
+    instruction: str = Form(""),
+):
+    import anthropic
+
+    api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return {"success": False, "error": "ANTHROPIC_API_KEY not set"}
+
+    contents = await file.read()
+    df = pd.read_csv(io.BytesIO(contents))
+    original_shape = list(df.shape)
+    preview_cols = list(df.columns)
+    sample = df.head(5).fillna("").to_dict("records")
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        message = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
+            messages=[{
+                "role": "user",
+                "content": f"""You are a pandas data cleaning expert. Given this DataFrame info and instruction, write ONLY the pandas Python code to apply the transformation.
+
+Columns: {preview_cols}
+Sample rows: {sample}
+Instruction: {instruction}
+
+Rules:
+- The DataFrame variable is called `df`
+- Write only the transformation code, no imports, no print statements
+- Do not reassign df to a new variable name, use df = ... or df.drop(..., inplace=True) etc
+- Keep it simple and safe
+- Example: df = df[df['age'] <= 100]
+
+Reply with ONLY the Python code, nothing else, no markdown, no backticks."""
+            }]
+        )
+        code = message.content[0].text.strip()
+        code = code.replace("```python", "").replace("```", "").strip()
+
+        local_vars = {"df": df.copy(), "pd": pd, "np": np}
+        exec(code, {"pd": pd, "np": np}, local_vars)
+        df_cleaned = local_vars.get("df", df)
+
+        filename = f"ai_custom_{uuid.uuid4().hex[:8]}.csv"
+        filepath = os.path.join(UPLOAD_DIR, filename)
+        df_cleaned.to_csv(filepath, index=False)
+
+        return {
+            "success": True,
+            "original_shape": original_shape,
+            "cleaned_shape": list(df_cleaned.shape),
+            "download_url": f"/api/download/{filename}",
+            "preview_data": df_cleaned.head(500).fillna("").to_dict("records"),
+            "preview_columns": list(df_cleaned.columns),
+            "code_used": code,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
     import anthropic
     csv_preview = body.get("csv_preview", "")[:3000]
     instructions = body.get("instructions", "")
