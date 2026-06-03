@@ -24,6 +24,7 @@ from pathlib import Path
 
 load_dotenv(dotenv_path=Path(__file__).parent / "credentials.env")
 
+
 SMTP_EMAIL = os.getenv("SMTP_EMAIL", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID", "")
