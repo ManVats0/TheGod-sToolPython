@@ -1,4 +1,3 @@
-# fix
 import os
 os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Request, Response
@@ -23,8 +22,9 @@ from sklearn.impute import KNNImputer
 from dotenv import load_dotenv
 from pathlib import Path
 
-load_dotenv(dotenv_path=Path(__file__).parent / "credentials.env")
-
+_env_path = Path(__file__).parent / "credentials.env"
+if _env_path.exists():
+    load_dotenv(dotenv_path=_env_path)
 
 SMTP_EMAIL = os.getenv("SMTP_EMAIL", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
@@ -2484,7 +2484,20 @@ async def ai_clean_route(body: dict):
         return {"success": False, "error": "ANTHROPIC_API_KEY not set in environment variables"}
 
     try:
+        system_override = body.get("system_override", "")
         client = anthropic.Anthropic(api_key=api_key)
+        if system_override:
+            message = client.messages.create(
+                model="claude-haiku-4-5",
+                max_tokens=512,
+                system=system_override,
+                messages=[{
+                    "role": "user",
+                    "content": f"Instructions: {instructions}\n\nCSV sample:\n{csv_preview}"
+                }]
+            )
+            text = message.content[0].text.strip()
+            return {"success": True, "steps": [], "explanation": text}
         message = client.messages.create(
             model="claude-haiku-4-5",
             max_tokens=512,
@@ -4044,6 +4057,137 @@ async def aws_write_table(body: dict):
 
     return {"success": False, "error": f"Unknown service: {service}"}
 
+@app.post("/api/write-to-source")
+async def write_to_source(
+    request: Request,
+    file: UploadFile = File(...),
+    source_type: str = Form(""),
+    source_name: str = Form(""),
+    session_id: str = Form(""),
+    sheet_id: str = Form(""),
+    tab: str = Form("Sheet1"),
+    mysql_host: str = Form(""),
+    mysql_port: str = Form("3306"),
+    mysql_user: str = Form(""),
+    mysql_password: str = Form(""),
+    mysql_database: str = Form(""),
+    mysql_ssl: str = Form("false"),
+    mysql_table: str = Form(""),
+    bq_key_json: str = Form(""),
+    bq_project: str = Form(""),
+    bq_dataset: str = Form(""),
+    bq_table: str = Form(""),
+    mongo_uri: str = Form(""),
+    mongo_database: str = Form(""),
+    mongo_collection: str = Form(""),
+    aws_service: str = Form(""),
+    aws_region: str = Form("us-east-1"),
+    aws_access_key_id: str = Form(""),
+    aws_secret_access_key: str = Form(""),
+    aws_bucket: str = Form(""),
+    aws_host: str = Form(""),
+    aws_port: str = Form(""),
+    aws_user: str = Form(""),
+    aws_password: str = Form(""),
+    aws_database: str = Form(""),
+    aws_table: str = Form(""),
+    db_type: str = Form("postgres"),
+):
+    import io as _io
+    contents = await file.read()
+    csv_text = contents.decode("utf-8", errors="replace")
+
+    if source_type == "sheets":
+        # Resolve session
+        resolved_session = session_id or _get_session_id(request)
+        tokens = _get_session_tokens(resolved_session) if resolved_session else {}
+        if not tokens.get("access_token"):
+            for sid, tok in _session_store.items():
+                if "access_token" in tok:
+                    tokens = tok
+                    resolved_session = sid
+                    break
+        if not tokens.get("access_token"):
+            return {"success": False, "error": "Not authenticated with Google"}
+        try:
+            creds = Credentials(
+                token=tokens.get("access_token"),
+                refresh_token=tokens.get("refresh_token"),
+                token_uri=tokens.get("token_uri", "https://oauth2.googleapis.com/token"),
+                client_id=tokens.get("client_id", GOOGLE_CLIENT_ID),
+                client_secret=tokens.get("client_secret", GOOGLE_CLIENT_SECRET),
+                scopes=tokens.get("scopes"),
+            )
+            if creds.expired and creds.refresh_token:
+                creds.refresh(GoogleAuthRequest())
+                tokens["access_token"] = creds.token
+                _save_session_tokens(resolved_session, tokens)
+            service = build("sheets", "v4", credentials=creds)
+            df = pd.read_csv(_io.BytesIO(contents))
+            str_df = df.fillna("").astype(str)
+            values = [str_df.columns.tolist()] + str_df.values.tolist()
+            use_tab = tab or "Sheet1"
+            service.spreadsheets().values().clear(
+                spreadsheetId=sheet_id,
+                range=f"{use_tab}!A1:ZZ1000000",
+            ).execute()
+            service.spreadsheets().values().update(
+                spreadsheetId=sheet_id,
+                range=f"{use_tab}!A1",
+                valueInputOption="RAW",
+                body={"values": values},
+            ).execute()
+            return {"success": True, "rows_written": len(df)}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    elif source_type in ("mysql", "cloudsql"):
+        result = await mysql_write_table({
+            "host": mysql_host, "port": mysql_port, "user": mysql_user,
+            "password": mysql_password, "database": mysql_database,
+            "ssl": mysql_ssl == "true", "table": mysql_table,
+            "csvData": csv_text, "mode": "replace",
+        })
+        return result
+
+    elif source_type == "postgres":
+        result = await postgres_write_table({
+            "host": mysql_host, "port": mysql_port, "user": mysql_user,
+            "password": mysql_password, "database": mysql_database,
+            "ssl": mysql_ssl == "true", "table": mysql_table,
+            "csvData": csv_text, "mode": "replace",
+        })
+        return result
+
+    elif source_type == "bigquery":
+        result = await bigquery_write_table({
+            "key_json": bq_key_json, "project": bq_project,
+            "dataset": bq_dataset, "table": bq_table,
+            "csvData": csv_text, "mode": "replace",
+        })
+        return result
+
+    elif source_type == "mongodb":
+        result = await mongo_write_collection({
+            "uri": mongo_uri, "database": mongo_database,
+            "collection": mongo_collection,
+            "csvData": csv_text, "mode": "replace",
+        })
+        return result
+
+    elif source_type == "aws":
+        result = await aws_write_table({
+            "service": aws_service, "region": aws_region,
+            "accessKeyId": aws_access_key_id,
+            "secretAccessKey": aws_secret_access_key,
+            "bucket": aws_bucket, "host": aws_host,
+            "port": aws_port, "user": aws_user,
+            "password": aws_password, "database": aws_database,
+            "table": aws_table, "csvData": csv_text, "mode": "replace",
+        })
+        return result
+
+    return {"success": False, "error": f"Unsupported source type: {source_type}"}
 
 @app.post("/api/update-gsheet")
 async def update_gsheet(request: Request, body: dict):
