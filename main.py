@@ -189,18 +189,12 @@ def get_thread_id(filename: str) -> str:
     return f"<datapro-{key}@datapro.pro>"
 
 def send_email_alert(to_email: str, filename: str, alerts: list):
-    if not SMTP_EMAIL or not SMTP_PASSWORD or not to_email or not alerts:
-        print(f"Email skipped: SMTP_EMAIL={bool(SMTP_EMAIL)}, SMTP_PASSWORD={bool(SMTP_PASSWORD)}, to_email={bool(to_email)}, alerts={len(alerts)}")
+    if not to_email or not alerts:
+        print(f"Email skipped: to_email={bool(to_email)}, alerts={len(alerts)}")
         return
     try:
-        thread_id = get_thread_id(filename)
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"The God's Tool Alert: {filename}"
-        msg["From"] = f"The God's Tool <{SMTP_EMAIL}>"
-        msg["To"] = to_email
-        msg["Message-ID"] = thread_id
-        msg["In-Reply-To"] = thread_id
-        msg["References"] = thread_id
+        from resend import Resend
+        resend_client = Resend(os.getenv("RESEND_API_KEY", ""))
 
         color_map = {
             "missing": "#f97316", "duplicate": "#ef4444",
@@ -247,11 +241,13 @@ def send_email_alert(to_email: str, filename: str, alerts: list):
         </div>
         </body></html>"""
 
-        msg.attach(MIMEText(html, "html"))
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(SMTP_EMAIL, SMTP_PASSWORD)
-            server.sendmail(SMTP_EMAIL, to_email, msg.as_string())
-        print(f"✓ Email sent to {to_email} for {filename}")
+        resend_client.emails.send({
+            "from": "The Gods Tool <noreply@thegodstool.com>",
+            "to": [to_email],
+            "subject": f"Data Quality Alert — {filename}",
+            "html": html
+        })
+        print(f"✓ Resend alert sent to {to_email} for {filename}")
     except Exception as e:
         print(f"✗ Email error: {e}")
 
@@ -1162,8 +1158,8 @@ async def analyze(
             a["link"] = "timeseries" if date_col else "problems"
         notifications.extend(flow_alerts)
 
-    if notify_email and notifications and file:
-        background_tasks.add_task(send_email_alert, notify_email, file.filename, notifications)
+    if notify_email and notifications:
+        background_tasks.add_task(send_email_alert, notify_email, filename_for_meta, notifications)
 
     if missing == 0 and duplicates == 0 and outlier_cols == 0:
         insight = "Your dataset looks clean! No missing values, duplicates, or outliers found."
