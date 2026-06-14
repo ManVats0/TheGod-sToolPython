@@ -193,8 +193,8 @@ def send_email_alert(to_email: str, filename: str, alerts: list):
         print(f"Email skipped: to_email={bool(to_email)}, alerts={len(alerts)}")
         return
     try:
-        from resend import Resend
-        resend_client = Resend(os.getenv("RESEND_API_KEY", ""))
+        import resend
+        resend.api_key = os.getenv("RESEND_API_KEY", "")
 
         color_map = {
             "missing": "#f97316", "duplicate": "#ef4444",
@@ -241,7 +241,7 @@ def send_email_alert(to_email: str, filename: str, alerts: list):
         </div>
         </body></html>"""
 
-        resend_client.emails.send({
+        resend.Emails.send({
             "from": "The Gods Tool <noreply@thegodstool.com>",
             "to": [to_email],
             "subject": f"Data Quality Alert — {filename}",
