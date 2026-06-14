@@ -38,3 +38,4 @@ scikit-learn
 python-dotenv
 requests
 google-auth-oauthlib
+resend
