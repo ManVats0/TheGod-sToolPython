@@ -1354,6 +1354,7 @@ async def clean_data(
     write_mode: str = Form("replace"),
     destination_file: UploadFile = File(None),
     ai_clean: str = Form("false"),
+    ai_custom_instructions: str = Form("[]"),
 ):
     contents = await file.read()
     df = pd.read_csv(io.BytesIO(contents))
@@ -1438,6 +1439,53 @@ async def clean_data(
         for col in df.select_dtypes(include="object").columns:
             df[col] = df[col].fillna(df[col].mode()[0] if not df[col].mode().empty else "unknown")
         print(f" AI Clean applied to {len(df)} rows")
+
+    # ── AI Custom Rules: execute each user-described transformation ──
+    if ai_custom_instructions and ai_custom_instructions != "[]":
+        import anthropic
+        try:
+            instructions_list = json.loads(ai_custom_instructions)
+        except Exception:
+            instructions_list = []
+        api_key = os.getenv("ANTHROPIC_API_KEY", "")
+        if instructions_list and not api_key:
+            print("⚠ AI Custom Rules skipped — ANTHROPIC_API_KEY not set")
+        for instr in instructions_list:
+            if not instr or not api_key:
+                continue
+            try:
+                preview_cols = list(df.columns)
+                sample = df.head(5).fillna("").to_dict("records")
+                client = anthropic.Anthropic(api_key=api_key)
+                message = client.messages.create(
+                    model="claude-haiku-4-5",
+                    max_tokens=1024,
+                    messages=[{
+                        "role": "user",
+                        "content": f"""You are a pandas data cleaning expert. Given this DataFrame info and instruction, write ONLY the pandas Python code to apply the transformation.
+
+Columns: {preview_cols}
+Sample rows: {sample}
+Instruction: {instr}
+
+Rules:
+- The DataFrame variable is called `df`
+- Write only the transformation code, no imports, no print statements
+- Do not reassign df to a new variable name, use df = ... or df.drop(..., inplace=True) etc
+- If replacing a value in a numeric column with a non-numeric value, convert the column to string first (df['col'] = df['col'].astype(str))
+- Keep it simple and safe
+
+Reply with ONLY the Python code, nothing else, no markdown, no backticks."""
+                    }]
+                )
+                code = message.content[0].text.strip()
+                code = code.replace("```python", "").replace("```", "").strip()
+                local_vars = {"df": df, "pd": pd, "np": np}
+                exec(code, {"pd": pd, "np": np}, local_vars)
+                df = local_vars.get("df", df)
+                print(f"✅ AI Custom Rule applied: '{instr}' → {code}")
+            except Exception as e:
+                print(f"⚠ AI Custom Rule failed ('{instr}'): {e}")
 
     # ── Append mode: merge cleaned source onto existing destination ──
     if write_mode == "append" and destination_file:
