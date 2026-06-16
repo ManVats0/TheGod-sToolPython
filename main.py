@@ -1727,8 +1727,7 @@ def get_google_auth_url(request: Request, response: Response):
             "redirect_uris": [GOOGLE_REDIRECT_URI],
         }},
         scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive.readonly",
+            "https://www.googleapis.com/auth/drive.file",
             "openid",
             "https://www.googleapis.com/auth/userinfo.email",
         ],
@@ -1787,8 +1786,7 @@ def google_callback(request: Request, code: str, state: str):
             "redirect_uris": [GOOGLE_REDIRECT_URI],
         }},
         scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive.readonly",
+            "https://www.googleapis.com/auth/drive.file",
             "openid",
             "https://www.googleapis.com/auth/userinfo.email",
         ],
