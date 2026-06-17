@@ -1785,11 +1785,12 @@ def google_callback(request: Request, code: str, state: str):
             "token_uri": "https://oauth2.googleapis.com/token",
             "redirect_uris": [GOOGLE_REDIRECT_URI],
         }},
-        scopes=[
-            "https://www.googleapis.com/auth/drive.file",
-            "openid",
-            "https://www.googleapis.com/auth/userinfo.email",
-        ],
+scopes=[
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/drive.readonly",
+],
         state=state,
     )
     flow.redirect_uri = GOOGLE_REDIRECT_URI
