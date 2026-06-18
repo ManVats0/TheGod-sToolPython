@@ -1152,8 +1152,12 @@ async def analyze(
             a["link"] = "timeseries" if date_col else "problems"
         notifications.extend(flow_alerts)
 
-    if notify_email and notifications:
-        background_tasks.add_task(send_email_alert, notify_email, filename_for_meta, notifications)
+    effective_email = notify_email
+    if not effective_email:
+        saved_data = _load_alert_emails()
+        effective_email = saved_data.get(filename_for_meta) or saved_data.get("_default") or ""
+    if effective_email and notifications:
+        background_tasks.add_task(send_email_alert, effective_email, filename_for_meta, notifications)
 
     if missing == 0 and duplicates == 0 and outlier_cols == 0:
         insight = "Your dataset looks clean! No missing values, duplicates, or outliers found."
