@@ -1727,10 +1727,11 @@ def get_google_auth_url(request: Request, response: Response):
             "redirect_uris": [GOOGLE_REDIRECT_URI],
         }},
         scopes=[
-            "https://www.googleapis.com/auth/drive.file",
-            "openid",
-            "https://www.googleapis.com/auth/userinfo.email",
-        ],
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/drive.readonly",
+],
     )
     flow.redirect_uri = GOOGLE_REDIRECT_URI
     auth_url, state = flow.authorization_url(
@@ -3104,6 +3105,179 @@ async def bigquery_write_table(body: dict):
         return {"success": False, "error": str(e)}
 
         # ── AWS ROUTES ─────────────────────────────────────────────────────────────────
+
+# ── GOOGLE CLOUD STORAGE (GCS) ROUTES ─────────────────────────────────────────
+
+@app.post("/api/gcs/health")
+async def gcs_health(body: dict):
+    try:
+        from google.cloud import storage as gcs_lib
+        from google.oauth2 import service_account
+    except ImportError:
+        return {"healthy": False, "message": "❌ google-cloud-storage not installed.\n   → Run: pip install google-cloud-storage"}
+
+    key_json = body.get("key_json", "")
+    project  = body.get("project", "").strip()
+    bucket   = body.get("bucket", "").strip()
+
+    if not key_json or not project or not bucket:
+        return {"healthy": False, "message": "❌ Service account key JSON, project, and bucket are all required."}
+
+    try:
+        info = json.loads(key_json)
+        creds = service_account.Credentials.from_service_account_info(
+            info,
+            scopes=["https://www.googleapis.com/auth/devstorage.read_write"],
+        )
+        client = gcs_lib.Client(project=project, credentials=creds)
+        bucket_obj = client.bucket(bucket)
+        if not bucket_obj.exists():
+            return {"healthy": False, "message": f"❌ Bucket '{bucket}' not found or not accessible."}
+        return {"healthy": True, "message": "✅ GCS bucket reachable."}
+    except ValueError as e:
+        return {"healthy": False, "message": f"❌ Invalid service account key: {e}"}
+    except Exception as e:
+        msg = str(e)
+        if "403" in msg or "Permission" in msg:
+            friendly = "❌ Permission denied.\n   → Grant the service account Storage Object Admin on this bucket."
+        elif "404" in msg or "not found" in msg.lower():
+            friendly = f"❌ Bucket '{bucket}' not found."
+        else:
+            friendly = f"❌ {msg}"
+        return {"healthy": False, "message": friendly}
+
+
+@app.post("/api/gcs/list-files")
+async def gcs_list_files(body: dict):
+    try:
+        from google.cloud import storage as gcs_lib
+        from google.oauth2 import service_account
+    except ImportError:
+        return {"files": [], "error": "google-cloud-storage not installed"}
+
+    key_json = body.get("key_json", "")
+    project  = body.get("project", "").strip()
+    bucket   = body.get("bucket", "").strip()
+    prefix   = body.get("prefix", "").strip()
+
+    try:
+        info = json.loads(key_json)
+        creds = service_account.Credentials.from_service_account_info(
+            info,
+            scopes=["https://www.googleapis.com/auth/devstorage.read_write"],
+        )
+        client = gcs_lib.Client(project=project, credentials=creds)
+        blobs = client.list_blobs(bucket, prefix=prefix or None)
+        files = [b.name for b in blobs if b.name.lower().endswith(('.csv', '.tsv')) ][:100]
+        return {"files": files}
+    except Exception as e:
+        return {"files": [], "error": str(e)}
+
+
+@app.post("/api/gcs/fetch-file")
+async def gcs_fetch_file(body: dict):
+    try:
+        from google.cloud import storage as gcs_lib
+        from google.oauth2 import service_account
+    except ImportError:
+        return {"error": "google-cloud-storage not installed. Run: pip install google-cloud-storage"}
+
+    key_json = body.get("key_json", "")
+    project  = body.get("project", "").strip()
+    bucket   = body.get("bucket", "").strip()
+    file_path = body.get("file", "").strip()
+
+    if not all([key_json, project, bucket, file_path]):
+        return {"error": f"Missing fields. Got project={project}, bucket={bucket}, file={file_path}"}
+
+    try:
+        info = json.loads(key_json)
+        creds = service_account.Credentials.from_service_account_info(
+            info,
+            scopes=["https://www.googleapis.com/auth/devstorage.read_write"],
+        )
+        client = gcs_lib.Client(project=project, credentials=creds)
+        blob = client.bucket(bucket).blob(file_path)
+        if not blob.exists():
+            return {"error": f"File '{file_path}' not found in bucket '{bucket}'."}
+
+        raw_bytes = blob.download_as_bytes()
+        df = pd.read_csv(io.BytesIO(raw_bytes))
+
+        safe_name = file_path.replace("/", "_").replace(" ", "_")
+        filename = f"gcs_{bucket}_{safe_name}_{uuid.uuid4().hex[:6]}.csv"
+        filepath = os.path.join(UPLOAD_DIR, filename)
+        df.to_csv(filepath, index=False)
+        print(f"✅ GCS fetch-file: {bucket}/{file_path} — {len(df)} rows")
+        return {
+            "rows": len(df),
+            "cols": len(df.columns),
+            "download_url": f"/api/download/{filename}",
+            "filename": filename,
+        }
+    except Exception as e:
+        err_str = str(e)
+        if "403" in err_str or "Permission" in err_str:
+            return {"error": f"Permission denied reading '{file_path}' from bucket '{bucket}'. Check service account roles."}
+        if "404" in err_str or "not found" in err_str.lower():
+            return {"error": f"File '{file_path}' not found in bucket '{bucket}'."}
+        return {"error": err_str}
+
+
+@app.post("/api/gcs/write-file")
+async def gcs_write_file(body: dict):
+    try:
+        from google.cloud import storage as gcs_lib
+        from google.oauth2 import service_account
+    except ImportError:
+        return {"success": False, "error": "google-cloud-storage not installed. Run: pip install google-cloud-storage"}
+
+    key_json = body.get("key_json", "")
+    project  = body.get("project", "").strip()
+    bucket   = body.get("bucket", "").strip()
+    file_path = body.get("file", "").strip()
+    csv_data  = body.get("csvData", "")
+    mode      = body.get("mode", "replace")
+
+    if not csv_data:
+        return {"success": False, "error": "No CSV data provided"}
+    if not all([key_json, project, bucket, file_path]):
+        return {"success": False, "error": "key_json, project, bucket, and file are all required"}
+
+    try:
+        info = json.loads(key_json)
+        creds = service_account.Credentials.from_service_account_info(
+            info,
+            scopes=["https://www.googleapis.com/auth/devstorage.read_write"],
+        )
+        client = gcs_lib.Client(project=project, credentials=creds)
+        blob = client.bucket(bucket).blob(file_path)
+
+        if mode == "append" and blob.exists():
+            existing_bytes = blob.download_as_bytes()
+            existing_df = pd.read_csv(io.BytesIO(existing_bytes))
+            new_df = pd.read_csv(io.StringIO(csv_data))
+            all_cols = list(dict.fromkeys(list(existing_df.columns) + list(new_df.columns)))
+            existing_df = existing_df.reindex(columns=all_cols)
+            new_df = new_df.reindex(columns=all_cols)
+            combined = pd.concat([existing_df, new_df], ignore_index=True)
+            buf = io.StringIO()
+            combined.to_csv(buf, index=False)
+            final_csv = buf.getvalue()
+            rows_written = len(combined)
+        else:
+            final_csv = csv_data
+            rows_written = len(pd.read_csv(io.StringIO(csv_data)))
+
+        blob.upload_from_string(final_csv, content_type="text/csv")
+        print(f"✅ GCS write-file: {bucket}/{file_path} — {rows_written} rows ({mode})")
+        return {"success": True, "rows_written": rows_written, "file": file_path}
+    except Exception as e:
+        err_str = str(e)
+        if "403" in err_str or "Permission" in err_str:
+            return {"success": False, "error": f"Permission denied writing to '{file_path}' in bucket '{bucket}'. Grant Storage Object Admin."}
+        return {"success": False, "error": err_str}
+
 
 # ── REST API ROUTES ───────────────────────────────────────────────────────────
 
