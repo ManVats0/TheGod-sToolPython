@@ -1,0 +1,36 @@
+name: Build Agent Binaries
+
+on:
+  push:
+    tags:
+      - 'agent-v*'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt pyinstaller
+      - run: pyinstaller --onefile --name datapro-agent agent.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: datapro-agent-${{ matrix.os }}
+          path: dist/datapro-agent*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            datapro-agent-ubuntu-latest/datapro-agent
+            datapro-agent-windows-latest/datapro-agent.exe
+            datapro-agent-macos-latest/datapro-agent
