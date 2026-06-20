@@ -684,6 +684,15 @@ async def mysql_tables(body: dict):
     password = body.get("password", "")
     database = body.get("database", "").strip()
     use_ssl  = body.get("ssl", False)
+
+    agent_key = f"{database}@{host}"
+    if agent_key in _agent_connections:
+        try:
+            tables = await _list_tables_via_agent(agent_key)
+            return {"tables": tables}
+        except RuntimeError as e:
+            return {"tables": [], "error": str(e)}
+
     ssl_ctx  = ssl_lib.create_default_context() if use_ssl else None
     try:
         conn = await asyncio.wait_for(
@@ -717,6 +726,14 @@ async def mysql_health(body: dict):
 
     if not all([host, user, database]):
         return {"healthy": False, "message": "❌ host, user, and database are all required."}
+
+    agent_key = f"{database}@{host}"
+    if agent_key in _agent_connections:
+        try:
+            await _query_via_agent(agent_key, "SELECT 1")
+            return {"healthy": True, "message": "✅ Connection healthy (via tunnel agent)."}
+        except RuntimeError as e:
+            return {"healthy": False, "message": f"❌ Tunnel agent error: {str(e)}"}
 
     ssl_ctx = ssl_lib.create_default_context() if use_ssl else None
 
