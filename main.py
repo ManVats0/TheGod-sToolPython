@@ -1731,10 +1731,10 @@ def get_google_auth_url(request: Request, response: Response):
             "redirect_uris": [GOOGLE_REDIRECT_URI],
         }},
         scopes=[
-    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    "https://www.googleapis.com/auth/spreadsheets",
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
-    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/drive.file",
 ],
     )
     flow.redirect_uri = GOOGLE_REDIRECT_URI
@@ -1791,10 +1791,10 @@ def google_callback(request: Request, code: str, state: str):
             "redirect_uris": [GOOGLE_REDIRECT_URI],
         }},
 scopes=[
-    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    "https://www.googleapis.com/auth/spreadsheets",
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
-    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/drive.file",
 ],
         state=state,
     )
@@ -1842,6 +1842,16 @@ scopes=[
         <p>Authentication successful. You can close this tab.</p>
         </body></html>
     """)
+
+@app.get("/api/auth/google/picker-token")
+def get_picker_token(request: Request):
+    session_id = _get_session_id(request)
+    if not session_id:
+        return {"error": "Not authenticated"}
+    creds = _get_valid_credentials(session_id)
+    if not creds:
+        return {"error": "Not authenticated"}
+    return {"access_token": creds.token}
 
 
 @app.get("/api/auth/google/status")
