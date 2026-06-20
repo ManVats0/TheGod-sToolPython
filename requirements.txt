@@ -39,3 +39,11 @@ python-dotenv
 requests
 google-auth-oauthlib
 resend
+websockets
+aiomysql
+asyncpg
+motor
+google-cloud-bigquery
+aiopg
+databricks-sql-connector
+aiohttp
