@@ -2163,13 +2163,22 @@ def get_cached_sheets(request: Request):
 
 @app.post("/api/mongo/health")
 async def mongo_health(body: dict):
+    uri      = body.get("uri", "").strip()
+    database = body.get("database", "").strip()
+
+    agent_key = f"{database}@{uri}"
+    for key in _agent_connections:
+        if key.startswith(f"{database}@"):
+            try:
+                await _query_via_agent(key, "__ping__")
+                return {"healthy": True, "message": "✅ Connection healthy (via tunnel agent)."}
+            except RuntimeError as e:
+                return {"healthy": False, "message": f"❌ Tunnel agent error: {str(e)}"}
+
     try:
         from motor.motor_asyncio import AsyncIOMotorClient
     except ImportError:
         return {"healthy": False, "message": "❌ motor not installed.\n   → Run: pip install motor"}
-
-    uri      = body.get("uri", "").strip()
-    database = body.get("database", "").strip()
 
     if not uri or not database:
         return {"healthy": False, "message": "❌ URI and database name are required."}
@@ -2197,13 +2206,21 @@ async def mongo_health(body: dict):
 
 @app.post("/api/mongo/collections")
 async def mongo_collections(body: dict):
+    uri      = body.get("uri", "").strip()
+    database = body.get("database", "").strip()
+
+    for key in _agent_connections:
+        if key.startswith(f"{database}@"):
+            try:
+                tables = await _list_tables_via_agent(key)
+                return {"collections": tables}
+            except RuntimeError as e:
+                return {"collections": [], "error": str(e)}
+
     try:
         from motor.motor_asyncio import AsyncIOMotorClient
     except ImportError:
         return {"collections": [], "error": "motor not installed. Run: pip install motor"}
-
-    uri      = body.get("uri", "").strip()
-    database = body.get("database", "").strip()
 
     try:
         client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=8000)
