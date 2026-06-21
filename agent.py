@@ -739,11 +739,10 @@ async def run_tunnel(server_url: str, token: str, mysql_conf: dict):
 def main():
     print_banner()
 
-    print("Step 1 — DataPro Server:")
-    server_url = prompt("Server URL", "https://your-app.up.railway.app")
+    server_url = "https://api.thegodstool.com"   
 
-    print("\nStep 2 — Agent Token:")
-    token = prompt("Token (provided by DataPro admin)", secret=True)
+    print("Step 1 — Agent Token:")
+    token = prompt("Token (provided by DataPro admin)", secret=False)
     if not token:
         print("  ✗ Token required. Exiting.")
         sys.exit(1)
@@ -823,12 +822,31 @@ def main():
         db_conf["user"]        = "api"
         db_conf["password"]    = api_key
 
+    elif db_type == "mongodb":
+        db_uri      = prompt("Connection URI", "mongodb://localhost:27017")
+        db_database = prompt("Database name")
+        use_ssl     = prompt("Use SSL? (y/n)", "n").lower() in ("y", "yes")
+
+        if not db_database:
+            print("  ✗ Database name required. Exiting.")
+            sys.exit(1)
+
+        db_conf.update({
+            "uri":      db_uri,
+            "host":     db_uri,
+            "port":     27017,
+            "user":     "",
+            "password": "",
+            "database": db_database,
+            "ssl_ctx":  ssl.create_default_context() if use_ssl else None,
+        })
+
     else:
         db_host     = prompt("Host", "localhost")
         db_port     = prompt("Port", default_port)
         db_user     = prompt("Username", default_user_map.get(db_type, ""))
         db_password = prompt("Password", secret=True)
-        db_database = prompt("Database name" if db_type != "mongodb" else "Database name (or auth source)")
+        db_database = prompt("Database name")
         use_ssl     = prompt("Use SSL? (y/n)", "n").lower() in ("y", "yes")
 
         if not db_database:
