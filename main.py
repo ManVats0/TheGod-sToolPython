@@ -798,6 +798,19 @@ async def mysql_fetch_table(body: dict):
     if not all([host, user, database, table]):
         return {"error": f"Missing required fields. Got: host={host}, user={user}, database={database}, table={table}"}
 
+    agent_key = f"{database}@{host}"
+    if agent_key in _agent_connections:
+        try:
+            rows = await _query_via_agent(agent_key, f"SELECT * FROM `{table}` LIMIT 50000")
+            df = pd.DataFrame(rows)
+            filename = f"mysql_{database}_{table}_{uuid.uuid4().hex[:6]}.csv"
+            filepath = os.path.join(UPLOAD_DIR, filename)
+            df.to_csv(filepath, index=False)
+            print(f"✅ MySQL fetch-table (via tunnel): {database}.{table} — {len(df)} rows")
+            return {"rows": len(df), "cols": len(df.columns), "download_url": f"/api/download/{filename}", "filename": filename}
+        except RuntimeError as e:
+            return {"error": str(e)}
+
     ssl_ctx = ssl_lib.create_default_context() if use_ssl else None
 
     try:
@@ -2233,14 +2246,38 @@ async def mongo_collections(body: dict):
 
 @app.post("/api/mongo/fetch-collection")
 async def mongo_fetch_collection(body: dict):
+    uri        = body.get("uri", "").strip()
+    database   = body.get("database", "").strip()
+    collection = body.get("collection", "").strip()
+
+    for key in _agent_connections:
+        if key.startswith(f"{database}@") and collection:
+            try:
+                request_id = _secrets.token_hex(16)
+                future = asyncio.get_event_loop().create_future()
+                _pending_queries[request_id] = future
+                await _agent_connections[key]["websocket"].send_text(json.dumps({
+                    "type": "query", "request_id": request_id, "collection": collection, "filter": {}, "limit": 50000,
+                }))
+                result = await asyncio.wait_for(future, timeout=30.0)
+                if "error" in result:
+                    return {"error": result["error"]}
+                rows = result.get("rows", [])
+                if not rows:
+                    return {"error": f"Collection '{collection}' is empty or has no documents"}
+                df = pd.DataFrame(rows)
+                filename = f"mongo_{database}_{collection}_{uuid.uuid4().hex[:6]}.csv"
+                filepath = os.path.join(UPLOAD_DIR, filename)
+                df.to_csv(filepath, index=False)
+                print(f"✅ MongoDB fetch-collection (via tunnel): {database}.{collection} — {len(df)} docs")
+                return {"rows": len(df), "cols": len(df.columns), "download_url": f"/api/download/{filename}", "filename": filename}
+            except Exception as e:
+                return {"error": str(e)}
+
     try:
         from motor.motor_asyncio import AsyncIOMotorClient
     except ImportError:
         return {"error": "motor not installed. Run: pip install motor"}
-
-    uri        = body.get("uri", "").strip()
-    database   = body.get("database", "").strip()
-    collection = body.get("collection", "").strip()
 
     if not all([uri, database, collection]):
         return {"error": f"Missing fields. Got database={database}, collection={collection}"}
@@ -2757,10 +2794,6 @@ async def mysql_write_table(body: dict):
 @app.post("/api/postgres/health")
 async def postgres_health(body: dict):
     import asyncio, ssl as ssl_lib
-    try:
-        import asyncpg
-    except ImportError:
-        return {"healthy": False, "message": "❌ asyncpg not installed.\n   → Run: pip install asyncpg"}
 
     host     = body.get("host", "").strip()
     port     = int(body.get("port", 5432))
@@ -2768,6 +2801,19 @@ async def postgres_health(body: dict):
     password = body.get("password", "")
     database = body.get("database", "").strip()
     use_ssl  = body.get("ssl", False)
+
+    agent_key = f"{database}@{host}"
+    if agent_key in _agent_connections:
+        try:
+            await _query_via_agent(agent_key, "SELECT 1")
+            return {"healthy": True, "message": "✅ Connection healthy (via tunnel agent)."}
+        except RuntimeError as e:
+            return {"healthy": False, "message": f"❌ Tunnel agent error: {str(e)}"}
+
+    try:
+        import asyncpg
+    except ImportError:
+        return {"healthy": False, "message": "❌ asyncpg not installed.\n   → Run: pip install asyncpg"}
 
     if not all([host, user, database]):
         return {"healthy": False, "message": "❌ host, user, and database are all required."}
@@ -2811,10 +2857,6 @@ async def postgres_health(body: dict):
 @app.post("/api/postgres/tables")
 async def postgres_tables(body: dict):
     import asyncio, ssl as ssl_lib
-    try:
-        import asyncpg
-    except ImportError:
-        return {"tables": [], "error": "asyncpg not installed. Run: pip install asyncpg"}
 
     host     = body.get("host", "").strip()
     port     = int(body.get("port", 5432))
@@ -2822,6 +2864,20 @@ async def postgres_tables(body: dict):
     password = body.get("password", "")
     database = body.get("database", "").strip()
     use_ssl  = body.get("ssl", False)
+
+    agent_key = f"{database}@{host}"
+    if agent_key in _agent_connections:
+        try:
+            tables = await _list_tables_via_agent(agent_key)
+            return {"tables": tables}
+        except RuntimeError as e:
+            return {"tables": [], "error": str(e)}
+
+    try:
+        import asyncpg
+    except ImportError:
+        return {"tables": [], "error": "asyncpg not installed. Run: pip install asyncpg"}
+
     ssl_ctx  = ssl_lib.create_default_context() if use_ssl else None
 
     try:
@@ -2847,10 +2903,6 @@ async def postgres_tables(body: dict):
 @app.post("/api/postgres/fetch-table")
 async def postgres_fetch_table(body: dict):
     import asyncio, ssl as ssl_lib, io as _io
-    try:
-        import asyncpg
-    except ImportError:
-        return {"error": "asyncpg not installed. Run: pip install asyncpg"}
 
     host     = body.get("host", "").strip()
     port     = int(body.get("port", 5432))
@@ -2862,6 +2914,24 @@ async def postgres_fetch_table(body: dict):
 
     if not all([host, user, database, table]):
         return {"error": f"Missing required fields. Got: host={host}, user={user}, database={database}, table={table}"}
+
+    agent_key = f"{database}@{host}"
+    if agent_key in _agent_connections:
+        try:
+            rows = await _query_via_agent(agent_key, f'SELECT * FROM "{table}" LIMIT 50000')
+            df = pd.DataFrame(rows)
+            filename = f"postgres_{database}_{table}_{uuid.uuid4().hex[:6]}.csv"
+            filepath = os.path.join(UPLOAD_DIR, filename)
+            df.to_csv(filepath, index=False)
+            print(f"✅ PostgreSQL fetch-table (via tunnel): {database}.{table} — {len(df)} rows")
+            return {"rows": len(df), "cols": len(df.columns), "download_url": f"/api/download/{filename}", "filename": filename}
+        except RuntimeError as e:
+            return {"error": str(e)}
+
+    try:
+        import asyncpg
+    except ImportError:
+        return {"error": "asyncpg not installed. Run: pip install asyncpg"}
 
     ssl_ctx = ssl_lib.create_default_context() if use_ssl else None
 
@@ -2994,14 +3064,22 @@ async def postgres_write_table(body: dict):
 
 @app.post("/api/bigquery/health")
 async def bigquery_health(body: dict):
+    key_json = body.get("key_json", "")
+    project  = body.get("project", "").strip()
+
+    agent_key = f"{project}@bigquery.googleapis.com"
+    if agent_key in _agent_connections:
+        try:
+            await _query_via_agent(agent_key, "SELECT 1")
+            return {"healthy": True, "message": "✅ Connection healthy (via tunnel agent)."}
+        except RuntimeError as e:
+            return {"healthy": False, "message": f"❌ Tunnel agent error: {str(e)}"}
+
     try:
         from google.cloud import bigquery as bq
         from google.oauth2 import service_account
     except ImportError:
         return {"healthy": False, "message": "❌ google-cloud-bigquery not installed.\n   → Run: pip install google-cloud-bigquery"}
-
-    key_json = body.get("key_json", "")
-    project  = body.get("project", "").strip()
 
     if not key_json or not project:
         return {"healthy": False, "message": "❌ service account key JSON and project ID are required."}
@@ -3033,15 +3111,23 @@ async def bigquery_health(body: dict):
 
 @app.post("/api/bigquery/tables")
 async def bigquery_tables(body: dict):
+    key_json = body.get("key_json", "")
+    project  = body.get("project", "").strip()
+    dataset  = body.get("dataset", "").strip()
+
+    agent_key = f"{project}@bigquery.googleapis.com"
+    if agent_key in _agent_connections and dataset:
+        try:
+            tables = await _list_tables_via_agent(agent_key)
+            return {"tables": tables, "datasets": []}
+        except RuntimeError as e:
+            return {"tables": [], "datasets": [], "error": str(e)}
+
     try:
         from google.cloud import bigquery as bq
         from google.oauth2 import service_account
     except ImportError:
         return {"tables": [], "error": "google-cloud-bigquery not installed"}
-
-    key_json = body.get("key_json", "")
-    project  = body.get("project", "").strip()
-    dataset  = body.get("dataset", "").strip()
 
     try:
         import json as _json
@@ -3064,16 +3150,30 @@ async def bigquery_tables(body: dict):
 
 @app.post("/api/bigquery/fetch-table")
 async def bigquery_fetch_table(body: dict):
+    key_json = body.get("key_json", "")
+    project  = body.get("project", "").strip()
+    dataset  = body.get("dataset", "").strip()
+    table    = body.get("table", "").strip()
+
+    agent_key = f"{project}@bigquery.googleapis.com"
+    if agent_key in _agent_connections and table:
+        try:
+            sql = f"SELECT * FROM `{project}.{dataset}.{table}` LIMIT 50000"
+            rows = await _query_via_agent(agent_key, sql)
+            df = pd.DataFrame(rows)
+            filename = f"bq_{project}_{dataset}_{table}_{uuid.uuid4().hex[:6]}.csv"
+            filepath = os.path.join(UPLOAD_DIR, filename)
+            df.to_csv(filepath, index=False)
+            print(f"✅ BigQuery fetch-table (via tunnel): {project}.{dataset}.{table} — {len(df)} rows")
+            return {"rows": len(df), "cols": len(df.columns), "download_url": f"/api/download/{filename}", "filename": filename}
+        except RuntimeError as e:
+            return {"error": str(e)}
+
     try:
         from google.cloud import bigquery as bq
         from google.oauth2 import service_account
     except ImportError:
         return {"error": "google-cloud-bigquery not installed"}
-
-    key_json = body.get("key_json", "")
-    project  = body.get("project", "").strip()
-    dataset  = body.get("dataset", "").strip()
-    table    = body.get("table", "").strip()
 
     if not all([key_json, project, dataset, table]):
         return {"error": f"Missing fields. Got project={project}, dataset={dataset}, table={table}"}
@@ -3326,6 +3426,144 @@ async def gcs_write_file(body: dict):
         return {"success": False, "error": err_str}
 
 
+# ── DATABRICKS ROUTES ─────────────────────────────────────────────────────────
+
+@app.post("/api/databricks/health")
+async def databricks_health(body: dict):
+    host      = body.get("host", "").strip()
+    http_path = body.get("httpPath", "").strip()
+    token     = body.get("token", "").strip()
+
+    if not all([host, http_path, token]):
+        return {"healthy": False, "message": "❌ host, httpPath, and token are all required."}
+
+    agent_key_guess = None
+    for key in _agent_connections:
+        if key.endswith(f"@{host}"):
+            agent_key_guess = key
+            break
+    if agent_key_guess:
+        try:
+            await _query_via_agent(agent_key_guess, "SELECT 1")
+            return {"healthy": True, "message": "✅ Connection healthy (via tunnel agent)."}
+        except RuntimeError as e:
+            return {"healthy": False, "message": f"❌ Tunnel agent error: {str(e)}"}
+
+    try:
+        from databricks import sql as databricks_sql
+    except ImportError:
+        return {"healthy": False, "message": "❌ databricks-sql-connector not installed.\n   → Run: pip install databricks-sql-connector"}
+
+    try:
+        loop = asyncio.get_event_loop()
+        def _check():
+            conn = databricks_sql.connect(server_hostname=host, http_path=http_path, access_token=token)
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1")
+            cursor.close()
+            conn.close()
+        await loop.run_in_executor(None, _check)
+        return {"healthy": True, "message": "✅ Databricks connection healthy."}
+    except Exception as e:
+        msg = str(e)
+        if "403" in msg or "401" in msg or "PERMISSION" in msg.upper():
+            friendly = "❌ Access denied.\n   → Check your Personal Access Token is valid and not expired."
+        elif "timeout" in msg.lower():
+            friendly = "❌ Connection timed out.\n   → Confirm the SQL Warehouse is running (not auto-terminated)."
+        else:
+            friendly = f"❌ {msg}"
+        return {"healthy": False, "message": friendly}
+
+
+@app.post("/api/databricks/tables")
+async def databricks_tables(body: dict):
+    host      = body.get("host", "").strip()
+    http_path = body.get("httpPath", "").strip()
+    token     = body.get("token", "").strip()
+    schema    = body.get("schema", "default").strip()
+
+    for key in _agent_connections:
+        if key.endswith(f"@{host}"):
+            try:
+                tables = await _list_tables_via_agent(key)
+                return {"tables": tables}
+            except RuntimeError as e:
+                return {"tables": [], "error": str(e)}
+
+    try:
+        from databricks import sql as databricks_sql
+    except ImportError:
+        return {"tables": [], "error": "databricks-sql-connector not installed"}
+
+    try:
+        loop = asyncio.get_event_loop()
+        def _list():
+            conn = databricks_sql.connect(server_hostname=host, http_path=http_path, access_token=token)
+            cursor = conn.cursor()
+            cursor.tables(schema_name=schema)
+            tables = [row.TABLE_NAME for row in cursor.fetchall()]
+            cursor.close()
+            conn.close()
+            return tables
+        tables = await loop.run_in_executor(None, _list)
+        return {"tables": tables}
+    except Exception as e:
+        return {"tables": [], "error": str(e)}
+
+
+@app.post("/api/databricks/fetch-table")
+async def databricks_fetch_table(body: dict):
+    host      = body.get("host", "").strip()
+    http_path = body.get("httpPath", "").strip()
+    token     = body.get("token", "").strip()
+    catalog   = body.get("catalog", "hive_metastore").strip()
+    schema    = body.get("schema", "default").strip()
+    table     = body.get("table", "").strip()
+
+    if not table:
+        return {"error": "table is required"}
+
+    for key in _agent_connections:
+        if key.endswith(f"@{host}"):
+            try:
+                sql_query = f"SELECT * FROM {catalog}.{schema}.{table} LIMIT 50000"
+                rows = await _query_via_agent(key, sql_query)
+                df = pd.DataFrame(rows)
+                filename = f"databricks_{schema}_{table}_{uuid.uuid4().hex[:6]}.csv"
+                filepath = os.path.join(UPLOAD_DIR, filename)
+                df.to_csv(filepath, index=False)
+                print(f"✅ Databricks fetch-table (via tunnel): {schema}.{table} — {len(df)} rows")
+                return {"rows": len(df), "cols": len(df.columns), "download_url": f"/api/download/{filename}", "filename": filename}
+            except RuntimeError as e:
+                return {"error": str(e)}
+
+    try:
+        from databricks import sql as databricks_sql
+    except ImportError:
+        return {"error": "databricks-sql-connector not installed"}
+
+    try:
+        loop = asyncio.get_event_loop()
+        def _fetch():
+            conn = databricks_sql.connect(server_hostname=host, http_path=http_path, access_token=token)
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT * FROM {catalog}.{schema}.{table} LIMIT 50000")
+            cols = [d[0] for d in cursor.description] if cursor.description else []
+            rows = [dict(zip(cols, row)) for row in cursor.fetchall()]
+            cursor.close()
+            conn.close()
+            return rows
+        rows = await loop.run_in_executor(None, _fetch)
+        df = pd.DataFrame(rows)
+        filename = f"databricks_{schema}_{table}_{uuid.uuid4().hex[:6]}.csv"
+        filepath = os.path.join(UPLOAD_DIR, filename)
+        df.to_csv(filepath, index=False)
+        print(f"✅ Databricks fetch-table: {schema}.{table} — {len(df)} rows")
+        return {"rows": len(df), "cols": len(df.columns), "download_url": f"/api/download/{filename}", "filename": filename}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ── REST API ROUTES ───────────────────────────────────────────────────────────
 
 @app.post("/api/rest/health")
@@ -3343,6 +3581,15 @@ async def rest_health(body: dict):
 
     if not base_url:
         return {"healthy": False, "message": "❌ Base URL is required."}
+
+    rest_domain = base_url.rstrip("/").replace("https://", "").replace("http://", "").split("/")[0]
+    agent_key = f"{rest_domain}@{rest_domain}"
+    if agent_key in _agent_connections:
+        try:
+            await _list_tables_via_agent(agent_key)
+            return {"healthy": True, "message": "✅ REST API reachable (via tunnel agent)."}
+        except RuntimeError as e:
+            return {"healthy": False, "message": f"❌ Tunnel agent error: {str(e)}"}
 
     test_url = base_url.rstrip("/") + "/" + test_path.lstrip("/") if test_path != "/" else base_url
     if test_path == "/":
@@ -3403,6 +3650,15 @@ async def rest_endpoints(body: dict):
     if not base_url:
         return {"endpoints": [], "error": "Base URL is required."}
 
+    rest_domain = base_url.rstrip("/").replace("https://", "").replace("http://", "").split("/")[0]
+    agent_key = f"{rest_domain}@{rest_domain}"
+    if agent_key in _agent_connections:
+        try:
+            agent_endpoints = await _list_tables_via_agent(agent_key)
+            return {"endpoints": [{"endpoint": ep, "url": ep, "status": 200, "ok": True} for ep in agent_endpoints]}
+        except RuntimeError as e:
+            return {"endpoints": [], "error": str(e)}
+
     results = []
     async with aiohttp_lib.ClientSession() as session:
         for ep in endpoints:
@@ -3454,6 +3710,33 @@ async def rest_fetch_endpoint(body: dict):
         return {"error": "Base URL is required."}
 
     url = endpoint if endpoint.startswith("http") else base_url.rstrip("/") + "/" + endpoint.lstrip("/")
+
+    rest_domain = base_url.rstrip("/").replace("https://", "").replace("http://", "").split("/")[0] if base_url else ""
+    agent_key = f"{rest_domain}@{rest_domain}" if rest_domain else ""
+    if agent_key and agent_key in _agent_connections:
+        try:
+            request_id = _secrets.token_hex(16)
+            future = asyncio.get_event_loop().create_future()
+            _pending_queries[request_id] = future
+            await _agent_connections[agent_key]["websocket"].send_text(json.dumps({
+                "type": "query", "request_id": request_id, "endpoint": url,
+                "method": method, "headers": headers, "params": query_params,
+                "body": request_body, "timeout": timeout_val,
+            }))
+            result = await asyncio.wait_for(future, timeout=timeout_val + 5)
+            if "error" in result:
+                return {"error": result["error"]}
+            rows_agent = result.get("rows", [])
+            if not rows_agent:
+                return {"error": "No data returned from endpoint via tunnel agent."}
+            df_agent = pd.DataFrame(rows_agent)
+            filename_agent = f"rest_{uuid.uuid4().hex[:8]}.csv"
+            filepath_agent = os.path.join(UPLOAD_DIR, filename_agent)
+            df_agent.to_csv(filepath_agent, index=False)
+            print(f"✅ REST API fetch (via tunnel): {url} — {len(df_agent)} rows")
+            return {"rows": len(df_agent), "cols": len(df_agent.columns), "download_url": f"/api/download/{filename_agent}", "filename": filename_agent, "endpoint": endpoint, "url": url}
+        except Exception as e:
+            return {"error": str(e)}
 
     def extract_rows(data: any, path: str) -> list:
         """Navigate dot-notation path in JSON, return list of rows."""
@@ -3777,6 +4060,15 @@ async def aws_cost_explorer(body: dict):
         if not all([host, user, database]):
             return {"healthy": False, "message": "❌ host, user, and database are required."}
 
+        if service == "redshift":
+            agent_key = f"{database}@{host}"
+            if agent_key in _agent_connections:
+                try:
+                    await _query_via_agent(agent_key, "SELECT 1")
+                    return {"healthy": True, "message": "✅ AWS Redshift connection healthy (via tunnel agent)."}
+                except RuntimeError as e:
+                    return {"healthy": False, "message": f"❌ Tunnel agent error: {str(e)}"}
+
         default_ports = {"rds-mysql": 3306, "rds-postgres": 5432, "redshift": 5439}
         port = int(port_raw) if port_raw else default_ports.get(service, 5432)
 
@@ -3954,6 +4246,16 @@ async def aws_tables(body: dict):
         password = body.get("password", "")
         database = body.get("database", "").strip()
         use_ssl  = body.get("ssl", True)
+
+        if service == "redshift":
+            agent_key = f"{database}@{host}"
+            if agent_key in _agent_connections:
+                try:
+                    tables = await _list_tables_via_agent(agent_key)
+                    return {"tables": tables}
+                except RuntimeError as e:
+                    return {"tables": [], "error": str(e)}
+
         ssl_ctx  = ssl_lib.create_default_context() if use_ssl else None
         try:
             import asyncpg
@@ -4087,6 +4389,21 @@ async def aws_fetch_table(body: dict):
         password = body.get("password", "")
         database = body.get("database", "").strip()
         use_ssl  = body.get("ssl", True)
+
+        if service == "redshift":
+            agent_key = f"{database}@{host}"
+            if agent_key in _agent_connections:
+                try:
+                    rows_agent = await _query_via_agent(agent_key, f'SELECT * FROM "{table}" LIMIT 50000')
+                    df_agent = pd.DataFrame(rows_agent)
+                    filename_agent = f"aws_redshift_{uuid.uuid4().hex[:6]}.csv"
+                    filepath_agent = os.path.join(UPLOAD_DIR, filename_agent)
+                    df_agent.to_csv(filepath_agent, index=False)
+                    print(f"✅ AWS Redshift fetch-table (via tunnel): {table} — {len(df_agent)} rows")
+                    return {"rows": len(df_agent), "cols": len(df_agent.columns), "download_url": f"/api/download/{filename_agent}", "filename": filename_agent}
+                except RuntimeError as e:
+                    return {"error": str(e)}
+
         ssl_ctx  = ssl_lib.create_default_context() if use_ssl else None
         try:
             import asyncpg
