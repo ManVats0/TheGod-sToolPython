@@ -1565,6 +1565,18 @@ def download(filename: str):
     return FileResponse(filepath, media_type="text/csv", filename=filename)
 
 
+@app.get("/download/agent.py")
+def download_agent_script():
+    agent_path = Path(__file__).parent / "agent.py"
+    if not agent_path.exists():
+        return {"error": "agent.py not found on server"}
+    return FileResponse(
+        agent_path,
+        media_type="text/x-python",
+        filename="agent.py",
+    )
+
+
 # ── ADAPTIVE PIPELINE ROUTES ───────────────────────────────────────────────────
 # These serve the FlowPage.tsx component.
 # Data is persisted in META_DIR as JSON files keyed by pipeline_id.
