@@ -2166,11 +2166,10 @@ async def mongo_health(body: dict):
     uri      = body.get("uri", "").strip()
     database = body.get("database", "").strip()
 
-    agent_key = f"{database}@{uri}"
     for key in _agent_connections:
         if key.startswith(f"{database}@"):
             try:
-                await _query_via_agent(key, "__ping__")
+                await _list_tables_via_agent(key)
                 return {"healthy": True, "message": "✅ Connection healthy (via tunnel agent)."}
             except RuntimeError as e:
                 return {"healthy": False, "message": f"❌ Tunnel agent error: {str(e)}"}
