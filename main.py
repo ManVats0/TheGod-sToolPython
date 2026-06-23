@@ -526,6 +526,38 @@ def root():
     return {"message": "Backend OK"}
 
 
+@app.post("/api/contact")
+async def submit_contact(body: dict):
+    name = (body.get("name") or "").strip()
+    email = (body.get("email") or "").strip()
+    message = (body.get("message") or "").strip()
+
+    if not name or not email or not message:
+        return {"success": False, "error": "Name, email, and message are all required."}
+
+    try:
+        import resend
+        resend.api_key = os.getenv("RESEND_API_KEY", "")
+        resend.Emails.send({
+            "from": "The Gods Tool <noreply@thegodstool.com>",
+            "to": ["contact@thegodstool.com"],
+            "reply_to": email,
+            "subject": f"New contact form message from {name}",
+            "html": f"""
+            <div style="font-family:sans-serif;max-width:600px;">
+              <h2>New Contact Form Submission</h2>
+              <p><b>Name:</b> {name}</p>
+              <p><b>Email:</b> {email}</p>
+              <p><b>Message:</b></p>
+              <p style="background:#f4f4f4;padding:16px;border-radius:8px;">{message}</p>
+            </div>
+            """
+        })
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 # ── Agent WebSocket tunnel ────────────────────────────────────────────────────
 
 @app.websocket("/ws/agent")
