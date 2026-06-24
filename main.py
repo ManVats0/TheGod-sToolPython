@@ -3,8 +3,17 @@ os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi import Body
+from pydantic import BaseModel
 from dotenv import load_dotenv
 from pathlib import Path
+
+# ── Pydantic Models ────────────────────────────────────────────────────────
+class ContactFormRequest(BaseModel):
+    name: str
+    email: str
+    message: str
+
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
@@ -526,11 +535,44 @@ def root():
     return {"message": "Backend OK"}
 
 
-@app.post("/api/contact")
-async def submit_contact(body: dict):
+@app.post("/api/feedback")
+async def submit_feedback(body: dict):
     name = (body.get("name") or "").strip()
     email = (body.get("email") or "").strip()
-    message = (body.get("message") or "").strip()
+    feedback = (body.get("feedback") or "").strip()
+
+    if not email or not feedback:
+        return {"success": False, "error": "Email and feedback are required."}
+
+    try:
+        import resend
+        resend.api_key = os.getenv("RESEND_API_KEY", "")
+        resend.Emails.send({
+            "from": "The Gods Tool <noreply@thegodstool.com>",
+            "to": ["aman@thegodstool.com"],
+            "reply_to": email,
+            "subject": f"Feedback from {name or email}",
+            "html": f"""
+            <div style="font-family:sans-serif;max-width:600px;">
+              <h2>New User Feedback</h2>
+              <p><b>Email:</b> {email}</p>
+              <p><b>Name:</b> {name or '(not provided)'}</p>
+              <p><b>Feedback:</b></p>
+              <p style="background:#f4f4f4;padding:16px;border-radius:8px;white-space:pre-wrap;">{feedback}</p>
+            </div>
+            """
+        })
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/contact")
+async def submit_contact(request: ContactFormRequest = Body(...)):
+    """Handle contact form submissions and send via Resend."""
+    name = (request.name or "").strip()
+    email = (request.email or "").strip()
+    message = (request.message or "").strip()
 
     if not name or not email or not message:
         return {"success": False, "error": "Name, email, and message are all required."}
@@ -544,17 +586,19 @@ async def submit_contact(body: dict):
             "reply_to": email,
             "subject": f"New contact form message from {name}",
             "html": f"""
-            <div style="font-family:sans-serif;max-width:600px;">
-              <h2>New Contact Form Submission</h2>
-              <p><b>Name:</b> {name}</p>
-              <p><b>Email:</b> {email}</p>
-              <p><b>Message:</b></p>
-              <p style="background:#f4f4f4;padding:16px;border-radius:8px;">{message}</p>
+            <div style="font-family:sans-serif;max-width:600px;background:#f9f9f9;padding:20px;border-radius:8px;">
+              <h2 style="color:#333;margin-top:0;">New Contact Form Submission</h2>
+              <p style="margin:10px 0;"><strong>Name:</strong> {name}</p>
+              <p style="margin:10px 0;"><strong>Email:</strong> {email}</p>
+              <p style="margin:10px 0;"><strong>Message:</strong></p>
+              <p style="background:#fff;padding:16px;border-left:4px solid #7c3aed;border-radius:4px;color:#555;margin:10px 0;">{message}</p>
             </div>
             """
         })
+        print(f"✓ Contact form email sent from {email}")
         return {"success": True}
     except Exception as e:
+        print(f"✗ Contact form error: {e}")
         return {"success": False, "error": str(e)}
 
 
