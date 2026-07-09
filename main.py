@@ -592,7 +592,7 @@ async def submit_contact(request: ContactFormRequest = Body(...)):
               <p style="margin:10px 0;"><strong>Email:</strong> {email}</p>
               <p style="margin:10px 0;"><strong>Message:</strong></p>
               <p style="background:#fff;padding:16px;border-left:4px solid #7c3aed;border-radius:4px;color:#555;margin:10px 0;">{message}</p>
-            </div>
+            </div> 
             """
         })
         print(f"✓ Contact form email sent from {email}")
@@ -895,12 +895,17 @@ async def mysql_fetch_table(body: dict):
                 password=password, db=database, ssl=ssl_ctx, connect_timeout=10),
             timeout=12,
         )
+        async with conn.cursor() as count_cur:
+            await count_cur.execute(f"SELECT COUNT(*) FROM `{table}`")
+            total_rows = (await count_cur.fetchone())[0]
+
         async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute(f"SELECT * FROM `{table}` LIMIT 50000")
+            await cur.execute(f"SELECT * FROM `{table}` LIMIT 500000")
             rows = await cur.fetchall()
         conn.close()
 
         df = pd.DataFrame(list(rows))
+        truncated = total_rows > len(df)
         filename = f"mysql_{database}_{table}_{uuid.uuid4().hex[:6]}.csv"
         filepath = os.path.join(UPLOAD_DIR, filename)
         df.to_csv(filepath, index=False)
@@ -910,6 +915,8 @@ async def mysql_fetch_table(body: dict):
             "cols": len(df.columns),
             "download_url": f"/api/download/{filename}",
             "filename": filename,
+            "total_rows_in_source": total_rows,
+            "truncated": truncated,
         }
     except asyncio.TimeoutError:
         return {"error": f"Connection timed out reaching {host}:{port}"}
@@ -965,7 +972,8 @@ async def analyze(
                 return {"error": "No tables found in this database."}
             table_name = mysql_table if mysql_table and mysql_table in tables else tables[0]
             print(f"PostgreSQL analyze — using table: '{table_name}'")
-            rows_data = await conn.fetch(f'SELECT * FROM "{table_name}" LIMIT 50000')
+            analyze_total_rows = await conn.fetchval(f'SELECT COUNT(*) FROM "{table_name}"')
+            rows_data = await conn.fetch(f'SELECT * FROM "{table_name}" LIMIT 500000')
             await conn.close()
             import io as _io
             df_pg = pd.DataFrame([dict(r) for r in rows_data])
@@ -1003,8 +1011,11 @@ async def analyze(
             print(f"MySQL analyze — tables found: {tables}, requested table: '{mysql_table}'")
             table_name = mysql_table if mysql_table and mysql_table in tables else tables[0]
             print(f"MySQL analyze — using table: '{table_name}'")
+            async with conn.cursor() as count_cur:
+                await count_cur.execute(f"SELECT COUNT(*) FROM `{table_name}`")
+                analyze_total_rows = (await count_cur.fetchone())[0]
             async with conn.cursor(aiomysql.DictCursor) as cur:
-                await cur.execute(f"SELECT * FROM `{table_name}` LIMIT 50000")
+                await cur.execute(f"SELECT * FROM `{table_name}` LIMIT 500000")
                 rows = await cur.fetchall()
             conn.close()
             import io as _io
@@ -1321,7 +1332,9 @@ async def analyze(
             "date_col": date_col,
             "frequency": freq_label,
             "chart_data": ts_chart_data
-        }
+        },
+        "total_rows_in_source": locals().get("analyze_total_rows"),
+        "truncated": locals().get("analyze_total_rows", 0) > len(df) if "analyze_total_rows" in locals() else False
     }
 
 @app.post("/api/preview-transform")
@@ -2374,13 +2387,15 @@ async def mongo_fetch_collection(body: dict):
         client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=8000)
         db = client[database]
         coll = db[collection]
-        cursor = coll.find({}, {"_id": 0}, limit=50000)
-        docs = await cursor.to_list(length=50000)
+        total_rows = await coll.count_documents({})
+        cursor = coll.find({}, {"_id": 0}, limit=500000)
+        docs = await cursor.to_list(length=500000)
         client.close()
 
         if not docs:
             return {"error": f"Collection '{collection}' is empty or has no documents"}
 
+        truncated = total_rows > len(docs)
         df = pd.DataFrame(docs)
         # Flatten any nested dict columns to string for CSV compatibility
         for col in df.columns:
@@ -2396,6 +2411,8 @@ async def mongo_fetch_collection(body: dict):
             "cols": len(df.columns),
             "download_url": f"/api/download/{filename}",
             "filename": filename,
+            "total_rows_in_source": total_rows,
+            "truncated": truncated,
         }
     except Exception as e:
         return {"error": str(e)}
@@ -2572,6 +2589,7 @@ async def ga4_fetch_report(body: dict):
                 all_rows.append(record)
 
             offset += len(response.rows)
+            ga4_total_rows = response.row_count
             if offset >= response.row_count:
                 break
             if len(all_rows) >= row_limit:
@@ -2579,6 +2597,8 @@ async def ga4_fetch_report(body: dict):
 
         if not all_rows:
             return {"error": f"No data returned for property {property_id} in date range {start_date} to {end_date}. Check that your GA4 property has data."}
+
+        ga4_truncated = ga4_total_rows > len(all_rows)
 
         df = pd.DataFrame(all_rows)
 
@@ -2601,6 +2621,8 @@ async def ga4_fetch_report(body: dict):
             "metrics": metric_list,
             "dimensions": dimension_list,
             "date_range": f"{start_date} → {end_date}",
+            "total_rows_in_source": ga4_total_rows,
+            "truncated": ga4_truncated,
         }
     except Exception as e:
         err_str = str(e)
@@ -3032,9 +3054,11 @@ async def postgres_fetch_table(body: dict):
             ),
             timeout=12,
         )
-        rows = await conn.fetch(f'SELECT * FROM "{table}" LIMIT 50000')
+        total_rows = await conn.fetchval(f'SELECT COUNT(*) FROM "{table}"')
+        rows = await conn.fetch(f'SELECT * FROM "{table}" LIMIT 500000')
         await conn.close()
 
+        truncated = total_rows > len(rows)
         safe_rows = []
         for row in rows:
             safe = {}
@@ -3057,6 +3081,8 @@ async def postgres_fetch_table(body: dict):
             "cols": len(df.columns),
             "download_url": f"/api/download/{filename}",
             "filename": filename,
+            "total_rows_in_source": total_rows,
+            "truncated": truncated,
         }
     except asyncio.TimeoutError:
         return {"error": f"Connection timed out reaching {host}:{port}"}
@@ -3274,8 +3300,11 @@ async def bigquery_fetch_table(body: dict):
             scopes=["https://www.googleapis.com/auth/bigquery"],
         )
         client = bq.Client(project=project, credentials=creds)
-        query = f"SELECT * FROM `{project}.{dataset}.{table}` LIMIT 50000"
+        count_query = f"SELECT COUNT(*) as total FROM `{project}.{dataset}.{table}`"
+        total_rows = list(client.query(count_query).result())[0]["total"]
+        query = f"SELECT * FROM `{project}.{dataset}.{table}` LIMIT 500000"
         df = client.query(query).to_dataframe()
+        truncated = total_rows > len(df)
         filename = f"bq_{project}_{dataset}_{table}_{uuid.uuid4().hex[:6]}.csv"
         filepath = os.path.join(UPLOAD_DIR, filename)
         df.to_csv(filepath, index=False)
@@ -3285,6 +3314,8 @@ async def bigquery_fetch_table(body: dict):
             "cols": len(df.columns),
             "download_url": f"/api/download/{filename}",
             "filename": filename,
+            "total_rows_in_source": total_rows,
+            "truncated": truncated,
         }
     except Exception as e:
         return {"error": str(e)}
@@ -3635,19 +3666,29 @@ async def databricks_fetch_table(body: dict):
         def _fetch():
             conn = databricks_sql.connect(server_hostname=host, http_path=http_path, access_token=token)
             cursor = conn.cursor()
-            cursor.execute(f"SELECT * FROM {catalog}.{schema}.{table} LIMIT 50000")
+            cursor.execute(f"SELECT COUNT(*) FROM {catalog}.{schema}.{table}")
+            db_total_rows = cursor.fetchone()[0]
+            cursor.execute(f"SELECT * FROM {catalog}.{schema}.{table} LIMIT 500000")
             cols = [d[0] for d in cursor.description] if cursor.description else []
             rows = [dict(zip(cols, row)) for row in cursor.fetchall()]
             cursor.close()
             conn.close()
-            return rows
-        rows = await loop.run_in_executor(None, _fetch)
+            return rows, db_total_rows
+        rows, db_total_rows = await loop.run_in_executor(None, _fetch)
         df = pd.DataFrame(rows)
+        db_truncated = db_total_rows > len(df)
         filename = f"databricks_{schema}_{table}_{uuid.uuid4().hex[:6]}.csv"
         filepath = os.path.join(UPLOAD_DIR, filename)
         df.to_csv(filepath, index=False)
         print(f"✅ Databricks fetch-table: {schema}.{table} — {len(df)} rows")
-        return {"rows": len(df), "cols": len(df.columns), "download_url": f"/api/download/{filename}", "filename": filename}
+        return {
+            "rows": len(df),
+            "cols": len(df.columns),
+            "download_url": f"/api/download/{filename}",
+            "filename": filename,
+            "total_rows_in_source": db_total_rows,
+            "truncated": db_truncated,
+        }
     except Exception as e:
         return {"error": str(e)}
 
@@ -4462,11 +4503,15 @@ async def aws_fetch_table(body: dict):
                     password=password, db=database, ssl=ssl_ctx, connect_timeout=10),
                 timeout=12,
             )
+            async with conn.cursor() as count_cur:
+                await count_cur.execute(f"SELECT COUNT(*) FROM `{table}`")
+                aws_total_rows = (await count_cur.fetchone())[0]
             async with conn.cursor(aiomysql.DictCursor) as cur:
-                await cur.execute(f"SELECT * FROM `{table}` LIMIT 50000")
+                await cur.execute(f"SELECT * FROM `{table}` LIMIT 500000")
                 rows = await cur.fetchall()
             conn.close()
             df = pd.DataFrame(list(rows))
+            aws_truncated = aws_total_rows > len(df)
         except Exception as e:
             return {"error": str(e)}
 
@@ -4500,8 +4545,10 @@ async def aws_fetch_table(body: dict):
                     password=password, database=database, ssl=ssl_ctx, timeout=10),
                 timeout=12,
             )
-            rows = await conn.fetch(f'SELECT * FROM "{table}" LIMIT 50000')
+            aws_total_rows = await conn.fetchval(f'SELECT COUNT(*) FROM "{table}"')
+            rows = await conn.fetch(f'SELECT * FROM "{table}" LIMIT 500000')
             await conn.close()
+            aws_truncated = aws_total_rows > len(rows)
             safe_rows = []
             for row in rows:
                 safe = {}
@@ -4539,13 +4586,15 @@ async def aws_fetch_table(body: dict):
                 aws_secret_access_key=secret_key)
             dyn_table = dynamo.Table(table)
             items = []
-            scan_kwargs = {"Limit": 50000}
+            scan_kwargs = {"Limit": 500000}
             response = dyn_table.scan(**scan_kwargs)
             items.extend(response.get("Items", []))
-            while "LastEvaluatedKey" in response and len(items) < 50000:
+            aws_truncated = "LastEvaluatedKey" in response
+            while "LastEvaluatedKey" in response and len(items) < 500000:
                 scan_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
                 response = dyn_table.scan(**scan_kwargs)
                 items.extend(response.get("Items", []))
+                aws_truncated = "LastEvaluatedKey" in response
             if not items:
                 return {"error": f"DynamoDB table '{table}' is empty"}
             df = pd.DataFrame(items)
@@ -4620,12 +4669,16 @@ async def aws_fetch_table(body: dict):
     filepath = os.path.join(UPLOAD_DIR, filename)
     df.to_csv(filepath, index=False)
     print(f"✅ AWS fetch {service}/{table} — {len(df)} rows")
-    return {
+    result = {
         "rows": len(df),
         "cols": len(df.columns),
         "download_url": f"/api/download/{filename}",
         "filename": filename,
     }
+    if service in ("rds-mysql", "rds-postgres", "redshift"):
+        result["total_rows_in_source"] = aws_total_rows
+        result["truncated"] = aws_truncated
+    return result
 
 
 @app.post("/api/aws/write-table")
