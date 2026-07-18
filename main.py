@@ -536,10 +536,15 @@ def root():
 
 
 @app.post("/api/feedback")
-async def submit_feedback(body: dict):
-    name = (body.get("name") or "").strip()
-    email = (body.get("email") or "").strip()
-    feedback = (body.get("feedback") or "").strip()
+async def submit_feedback(
+    name: str = Form(""),
+    email: str = Form(""),
+    feedback: str = Form(""),
+    attachment: UploadFile = File(None),
+):
+    name = (name or "").strip()
+    email = (email or "").strip()
+    feedback = (feedback or "").strip()
 
     if not email or not feedback:
         return {"success": False, "error": "Email and feedback are required."}
@@ -547,7 +552,8 @@ async def submit_feedback(body: dict):
     try:
         import resend
         resend.api_key = os.getenv("RESEND_API_KEY", "")
-        resend.Emails.send({
+
+        email_payload = {
             "from": "The Gods Tool <noreply@thegodstool.com>",
             "to": ["aman@thegodstool.com"],
             "reply_to": email,
@@ -561,7 +567,19 @@ async def submit_feedback(body: dict):
               <p style="background:#f4f4f4;padding:16px;border-radius:8px;white-space:pre-wrap;">{feedback}</p>
             </div>
             """
-        })
+        }
+
+        if attachment and attachment.filename:
+            file_bytes = await attachment.read()
+            MAX_ATTACHMENT_SIZE = 8 * 1024 * 1024  # 8MB
+            if len(file_bytes) > MAX_ATTACHMENT_SIZE:
+                return {"success": False, "error": "Attachment too large (max 8MB)."}
+            email_payload["attachments"] = [{
+                "filename": attachment.filename,
+                "content": list(file_bytes),
+            }]
+
+        resend.Emails.send(email_payload)
         return {"success": True}
     except Exception as e:
         return {"success": False, "error": str(e)}
