@@ -47,3 +47,4 @@ google-cloud-bigquery
 aiopg
 databricks-sql-connector
 aiohttp
+duckdb
