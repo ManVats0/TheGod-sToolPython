@@ -1674,9 +1674,15 @@ async def sql_clean(
     preview_only: str = Form("false"),
 ):
     import duckdb
+    import re
 
     # ── Safety: only allow read-only SELECT/WITH statements ──
-    stripped = sql.strip().lstrip("(").strip()
+    # Strip comments FIRST so a query starting with a "-- header" block
+    # (e.g. the auto-generated pipeline SQL) is correctly recognized as
+    # starting with SELECT/WITH instead of being misread as "--...".
+    _no_block_comments = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
+    _no_line_comments = re.sub(r"--[^\n]*", "", _no_block_comments)
+    stripped = _no_line_comments.strip().lstrip("(").strip()
     lowered = stripped.lower()
     if not (lowered.startswith("select") or lowered.startswith("with")):
         return {"success": False, "error": "Only SELECT / WITH queries are allowed. Statements like INSERT, DELETE, DROP, ATTACH, COPY, or PRAGMA are blocked."}
