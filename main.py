@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from pathlib import Path
 
+
 # ── Pydantic Models ────────────────────────────────────────────────────────
 class ContactFormRequest(BaseModel):
     name: str
@@ -1664,6 +1665,59 @@ Reply with ONLY the Python code, nothing else, no markdown, no backticks."""
             "fill_missing": fill_missing == "true",
             "imputation_method": imputation_method if imputation_method != "none" else None,
         }
+    }
+
+@app.post("/api/sql-clean")
+async def sql_clean(
+    file: UploadFile = File(...),
+    sql: str = Form(...),
+    preview_only: str = Form("false"),
+):
+    import duckdb
+
+    # ── Safety: only allow read-only SELECT/WITH statements ──
+    stripped = sql.strip().lstrip("(").strip()
+    lowered = stripped.lower()
+    if not (lowered.startswith("select") or lowered.startswith("with")):
+        return {"success": False, "error": "Only SELECT / WITH queries are allowed. Statements like INSERT, DELETE, DROP, ATTACH, COPY, or PRAGMA are blocked."}
+    blocked = ["attach ", "pragma ", "copy ", "install ", "load ", "create ", "insert ", "update ", "delete ", "drop ", "call "]
+    if any(b in lowered for b in blocked):
+        return {"success": False, "error": "Query contains a disallowed keyword. Only read-only SELECT queries are permitted."}
+
+    contents = await file.read()
+    try:
+        df = pd.read_csv(io.BytesIO(contents))
+        original_shape = list(df.shape)
+    except Exception as e:
+        return {"success": False, "error": f"Could not read source CSV: {e}"}
+
+    try:
+        con = duckdb.connect(database=":memory:")
+        con.register("source", df)   # the table name your SQL should query: FROM source
+        result_df = con.execute(sql).fetchdf()
+        con.close()
+    except Exception as e:
+        return {"success": False, "error": f"SQL error: {e}"}
+
+    if preview_only == "true":
+        return {
+            "success": True,
+            "original_shape": original_shape,
+            "cleaned_shape": list(result_df.shape),
+            "preview_data": result_df.head(100).fillna("").to_dict("records"),
+            "preview_columns": list(result_df.columns),
+        }
+
+    filename = f"sql_cleaned_{uuid.uuid4()}.csv"
+    result_df.to_csv(os.path.join(UPLOAD_DIR, filename), index=False)
+    return {
+        "success": True,
+        "original_shape": original_shape,
+        "cleaned_shape": list(result_df.shape),
+        "download_url": f"/api/download/{filename}",
+        "preview_data": result_df.head(500).fillna("").to_dict("records"),
+        "preview_columns": list(result_df.columns),
+        "options_used": {"sql_custom": True},
     }
 
 @app.get("/api/download/{filename}")
