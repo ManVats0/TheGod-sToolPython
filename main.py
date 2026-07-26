@@ -3770,6 +3770,77 @@ async def databricks_fetch_table(body: dict):
     except Exception as e:
         return {"error": str(e)}
 
+@app.post("/api/databricks/write-table")
+async def databricks_write_table(body: dict):
+    import io as _io
+    try:
+        from databricks import sql as databricks_sql
+    except ImportError:
+        return {"success": False, "error": "databricks-sql-connector not installed. Run: pip install databricks-sql-connector"}
+
+    host      = body.get("host", "").strip()
+    http_path = body.get("httpPath", "").strip()
+    token     = body.get("token", "").strip()
+    catalog   = body.get("catalog", "hive_metastore").strip()
+    schema    = body.get("schema", "default").strip()
+    table     = body.get("table", "").strip()
+    csv_data  = body.get("csvData", "")
+    mode      = body.get("mode", "replace")
+
+    if not csv_data:
+        return {"success": False, "error": "No CSV data provided"}
+    if not all([host, http_path, token, table]):
+        return {"success": False, "error": "host, httpPath, token, and table are all required"}
+
+    try:
+        df = pd.read_csv(_io.StringIO(csv_data))
+    except Exception as e:
+        return {"success": False, "error": f"Could not parse CSV: {e}"}
+
+    full_table = f"{catalog}.{schema}.{table}"
+
+    try:
+        loop = asyncio.get_event_loop()
+        def _write():
+            conn = databricks_sql.connect(server_hostname=host, http_path=http_path, access_token=token)
+            cursor = conn.cursor()
+
+            if mode == "replace":
+                cursor.execute(f"DROP TABLE IF EXISTS {full_table}")
+
+            col_defs = []
+            for col in df.columns:
+                safe_col = col.replace('`', '').replace(' ', '_')[:255]
+                if pd.api.types.is_integer_dtype(df[col]):
+                    col_defs.append(f"`{safe_col}` BIGINT")
+                elif pd.api.types.is_float_dtype(df[col]):
+                    col_defs.append(f"`{safe_col}` DOUBLE")
+                else:
+                    col_defs.append(f"`{safe_col}` STRING")
+
+            cursor.execute(f"CREATE TABLE IF NOT EXISTS {full_table} ({', '.join(col_defs)})")
+
+            if mode == "replace":
+                cursor.execute(f"TRUNCATE TABLE {full_table}")
+
+            placeholders = ", ".join(["?"] * len(df.columns))
+            insert_sql = f"INSERT INTO {full_table} VALUES ({placeholders})"
+            rows_to_insert = [
+                tuple(None if pd.isna(v) else str(v) for v in row)
+                for row in df.itertuples(index=False)
+            ]
+            for row in rows_to_insert:
+                cursor.execute(insert_sql, row)
+
+            cursor.close()
+            conn.close()
+            return len(rows_to_insert)
+
+        rows_written = await loop.run_in_executor(None, _write)
+        print(f"✅ Databricks write-back: {full_table} — {rows_written} rows ({mode})")
+        return {"success": True, "rows_written": rows_written, "table": full_table}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 # ── REST API ROUTES ───────────────────────────────────────────────────────────
 
