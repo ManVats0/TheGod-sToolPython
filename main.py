@@ -513,17 +513,15 @@ def find_problems_fast(df, pk_col):
 def count_real_outliers(df):
     total = 0
     cols = 0
-    # Sample for speed — full scan on large files is too slow
-    df_sample = df.head(2000)
-    for col in df_sample.select_dtypes(include=[np.number]).columns:
-        col_data = df_sample[col].dropna()
+    for col in df.select_dtypes(include=[np.number]).columns:
+        col_data = df[col].dropna()
         if len(col_data) == 0:
             continue
         median = col_data.median()
         mad = np.median(np.abs(col_data - median))
         if mad == 0:
             continue
-        modified_z = 0.6745 * (df_sample[col] - median) / mad
+        modified_z = 0.6745 * (df[col] - median) / mad
         real_count = int((modified_z.abs() > 3.5).sum())
         if real_count > 0:
             total += real_count
