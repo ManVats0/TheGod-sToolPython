@@ -1354,6 +1354,151 @@ async def analyze(
         "truncated": locals().get("analyze_total_rows", 0) > len(df) if "analyze_total_rows" in locals() else False
     }
 
+@app.post("/api/check-size")
+async def check_source_size(body: dict):
+    """
+    Lightweight size check — reads only metadata/estimates, never pulls full data.
+    Frontend calls this before fetching a source to decide whether to skip
+    full analysis on very large sources. Fails open: any error or unsupported
+    type returns supported=False, and the caller proceeds as before.
+    """
+    source_type = body.get("source_type", "")
+    try:
+        if source_type == "mysql":
+            import asyncio, ssl as ssl_lib, aiomysql
+            host = body.get("host", "").strip()
+            port = int(body.get("port", 3306))
+            user = body.get("user", "").strip()
+            password = body.get("password", "")
+            database = body.get("database", "").strip()
+            table = body.get("table", "").strip()
+            ssl_ctx = ssl_lib.create_default_context() if body.get("ssl") else None
+            conn = await asyncio.wait_for(
+                aiomysql.connect(host=host, port=port, user=user, password=password,
+                    db=database, ssl=ssl_ctx, connect_timeout=10), timeout=12,
+            )
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT TABLE_ROWS, DATA_LENGTH, INDEX_LENGTH FROM information_schema.tables "
+                    "WHERE table_schema=%s AND table_name=%s", (database, table)
+                )
+                row = await cur.fetchone()
+            conn.close()
+            if not row:
+                return {"supported": True, "size_bytes": 0, "row_estimate": 0}
+            rows, data_len, index_len = row
+            return {"supported": True, "size_bytes": int((data_len or 0) + (index_len or 0)), "row_estimate": int(rows or 0)}
+
+        elif source_type == "postgres":
+            import asyncio, ssl as ssl_lib, asyncpg
+            host = body.get("host", "").strip()
+            port = int(body.get("port", 5432))
+            user = body.get("user", "").strip()
+            password = body.get("password", "")
+            database = body.get("database", "").strip()
+            table = body.get("table", "").strip()
+            ssl_ctx = ssl_lib.create_default_context() if body.get("ssl") else None
+            conn = await asyncio.wait_for(
+                asyncpg.connect(host=host, port=port, user=user, password=password,
+                    database=database, ssl=ssl_ctx, timeout=10), timeout=12,
+            )
+            size_bytes = await conn.fetchval("SELECT pg_total_relation_size($1)", table)
+            row_estimate = await conn.fetchval("SELECT reltuples::bigint FROM pg_class WHERE relname = $1", table)
+            await conn.close()
+            return {"supported": True, "size_bytes": int(size_bytes or 0), "row_estimate": int(row_estimate or 0)}
+
+        elif source_type == "mongodb":
+            from motor.motor_asyncio import AsyncIOMotorClient
+            uri = body.get("mongo_uri", "").strip()
+            database = body.get("mongo_database", "").strip()
+            collection = body.get("mongo_collection", "").strip()
+            client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=8000)
+            stats = await client[database].command("collStats", collection)
+            client.close()
+            return {"supported": True, "size_bytes": int(stats.get("size", 0)), "row_estimate": int(stats.get("count", 0))}
+
+        elif source_type == "bigquery":
+            from google.cloud import bigquery as bq_lib
+            from google.oauth2 import service_account
+            info = json.loads(body.get("bq_key_json", "{}"))
+            project = body.get("bq_project", "").strip()
+            dataset = body.get("bq_dataset", "").strip()
+            table = body.get("bq_table", "").strip()
+            creds = service_account.Credentials.from_service_account_info(
+                info, scopes=["https://www.googleapis.com/auth/bigquery"])
+            client = bq_lib.Client(project=project, credentials=creds)
+            tbl = client.get_table(f"{project}.{dataset}.{table}")
+            return {"supported": True, "size_bytes": int(tbl.num_bytes or 0), "row_estimate": int(tbl.num_rows or 0)}
+
+        elif source_type == "gcs":
+            from google.cloud import storage as gcs_lib
+            from google.oauth2 import service_account
+            info = json.loads(body.get("gcs_key_json", "{}"))
+            project = body.get("gcs_project", "").strip()
+            bucket = body.get("gcs_bucket", "").strip()
+            file_path = body.get("gcs_file", "").strip()
+            creds = service_account.Credentials.from_service_account_info(
+                info, scopes=["https://www.googleapis.com/auth/devstorage.read_only"])
+            client = gcs_lib.Client(project=project, credentials=creds)
+            blob = client.bucket(bucket).get_blob(file_path)
+            if not blob:
+                return {"supported": True, "size_bytes": 0, "row_estimate": None}
+            return {"supported": True, "size_bytes": int(blob.size or 0), "row_estimate": None}
+
+        elif source_type == "aws":
+            import boto3
+            aws_service = body.get("aws_service", "")
+            region = body.get("aws_region", "us-east-1")
+            access_key_id = body.get("aws_access_key_id", "").strip()
+            secret_key = body.get("aws_secret_access_key", "").strip()
+
+            if aws_service == "s3":
+                bucket = body.get("aws_bucket", "").strip()
+                key = body.get("aws_table", "").strip()
+                s3 = boto3.client("s3", region_name=region,
+                    aws_access_key_id=access_key_id, aws_secret_access_key=secret_key)
+                head = s3.head_object(Bucket=bucket, Key=key)
+                return {"supported": True, "size_bytes": int(head.get("ContentLength", 0)), "row_estimate": None}
+
+            elif aws_service == "dynamodb":
+                table = body.get("aws_table", "").strip()
+                dynamo = boto3.client("dynamodb", region_name=region,
+                    aws_access_key_id=access_key_id, aws_secret_access_key=secret_key)
+                desc = dynamo.describe_table(TableName=table)["Table"]
+                return {"supported": True, "size_bytes": int(desc.get("TableSizeBytes", 0)), "row_estimate": int(desc.get("ItemCount", 0))}
+
+            elif aws_service == "rds-mysql":
+                return await check_source_size({
+                    "source_type": "mysql", "host": body.get("host", ""), "port": body.get("port", 3306),
+                    "user": body.get("user", ""), "password": body.get("password", ""),
+                    "database": body.get("database", ""), "table": body.get("aws_table", ""),
+                    "ssl": body.get("ssl", True),
+                })
+            elif aws_service in ("rds-postgres", "redshift"):
+                return await check_source_size({
+                    "source_type": "postgres", "host": body.get("host", ""),
+                    "port": body.get("port", 5432 if aws_service == "rds-postgres" else 5439),
+                    "user": body.get("user", ""), "password": body.get("password", ""),
+                    "database": body.get("database", ""), "table": body.get("aws_table", ""),
+                    "ssl": body.get("ssl", True),
+                })
+            return {"supported": False, "reason": f"No size check for AWS service '{aws_service}'"}
+
+        elif source_type == "cloudsql":
+            db_type = body.get("db_type", "postgres")
+            return await check_source_size({
+                **body,
+                "source_type": "mysql" if db_type == "mysql" else "postgres",
+                "host": body.get("host", ""),
+            })
+
+        else:
+            return {"supported": False, "reason": f"No size check for '{source_type}'"}
+
+    except Exception as e:
+        return {"supported": False, "error": str(e)}
+
+
 @app.post("/api/preview-transform")
 async def preview_transform(
     file: UploadFile = File(...),
@@ -3727,7 +3872,7 @@ async def databricks_fetch_table(body: dict):
                 filename = f"databricks_{schema}_{table}_{uuid.uuid4().hex[:6]}.csv"
                 filepath = os.path.join(UPLOAD_DIR, filename)
                 df.to_csv(filepath, index=False)
-                print(f"✅ Databricks fetch-table (via tunnel): {schema}.{table} — {len(df)} rows")
+                print(f" Databricks fetch-table (via tunnel): {schema}.{table} — {len(df)} rows")
                 return {"rows": len(df), "cols": len(df.columns), "download_url": f"/api/download/{filename}", "filename": filename}
             except RuntimeError as e:
                 return {"error": str(e)}
