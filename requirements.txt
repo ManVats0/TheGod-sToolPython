@@ -48,3 +48,4 @@ aiopg
 databricks-sql-connector
 aiohttp
 duckdb
+PyJWT
