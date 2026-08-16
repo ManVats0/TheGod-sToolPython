@@ -41,6 +41,29 @@ SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REDIRECT_URI  = os.getenv("GOOGLE_REDIRECT_URI", "https://bubbly-empathy-production-7977.up.railway.app/api/auth/google/callback")
+
+# ── JWT verification (isolated — not yet used by any existing route) ──────────
+JWT_SECRET = os.getenv("JWT_SECRET", "")
+
+def verify_jwt_token(authorization_header: str = "") -> dict | None:
+    """
+    Decode and verify a JWT issued by the Express auth server.
+    Returns the decoded payload (userId, email, sessionId) if valid, else None.
+    This function is standalone — nothing existing calls it yet.
+    """
+    if not authorization_header.startswith("Bearer "):
+        return None
+    token = authorization_header[7:]
+    if not JWT_SECRET:
+        print("⚠ JWT_SECRET not set in credentials.env — cannot verify tokens")
+        return None
+    try:
+        import jwt as _pyjwt
+        payload = _pyjwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        return payload
+    except Exception as e:
+        print(f"JWT verification failed: {e}")
+        return None
 import asyncio
 import secrets
 import secrets as _secrets
@@ -532,6 +555,20 @@ def count_real_outliers(df):
 @app.get("/")
 def root():
     return {"message": "Backend OK"}
+
+
+@app.get("/api/auth/test")
+async def test_jwt_auth(request: Request):
+    """
+    Isolated test route for Step 1. Not used by any existing feature.
+    Hit this with/without an Authorization: Bearer <token> header to confirm
+    JWT verification is wired correctly before building anything on top of it.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    payload = verify_jwt_token(auth_header)
+    if payload:
+        return {"authenticated": True, "userId": payload.get("userId"), "email": payload.get("email")}
+    return {"authenticated": False}
 
 
 @app.post("/api/feedback")
