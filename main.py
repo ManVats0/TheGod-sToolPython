@@ -45,6 +45,38 @@ GOOGLE_REDIRECT_URI  = os.getenv("GOOGLE_REDIRECT_URI", "https://bubbly-empathy-
 # ── JWT verification (isolated — not yet used by any existing route) ──────────
 JWT_SECRET = os.getenv("JWT_SECRET", "")
 
+# ── MongoDB persistence (connections, pipelines, audit logs) ────────────────
+from motor.motor_asyncio import AsyncIOMotorClient
+from bson import ObjectId
+from cryptography.fernet import Fernet
+
+MONGODB_URI = os.getenv("MONGODB_URI", "")
+mongo_client = AsyncIOMotorClient(MONGODB_URI) if MONGODB_URI else None
+mongo_db = mongo_client["thegodstool"] if mongo_client else None
+
+CRED_ENCRYPTION_KEY = os.getenv("CRED_ENCRYPTION_KEY", "")
+_fernet = Fernet(CRED_ENCRYPTION_KEY.encode()) if CRED_ENCRYPTION_KEY else None
+
+def encrypt_credentials(data: dict) -> str:
+    if not _fernet:
+        raise RuntimeError("CRED_ENCRYPTION_KEY not set in credentials.env")
+    return _fernet.encrypt(json.dumps(data).encode()).decode()
+
+def decrypt_credentials(token: str) -> dict:
+    if not _fernet:
+        raise RuntimeError("CRED_ENCRYPTION_KEY not set in credentials.env")
+    return json.loads(_fernet.decrypt(token.encode()).decode())
+
+def require_user(request: Request) -> dict | None:
+    return verify_jwt_token(request.headers.get("Authorization", ""))
+
+def serialize_doc(doc: dict, drop: list | None = None) -> dict:
+    doc = dict(doc)
+    doc["_id"] = str(doc["_id"])
+    for f in (drop or []):
+        doc.pop(f, None)
+    return doc
+
 def verify_jwt_token(authorization_header: str = "") -> dict | None:
     """
     Decode and verify a JWT issued by the Express auth server.
@@ -569,6 +601,182 @@ async def test_jwt_auth(request: Request):
     if payload:
         return {"authenticated": True, "userId": payload.get("userId"), "email": payload.get("email")}
     return {"authenticated": False}
+
+
+# ── Connections ───────────────────────────────────────────────────────────
+@app.get("/api/connections")
+async def list_connections(request: Request):
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+    cursor = mongo_db.connections.find({"userId": user["userId"]}).sort("createdAt", -1)
+    docs = await cursor.to_list(length=500)
+    return [serialize_doc(d, drop=["credentialsEncrypted"]) for d in docs]
+
+
+@app.post("/api/connections")
+async def create_connection(request: Request, body: dict):
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+
+    name = body.get("name", "")
+    conn_type = body.get("type", "")
+    config = body.get("config", {})
+    credentials = body.get("credentials", {})
+    if not name or not conn_type:
+        return {"error": "name and type are required"}
+
+    doc = {
+        "userId": user["userId"],
+        "name": name,
+        "type": conn_type,
+        "config": config,
+        "credentialsEncrypted": encrypt_credentials(credentials) if credentials else "",
+        "status": "active",
+        "createdAt": datetime.now(),
+        "updatedAt": datetime.now(),
+    }
+    result = await mongo_db.connections.insert_one(doc)
+    doc["_id"] = result.inserted_id
+    await log_audit(user["userId"], "connection.created", "connection", str(doc["_id"]), {"name": name, "type": conn_type})
+    return serialize_doc(doc, drop=["credentialsEncrypted"])
+
+
+@app.delete("/api/connections/{connection_id}")
+async def delete_connection(request: Request, connection_id: str):
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+    result = await mongo_db.connections.delete_one({"_id": ObjectId(connection_id), "userId": user["userId"]})
+    await log_audit(user["userId"], "connection.deleted", "connection", connection_id)
+    return {"success": result.deleted_count > 0}
+
+
+async def get_decrypted_connection(connection_id: str, user_id: str) -> dict | None:
+    """
+    Internal helper — NOT a route. Fetches a connection by id (scoped to user_id)
+    and decrypts its credentials. Used by the scheduler / pipeline runner to
+    reconnect to a source without the browser being open. Never expose the
+    decrypted result directly to the frontend — it's for server-side use only.
+    """
+    if mongo_db is None:
+        return None
+    doc = await mongo_db.connections.find_one({"_id": ObjectId(connection_id), "userId": user_id})
+    if not doc:
+        return None
+    creds = {}
+    if doc.get("credentialsEncrypted"):
+        try:
+            creds = decrypt_credentials(doc["credentialsEncrypted"])
+        except Exception as e:
+            print(f"Credential decryption failed for connection {connection_id}: {e}")
+            return None
+    return {
+        "id": str(doc["_id"]),
+        "name": doc.get("name", ""),
+        "type": doc.get("type", ""),
+        "config": doc.get("config", {}),
+        "credentials": creds,
+    }
+
+
+# ── Pipelines ─────────────────────────────────────────────────────────────
+@app.get("/api/pipelines")
+async def list_pipelines(request: Request):
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+    cursor = mongo_db.pipelines.find({"userId": user["userId"]}).sort("updatedAt", -1)
+    docs = await cursor.to_list(length=500)
+    return [serialize_doc(d) for d in docs]
+
+
+@app.post("/api/pipelines")
+async def save_pipeline(request: Request, body: dict):
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+
+    pipeline_id = body.get("id")
+    payload = {
+        "userId": user["userId"],
+        "name": body.get("name", ""),
+        "sourceId": body.get("sourceId", ""),
+        "destinationId": body.get("destinationId", ""),
+        "sourceName": body.get("sourceName", ""),
+        "destinationName": body.get("destinationName", ""),
+        "destinationMode": body.get("destinationMode", "replace"),
+        "transformations": body.get("transformations", []),
+        "schedule": body.get("schedule"),
+        "scheduleLabel": body.get("scheduleLabel"),
+        "scheduleMs": body.get("scheduleMs"),
+        "scheduleTimezone": body.get("scheduleTimezone"),
+        "scheduleStartDate": body.get("scheduleStartDate"),
+        "isActive": body.get("isActive", False),
+        "updatedAt": datetime.now(),
+    }
+
+    if pipeline_id:
+        await mongo_db.pipelines.update_one({"_id": ObjectId(pipeline_id), "userId": user["userId"]}, {"$set": payload})
+        doc = await mongo_db.pipelines.find_one({"_id": ObjectId(pipeline_id)})
+        await log_audit(user["userId"], "pipeline.updated", "pipeline", pipeline_id, {"name": payload["name"]})
+    else:
+        payload["createdAt"] = datetime.now()
+        payload["runCount"] = 0
+        payload["lastRun"] = None
+        result = await mongo_db.pipelines.insert_one(payload)
+        doc = await mongo_db.pipelines.find_one({"_id": result.inserted_id})
+        await log_audit(user["userId"], "pipeline.created", "pipeline", str(result.inserted_id), {"name": payload["name"]})
+
+    return serialize_doc(doc)
+
+
+@app.delete("/api/pipelines/{pipeline_id}")
+async def delete_pipeline(request: Request, pipeline_id: str):
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+    result = await mongo_db.pipelines.delete_one({"_id": ObjectId(pipeline_id), "userId": user["userId"]})
+    await log_audit(user["userId"], "pipeline.deleted", "pipeline", pipeline_id)
+    return {"success": result.deleted_count > 0}
+
+
+# ── Audit logs ────────────────────────────────────────────────────────────
+async def log_audit(user_id: str, action: str, resource_type: str, resource_id: str = "", metadata: dict | None = None):
+    if mongo_db is None:
+        return
+    try:
+        await mongo_db.audit_logs.insert_one({
+            "userId": user_id, "action": action, "resourceType": resource_type,
+            "resourceId": resource_id, "metadata": metadata or {}, "createdAt": datetime.now(),
+        })
+    except Exception as e:
+        print(f"Audit log write failed: {e}")
+
+
+@app.get("/api/audit-logs")
+async def list_audit_logs(request: Request):
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+    cursor = mongo_db.audit_logs.find({"userId": user["userId"]}).sort("createdAt", -1).limit(200)
+    docs = await cursor.to_list(length=200)
+    return [serialize_doc(d) for d in docs]
 
 
 @app.post("/api/feedback")
