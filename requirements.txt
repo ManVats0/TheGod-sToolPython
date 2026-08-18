@@ -49,3 +49,5 @@ databricks-sql-connector
 aiohttp
 duckdb
 PyJWT
+motor
+cryptography
