@@ -52,11 +52,11 @@ from cryptography.fernet import Fernet
 
 MONGODB_URI = os.getenv("MONGODB_URI", "")
 mongo_client = AsyncIOMotorClient(MONGODB_URI) if MONGODB_URI else None
-mongo_db = mongo_client["thegodstool"] if mongo_client else None
+mongo_db = mongo_client["test"] if mongo_client else None
 
 CRED_ENCRYPTION_KEY = os.getenv("CRED_ENCRYPTION_KEY", "")
 _fernet = Fernet(CRED_ENCRYPTION_KEY.encode()) if CRED_ENCRYPTION_KEY else None
-
+ 
 def encrypt_credentials(data: dict) -> str:
     if not _fernet:
         raise RuntimeError("CRED_ENCRYPTION_KEY not set in credentials.env")
@@ -2866,7 +2866,7 @@ async def mongo_fetch_collection(body: dict):
         # Flatten any nested dict columns to string for CSV compatibility
         for col in df.columns:
             if df[col].apply(lambda x: isinstance(x, (dict, list))).any():
-                df[col] = df[col].apply(lambda x: json.dumps(x) if isinstance(x, (dict, list)) else x)
+                df[col] = df[col].apply(lambda x: json.dumps(x, default=str) if isinstance(x, (dict, list)) else x)
 
         filename = f"mongo_{database}_{collection}_{uuid.uuid4().hex[:6]}.csv"
         filepath = os.path.join(UPLOAD_DIR, filename)
