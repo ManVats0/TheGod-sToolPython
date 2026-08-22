@@ -1310,6 +1310,30 @@ async def analyze(
     elif source_type == 'mongodb' and mysql_host and mysql_database and mysql_table:
         try:
             from motor.motor_asyncio import AsyncIOMotorClient
+            from datetime import datetime as _dt, date as _date
+            from bson import ObjectId as _ObjectId
+            try:
+                from bson.decimal128 import Decimal128 as _Decimal128
+            except Exception:
+                _Decimal128 = None
+
+            def _sanitize(value):
+                """Recursively convert any Mongo/BSON type that isn't
+                natively JSON/CSV safe into a plain string or primitive."""
+                if isinstance(value, dict):
+                    return {k: _sanitize(v) for k, v in value.items()}
+                if isinstance(value, list):
+                    return [_sanitize(v) for v in value]
+                if isinstance(value, (_dt, _date)):
+                    return value.isoformat()
+                if isinstance(value, _ObjectId):
+                    return str(value)
+                if _Decimal128 is not None and isinstance(value, _Decimal128):
+                    return str(value)
+                if isinstance(value, bytes):
+                    return value.decode("utf-8", errors="replace")
+                return value
+
             mongo_uri_val = mysql_host  # stored in mysql_host field
             mongo_db_val  = mysql_database
             mongo_coll_val = mysql_table
@@ -1321,10 +1345,16 @@ async def analyze(
             client_mg.close()
             if not docs_mg:
                 return {"error": f"Collection '{mongo_coll_val}' is empty"}
+
+            # Sanitize every document BEFORE building the DataFrame —
+            # this guarantees no raw datetime/ObjectId/Decimal128 ever
+            # reaches pandas or json.dumps downstream.
+            docs_mg = [_sanitize(doc) for doc in docs_mg]
+
             df_mg = pd.DataFrame(docs_mg)
             for col in df_mg.columns:
                 if df_mg[col].apply(lambda x: isinstance(x, (dict, list))).any():
-                    df_mg[col] = df_mg[col].apply(lambda x: json.dumps(x) if isinstance(x, (dict, list)) else x)
+                    df_mg[col] = df_mg[col].apply(lambda x: json.dumps(x, default=str) if isinstance(x, (dict, list)) else x)
             buf_mg = io.BytesIO()
             df_mg.to_csv(buf_mg, index=False)
             contents = buf_mg.getvalue()
