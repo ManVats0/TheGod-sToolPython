@@ -659,6 +659,51 @@ async def delete_connection(request: Request, connection_id: str):
     return {"success": result.deleted_count > 0}
 
 
+# ── Analysis results (cross-device "Last Run" badge + quality trend) ───────
+@app.post("/api/analysis-results")
+async def save_analysis_result(request: Request, body: dict):
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+
+    source_name = body.get("source_name", "")
+    connection_id = body.get("connection_id", "")
+    result = body.get("result", {})
+    if not source_name:
+        return {"error": "source_name is required"}
+
+    source_key = connection_id or source_name
+
+    doc = {
+        "userId": user["userId"],
+        "sourceKey": source_key,
+        "sourceName": source_name,
+        "connectionId": connection_id,
+        "result": result,
+        "updatedAt": datetime.now(),
+    }
+    await mongo_db.analysis_results.update_one(
+        {"userId": user["userId"], "sourceKey": source_key},
+        {"$set": doc, "$setOnInsert": {"createdAt": datetime.now()}},
+        upsert=True,
+    )
+    return {"success": True}
+
+
+@app.get("/api/analysis-results")
+async def list_analysis_results(request: Request):
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+    cursor = mongo_db.analysis_results.find({"userId": user["userId"]})
+    docs = await cursor.to_list(length=1000)
+    return [serialize_doc(d) for d in docs]
+
+
 async def get_decrypted_connection(connection_id: str, user_id: str) -> dict | None:
     """
     Internal helper — NOT a route. Fetches a connection by id (scoped to user_id)
