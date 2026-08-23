@@ -1265,6 +1265,7 @@ async def mysql_fetch_table(body: dict):
 
 @app.post("/api/analyze")
 async def analyze(
+    request: Request,
     background_tasks: BackgroundTasks,
     notify_email: str = Form(""),
     alert_staleness: str = Form("true"),
@@ -1274,6 +1275,7 @@ async def analyze(
     file: UploadFile = File(None),
     source_name: str = Form(""),
     source_type: str = Form(""),
+    connection_id: str = Form(""),
     mysql_host: str = Form(""),
     mysql_port: str = Form("3306"),
     mysql_user: str = Form(""),
@@ -1286,6 +1288,48 @@ async def analyze(
     bq_dataset: str = Form(""),
     bq_table: str = Form(""),
 ):
+    # ── If the frontend couldn't find raw credentials in localStorage (e.g.
+    # new device, cleared cache), it sends connection_id instead. Resolve the
+    # saved, encrypted connection server-side rather than failing. Only fills
+    # in fields that are still empty — never overrides an explicit value the
+    # frontend already sent.
+    if connection_id and not mysql_host:
+        user_for_conn = require_user(request)
+        if user_for_conn:
+            conn = await get_decrypted_connection(connection_id, user_for_conn["userId"])
+            if conn:
+                creds = conn.get("credentials", {})
+                cfg = conn.get("config", {})
+                if conn["type"] == "mysql":
+                    source_type = "mysql"
+                    mysql_host = cfg.get("host", "")
+                    mysql_port = str(cfg.get("port", "3306"))
+                    mysql_user = creds.get("user", "")
+                    mysql_password = creds.get("password", "")
+                    mysql_database = cfg.get("database", "")
+                    mysql_ssl = str(cfg.get("ssl", False)).lower()
+                    if not mysql_table:
+                        tables_list = cfg.get("tables", [])
+                        mysql_table = tables_list[0] if tables_list else ""
+                elif conn["type"] == "postgres":
+                    source_type = "postgres"
+                    mysql_host = cfg.get("host", "")
+                    mysql_port = str(cfg.get("port", "5432"))
+                    mysql_user = creds.get("user", "")
+                    mysql_password = creds.get("password", "")
+                    mysql_database = cfg.get("database", "")
+                    mysql_ssl = str(cfg.get("ssl", False)).lower()
+                    if not mysql_table:
+                        tables_list = cfg.get("tables", [])
+                        mysql_table = tables_list[0] if tables_list else ""
+                elif conn["type"] == "mongodb":
+                    source_type = "mongodb"
+                    mysql_host = creds.get("uri", cfg.get("uri", ""))
+                    mysql_database = cfg.get("database", "")
+                    if not mysql_table:
+                        colls = cfg.get("collections", [])
+                        mysql_table = colls[0] if colls else ""
+
     # ── Resolve the DataFrame ──────────────────────────────────────────────
     if source_type == 'postgres' and mysql_host and mysql_user and mysql_database:
         import asyncio, ssl as ssl_lib
