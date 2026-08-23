@@ -414,33 +414,51 @@ def check_staleness(df, date_col, freq_label, freq_days, filename):
     return alerts
 
 # ── SCHEMA DRIFT ───────────────────────────────────────────────────────────────
-def check_schema_drift(df, filename):
+def _diff_schema(prev_schema: dict, current_schema: dict) -> list:
     alerts = []
-    schema_path = os.path.join(META_DIR, f"schema_{hashlib.md5(filename.encode()).hexdigest()}.json")
+    added = [c for c in current_schema if c not in prev_schema]
+    removed = [c for c in prev_schema if c not in current_schema]
+    type_changed = [c for c in current_schema if c in prev_schema and current_schema[c] != prev_schema[c]]
+
+    if added or removed or type_changed:
+        parts = []
+        if added:        parts.append(f"{len(added)} column(s) added: {', '.join(added[:3])}")
+        if removed:      parts.append(f"{len(removed)} column(s) removed: {', '.join(removed[:3])}")
+        if type_changed: parts.append(f"{len(type_changed)} type change(s): {', '.join(type_changed[:3])}")
+        alerts.append({
+            "id": str(uuid.uuid4()),
+            "type": "schema",
+            "title": "Schema Drift Detected",
+            "message": ". ".join(parts) + f". Previous schema had {len(prev_schema)} columns, now {len(current_schema)}.",
+            "severity": "error"
+        })
+    return alerts
+
+
+async def check_schema_drift(df, filename):
+    schema_key = hashlib.md5(filename.encode()).hexdigest()
     current_schema = {col: str(df[col].dtype) for col in df.columns}
 
-    if os.path.exists(schema_path):
-        with open(schema_path) as f:
-            prev_schema = json.load(f)
-        added = [c for c in current_schema if c not in prev_schema]
-        removed = [c for c in prev_schema if c not in current_schema]
-        type_changed = [c for c in current_schema if c in prev_schema and current_schema[c] != prev_schema[c]]
+    if mongo_db is None:
+        # Fallback so this still works even without Mongo configured —
+        # same behavior as before, just isolated to this branch.
+        schema_path = os.path.join(META_DIR, f"schema_{schema_key}.json")
+        alerts = []
+        if os.path.exists(schema_path):
+            with open(schema_path) as f:
+                prev_schema = json.load(f)
+            alerts = _diff_schema(prev_schema, current_schema)
+        with open(schema_path, "w") as f:
+            json.dump(current_schema, f)
+        return alerts
 
-        if added or removed or type_changed:
-            parts = []
-            if added:        parts.append(f"{len(added)} column(s) added: {', '.join(added[:3])}")
-            if removed:      parts.append(f"{len(removed)} column(s) removed: {', '.join(removed[:3])}")
-            if type_changed: parts.append(f"{len(type_changed)} type change(s): {', '.join(type_changed[:3])}")
-            alerts.append({
-                "id": str(uuid.uuid4()),
-                "type": "schema",
-                "title": "Schema Drift Detected",
-                "message": ". ".join(parts) + f". Previous schema had {len(prev_schema)} columns, now {len(current_schema)}.",
-                "severity": "error"
-            })
-
-    with open(schema_path, "w") as f:
-        json.dump(current_schema, f)
+    prev_doc = await mongo_db.schema_snapshots.find_one({"schemaKey": schema_key})
+    alerts = _diff_schema(prev_doc.get("schema", {}), current_schema) if prev_doc else []
+    await mongo_db.schema_snapshots.update_one(
+        {"schemaKey": schema_key},
+        {"$set": {"schema": current_schema, "filename": filename, "updatedAt": datetime.now()}},
+        upsert=True,
+    )
     return alerts
 
 # ── ANOMALIES & IMBALANCES ─────────────────────────────────────────────────────
@@ -1597,7 +1615,7 @@ async def analyze(
     if alert_staleness == "true" and date_col:
         notifications.extend(check_staleness(df, date_col, freq_label, freq_days, filename_for_meta))
     if alert_schema == "true":
-        notifications.extend(check_schema_drift(df, filename_for_meta))
+        notifications.extend(await check_schema_drift(df, filename_for_meta))
     if alert_anomalies == "true":
         notifications.extend(check_anomalies(df))
     if alert_flow == "true":
