@@ -697,45 +697,6 @@ async def delete_connection(request: Request, connection_id: str):
     return {"success": result.deleted_count > 0}
 
 
-# ── Analysis results (cross-device "Last Run" badge + quality trend) ───────
-@app.post("/api/analysis-results")
-async def save_analysis_result(request: Request, body: dict):
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
-    if mongo_db is None:
-        return {"error": "MongoDB not configured"}
-
-    source_name = body.get("source_name", "")
-    connection_id = body.get("connection_id", "")
-    result = body.get("result", {})
-    if not source_name:
-        return {"error": "source_name is required"}
-
-    source_key = connection_id or source_name
-
-    doc = {
-        "userId": user["userId"],
-        "sourceKey": source_key,
-        "sourceName": source_name,
-        "connectionId": connection_id,
-        "result": result,
-        "createdAt": datetime.now(),
-    }
-    await mongo_db.analysis_results.insert_one(doc)
-
-    # Keep history bounded — drop anything beyond the most recent 30 runs
-    # for this user+source (oldest first), so this never grows unbounded.
-    cursor = mongo_db.analysis_results.find(
-        {"userId": user["userId"], "sourceKey": source_key}
-    ).sort("createdAt", -1).skip(30)
-    old_ids = [d["_id"] async for d in cursor]
-    if old_ids:
-        await mongo_db.analysis_results.delete_many({"_id": {"$in": old_ids}})
-
-    return {"success": True}
-
-
 @app.get("/api/analysis-results/latest")
 async def get_latest_analysis_result(request: Request, source_key: str):
     """
@@ -756,24 +717,6 @@ async def get_latest_analysis_result(request: Request, source_key: str):
     if not doc:
         return {"result": None}
     return {"result": serialize_doc(doc)}
-
-
-@app.get("/api/analysis-results")
-async def list_analysis_results(request: Request):
-    """Latest run per source — used for the 'Last Run' badge list."""
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
-    if mongo_db is None:
-        return {"error": "MongoDB not configured"}
-    pipeline = [
-        {"$match": {"userId": user["userId"]}},
-        {"$sort": {"createdAt": -1}},
-        {"$group": {"_id": "$sourceKey", "doc": {"$first": "$$ROOT"}}},
-        {"$replaceRoot": {"newRoot": "$doc"}},
-    ]
-    docs = [d async for d in mongo_db.analysis_results.aggregate(pipeline)]
-    return [serialize_doc(d) for d in docs]
 
 
 async def get_decrypted_connection(connection_id: str, user_id: str) -> dict | None:
@@ -2488,10 +2431,10 @@ async def get_google_auth_url(request: Request, response: Response):
         prompt="consent",
     )
 
-    tokens = _get_session_tokens(session_id)
+    tokens = await _get_session_tokens(session_id)
     tokens["state"] = state
     tokens["code_verifier"] = getattr(flow, 'code_verifier', "")
-    _save_session_tokens(session_id, tokens)
+    await _save_session_tokens(session_id, tokens)
 
     response.set_cookie(
         key="datapro_session",
@@ -5711,7 +5654,7 @@ async def write_to_source(
     if source_type == "sheets":
         # Resolve session
         resolved_session = session_id or _get_session_id(request)
-        tokens = _get_session_tokens(resolved_session) if resolved_session else {}
+        tokens = await _get_session_tokens(resolved_session) if resolved_session else {}
         if not tokens.get("access_token"):
             for sid, tok in _session_store.items():
                 if "access_token" in tok:
@@ -5732,7 +5675,7 @@ async def write_to_source(
             if creds.expired and creds.refresh_token:
                 creds.refresh(GoogleAuthRequest())
                 tokens["access_token"] = creds.token
-                _save_session_tokens(resolved_session, tokens)
+                await _save_session_tokens(resolved_session, tokens)
             service = build("sheets", "v4", credentials=creds)
             df = pd.read_csv(_io.BytesIO(contents))
             str_df = df.fillna("").astype(str)
@@ -5806,7 +5749,7 @@ async def update_gsheet(request: Request, body: dict):
     sheet_name = body.get("sheetName", "")
     csv_data   = body.get("csvData", "")
     session_id = _get_session_id(request) or body.get("sessionId", "")
-    tokens = _get_session_tokens(session_id) if session_id else {}
+    tokens = await _get_session_tokens(session_id) if session_id else {}
     if "access_token" not in tokens:
         # Fallback: find any authenticated session
         for sid, tok in _session_store.items():
@@ -5833,7 +5776,7 @@ async def update_gsheet(request: Request, body: dict):
             creds.refresh(GoogleAuthRequest())
             tokens["access_token"] = creds.token
             if session_id:
-                _save_session_tokens(session_id, tokens)
+                await _save_session_tokens(session_id, tokens)
         if not creds.token:
             return {"error": "Not authenticated"}
 
