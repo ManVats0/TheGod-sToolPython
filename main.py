@@ -641,6 +641,8 @@ async def test_jwt_auth(request: Request):
     return {"authenticated": False}
 
 
+
+
 # ── Connections ───────────────────────────────────────────────────────────
 @app.get("/api/connections")
 async def list_connections(request: Request):
@@ -718,6 +720,22 @@ async def get_latest_analysis_result(request: Request, source_key: str):
         return {"result": None}
     return {"result": serialize_doc(doc)}
 
+@app.get("/api/connections/{connection_id}/reveal")
+async def reveal_connection(request: Request, connection_id: str):
+    """
+    Returns decrypted credentials for one saved connection, scoped to the
+    requesting user. Used by the frontend to rebuild the 'active source'
+    localStorage entry on a browser/device that never ran the original
+    Test Connection flow, so DB-backed sources (mongo, mysql, postgres…)
+    work cross-device without re-entering the URI/password.
+    """
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    conn = await get_decrypted_connection(connection_id, user["userId"])
+    if not conn:
+        return {"error": "Connection not found"}
+    return conn
 
 async def get_decrypted_connection(connection_id: str, user_id: str) -> dict | None:
     """
