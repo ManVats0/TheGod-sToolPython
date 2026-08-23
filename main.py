@@ -126,11 +126,20 @@ _agent_connections: dict = {}
 # request_id -> asyncio.Future (for matching query responses)
 _pending_queries: dict = {} 
 
-def _get_session_tokens(session_id: str) -> dict:
-    """Get tokens for a specific session."""
+async def _get_session_tokens(session_id: str) -> dict:
+    """Get tokens for a specific session. In-memory cache first (fast,
+    within one process lifetime), then MongoDB (survives Railway restarts
+    and redeploys), then legacy local-disk file as a last resort."""
     if session_id in _session_store:
         return _session_store[session_id]
-    # Try loading from disk
+    if mongo_db is not None:
+        try:
+            doc = await mongo_db.google_sessions.find_one({"session_id": session_id})
+            if doc and doc.get("tokens"):
+                _session_store[session_id] = doc["tokens"]
+                return doc["tokens"]
+        except Exception as e:
+            print(f"Could not load session tokens from MongoDB: {e}")
     token_file = TOKEN_DIR / f"{session_id}.json"
     if token_file.exists():
         try:
@@ -141,9 +150,20 @@ def _get_session_tokens(session_id: str) -> dict:
             pass
     return {}
 
-def _save_session_tokens(session_id: str, tokens: dict):
-    """Save tokens for a specific session."""
+async def _save_session_tokens(session_id: str, tokens: dict):
+    """Save tokens for a specific session — in-memory cache for speed,
+    MongoDB for persistence across restarts/redeploys."""
     _session_store[session_id] = tokens
+    if mongo_db is not None:
+        try:
+            await mongo_db.google_sessions.update_one(
+                {"session_id": session_id},
+                {"$set": {"tokens": tokens, "updatedAt": datetime.now()}},
+                upsert=True,
+            )
+            return
+        except Exception as e:
+            print(f"Could not save session tokens to MongoDB: {e}")
     token_file = TOKEN_DIR / f"{session_id}.json"
     try:
         token_file.write_text(json.dumps(tokens))
@@ -224,9 +244,9 @@ from google.auth.transport.requests import Request as GoogleAuthRequest
 
 from google.auth.transport.requests import Request as GoogleAuthRequest
 
-def _get_valid_credentials(session_id: str = ""):
+async def _get_valid_credentials(session_id: str = ""):
     """Return valid credentials for this session, or None if not authenticated."""
-    tokens = _get_session_tokens(session_id) if session_id else google_tokens
+    tokens = await _get_session_tokens(session_id) if session_id else google_tokens
     if "access_token" not in tokens:
         return None
     try:
@@ -242,7 +262,7 @@ def _get_valid_credentials(session_id: str = ""):
             creds.refresh(GoogleAuthRequest())
             tokens["access_token"] = creds.token
             if session_id:
-                _save_session_tokens(session_id, tokens)
+                await _save_session_tokens(session_id, tokens)
         return creds
     except Exception as e:
         print(f"Credential refresh failed: {e}")
@@ -700,25 +720,59 @@ async def save_analysis_result(request: Request, body: dict):
         "sourceName": source_name,
         "connectionId": connection_id,
         "result": result,
-        "updatedAt": datetime.now(),
+        "createdAt": datetime.now(),
     }
-    await mongo_db.analysis_results.update_one(
-        {"userId": user["userId"], "sourceKey": source_key},
-        {"$set": doc, "$setOnInsert": {"createdAt": datetime.now()}},
-        upsert=True,
-    )
+    await mongo_db.analysis_results.insert_one(doc)
+
+    # Keep history bounded — drop anything beyond the most recent 30 runs
+    # for this user+source (oldest first), so this never grows unbounded.
+    cursor = mongo_db.analysis_results.find(
+        {"userId": user["userId"], "sourceKey": source_key}
+    ).sort("createdAt", -1).skip(30)
+    old_ids = [d["_id"] async for d in cursor]
+    if old_ids:
+        await mongo_db.analysis_results.delete_many({"_id": {"$in": old_ids}})
+
     return {"success": True}
+
+
+@app.get("/api/analysis-results/latest")
+async def get_latest_analysis_result(request: Request, source_key: str):
+    """
+    Returns the most recent PRIOR run for this source, before the current
+    one is saved. Used by the frontend to compute cross-device insights
+    (e.g. 'this Google Sheet changed since it was last analyzed on another
+    device').
+    """
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"result": None}
+    doc = await mongo_db.analysis_results.find_one(
+        {"userId": user["userId"], "sourceKey": source_key},
+        sort=[("createdAt", -1)],
+    )
+    if not doc:
+        return {"result": None}
+    return {"result": serialize_doc(doc)}
 
 
 @app.get("/api/analysis-results")
 async def list_analysis_results(request: Request):
+    """Latest run per source — used for the 'Last Run' badge list."""
     user = require_user(request)
     if not user:
         return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
-    cursor = mongo_db.analysis_results.find({"userId": user["userId"]})
-    docs = await cursor.to_list(length=1000)
+    pipeline = [
+        {"$match": {"userId": user["userId"]}},
+        {"$sort": {"createdAt": -1}},
+        {"$group": {"_id": "$sourceKey", "doc": {"$first": "$$ROOT"}}},
+        {"$replaceRoot": {"newRoot": "$doc"}},
+    ]
+    docs = [d async for d in mongo_db.analysis_results.aggregate(pipeline)]
     return [serialize_doc(d) for d in docs]
 
 
@@ -2404,7 +2458,7 @@ def rollback_rule(pipeline_id: str, rule_id: str):
 # ── GOOGLE OAUTH ROUTES ────────────────────────────────────────────────────────
 
 @app.get("/api/auth/google/url")
-def get_google_auth_url(request: Request, response: Response):
+async def get_google_auth_url(request: Request, response: Response):
     if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
         return {"error": "Google OAuth not configured"}
 
@@ -2450,7 +2504,7 @@ def get_google_auth_url(request: Request, response: Response):
 
 
 @app.get("/api/auth/google/callback")
-def google_callback(request: Request, code: str, state: str):
+async def google_callback(request: Request, code: str, state: str):
     # Find which session owns this state
     session_id = ""
     for sid, tokens in list(_session_store.items()):
@@ -2471,7 +2525,7 @@ def google_callback(request: Request, code: str, state: str):
         from fastapi.responses import HTMLResponse
         return HTMLResponse("<html><body><p>Session expired. Please close and try again.</p></body></html>", status_code=400)
 
-    session_tokens = _get_session_tokens(session_id)
+    session_tokens = await _get_session_tokens(session_id)
     flow = Flow.from_client_config(
         {"web": {
             "client_id": GOOGLE_CLIENT_ID,
@@ -2518,7 +2572,7 @@ scopes=[
     except Exception:
         pass
 
-    _save_session_tokens(session_id, session_tokens)
+    await _save_session_tokens(session_id, session_tokens)
 
     from fastapi.responses import HTMLResponse
     return HTMLResponse(content=f"""
@@ -2534,37 +2588,37 @@ scopes=[
     """)
 
 @app.get("/api/auth/google/picker-token")
-def get_picker_token(request: Request):
+async def get_picker_token(request: Request):
     session_id = _get_session_id(request)
     if not session_id:
         return {"error": "Not authenticated"}
-    creds = _get_valid_credentials(session_id)
+    creds = await _get_valid_credentials(session_id)
     if not creds:
         return {"error": "Not authenticated"}
     return {"access_token": creds.token}
 
 
 @app.get("/api/auth/google/status")
-def google_auth_status(request: Request):
+async def google_auth_status(request: Request):
     session_id = _get_session_id(request)
     if not session_id:
         return {"authenticated": False, "email": ""}
-    tokens = _get_session_tokens(session_id)
+    tokens = await _get_session_tokens(session_id)
     if "email" not in tokens:
         return {"authenticated": False, "email": ""}
     return {"authenticated": True, "email": tokens["email"]}
 
 
 @app.get("/api/auth/google/sheets")
-def list_google_sheets(request: Request):
+async def list_google_sheets(request: Request):
     session_id = _get_session_id(request)
     if not session_id:
         return {"error": "Not authenticated", "sheets": []}
-    tokens = _get_session_tokens(session_id)
+    tokens = await _get_session_tokens(session_id)
     if "access_token" not in tokens:
         return {"error": "Not authenticated", "sheets": []}
     try:
-        creds = _get_valid_credentials(session_id)
+        creds = await _get_valid_credentials(session_id)
         if not creds:
             return {"error": "Not authenticated", "sheets": []}
         drive = build("drive", "v3", credentials=creds)
@@ -2595,7 +2649,7 @@ def list_google_sheets(request: Request):
             })
         # Cache per session (stored inside that user's token file)
         tokens["_sheets_cache"] = sheets
-        _save_session_tokens(session_id, tokens)
+        await _save_session_tokens(session_id, tokens)
         return {"sheets": sheets, "email": tokens.get("email", "")}
     except Exception as e:
         return {"error": str(e), "sheets": []}
@@ -2607,7 +2661,7 @@ async def sheet_to_csv(request: Request, body: dict):
     sheet_name = body.get("sheetName", "unnamed")
 
     session_id = _get_session_id(request)
-    tokens = _get_session_tokens(session_id) if session_id else {}
+    tokens = await _get_session_tokens(session_id) if session_id else {}
     if "access_token" not in tokens:
         return {"error": "Not authenticated"}
     if not sheet_id:
@@ -2626,7 +2680,7 @@ async def sheet_to_csv(request: Request, body: dict):
             creds.refresh(GoogleAuthRequest())
             tokens["access_token"] = creds.token
             if session_id:
-                _save_session_tokens(session_id, tokens)
+                await _save_session_tokens(session_id, tokens)
         if not creds.token:
             return {"error": "Not authenticated"}
 
@@ -2673,10 +2727,10 @@ async def sheet_to_csv(request: Request, body: dict):
 
 
 @app.get("/api/auth/google/sheets/{sheet_id}/data")
-def get_sheet_data(request: Request, sheet_id: str, tab: str = "Sheet1"):
+async def get_sheet_data(request: Request, sheet_id: str, tab: str = "Sheet1"):
     """Fetches actual data from a Google Sheet tab and returns it as CSV rows."""
     session_id = _get_session_id(request)
-    tokens = _get_session_tokens(session_id) if session_id else {}
+    tokens = await _get_session_tokens(session_id) if session_id else {}
     if "access_token" not in tokens:
         return {"error": "Not authenticated"}
     try:
@@ -2691,7 +2745,7 @@ def get_sheet_data(request: Request, sheet_id: str, tab: str = "Sheet1"):
         if creds.expired and creds.refresh_token:
             creds.refresh(GoogleAuthRequest())
             tokens["access_token"] = creds.token
-            _save_session_tokens(session_id, tokens)
+            await _save_session_tokens(session_id, tokens)
         if not creds.token:
             return {"error": "Not authenticated"}
 
@@ -2721,11 +2775,11 @@ def get_sheet_data(request: Request, sheet_id: str, tab: str = "Sheet1"):
 
 
 @app.post("/api/auth/google/sheets/{sheet_id}/import")
-def import_sheet_as_source(request: Request, sheet_id: str, tab: str = "Sheet1"):
+async def import_sheet_as_source(request: Request, sheet_id: str, tab: str = "Sheet1"):
     session_id = _get_session_id(request)
     if not session_id:
         return {"error": "Not authenticated"}
-    tokens = _get_session_tokens(session_id)
+    tokens = await _get_session_tokens(session_id)
     if "access_token" not in tokens:
         return {"error": "Not authenticated"}
     try:
@@ -2740,7 +2794,7 @@ def import_sheet_as_source(request: Request, sheet_id: str, tab: str = "Sheet1")
         if creds.expired and creds.refresh_token:
             creds.refresh(GoogleAuthRequest())
             tokens["access_token"] = creds.token
-            _save_session_tokens(session_id, tokens)
+            await _save_session_tokens(session_id, tokens)
         if not creds.token:
             return {"error": "Not authenticated"}
 
@@ -2797,22 +2851,27 @@ def import_sheet_as_source(request: Request, sheet_id: str, tab: str = "Sheet1")
         return {"error": str(e)}
 
 @app.get("/api/auth/google/logout")
-def google_logout(request: Request, response: Response):
+async def google_logout(request: Request, response: Response):
     session_id = _get_session_id(request)
     if session_id:
         _session_store.pop(session_id, None)
         token_file = TOKEN_DIR / f"{session_id}.json"
         if token_file.exists():
             token_file.unlink()
+        if mongo_db is not None:
+            try:
+                await mongo_db.google_sessions.delete_one({"session_id": session_id})
+            except Exception as e:
+                print(f"Could not delete session from MongoDB: {e}")
     response.delete_cookie("datapro_session")
     return {"logged_out": True}
 
 @app.get("/api/auth/google/check")
-def check_and_refresh_google(request: Request):
+async def check_and_refresh_google(request: Request):
     session_id = _get_session_id(request)
     if not session_id:
         return {"authenticated": False, "email": ""}
-    tokens = _get_session_tokens(session_id)
+    tokens = await _get_session_tokens(session_id)
     if "access_token" not in tokens:
         return {"authenticated": False, "email": ""}
     return {
@@ -2822,11 +2881,11 @@ def check_and_refresh_google(request: Request):
     }
 
 @app.get("/api/auth/google/sheets/cached")
-def get_cached_sheets(request: Request):
+async def get_cached_sheets(request: Request):
     session_id = _get_session_id(request)
     if not session_id:
         return {"sheets": [], "cached": False}
-    tokens = _get_session_tokens(session_id)
+    tokens = await _get_session_tokens(session_id)
     cached = tokens.get("_sheets_cache", [])
     if cached:
         return {"sheets": cached, "email": tokens.get("email", ""), "cached": True}
