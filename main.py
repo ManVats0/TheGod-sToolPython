@@ -3128,6 +3128,144 @@ async def ga4_fetch_report(body: dict):
             return {"error": f"Property {property_id} not found. Verify the numeric Property ID in GA4 Admin → Property Settings."}
         return {"error": err_str}
 
+# ── Analysis Results persistence (metadata only — never raw rows) ─────────
+
+MAX_ANALYSIS_HISTORY = 20
+
+def _analysis_source_key(connection_id: str, source_name: str) -> str:
+    """connection_id wins when present (DB/API sources); falls back to the
+    source name itself for CSV / catalog / one-off sources that have no
+    backend connection doc."""
+    return connection_id.strip() if connection_id and connection_id.strip() else source_name.strip()
+
+
+@app.post("/api/analysis-results")
+async def save_analysis_result(request: Request, body: dict):
+    """
+    Upsert the latest analysis metadata for a source, plus append a small
+    trend snapshot to a capped history array. Called by Analysis.tsx right
+    after a successful /api/analyze — with the payload already stripped of
+    sample_data / original_preview / problems on the client side.
+
+    Body:
+      source_name:   str   (required) - display name, e.g. "orders.csv" or "mydb.orders@host"
+      connection_id: str   (optional) - Mongo _id from /api/connections, if this
+                                          source came from a saved connection
+      result:        dict  (required) - trimmed metadata (see toAnalysisMetadata in Analysis.tsx)
+    """
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+
+    source_name   = body.get("source_name", "").strip()
+    connection_id = body.get("connection_id", "").strip()
+    result        = body.get("result", {})
+
+    if not source_name or not result:
+        return {"error": "source_name and result are required"}
+
+    source_key = _analysis_source_key(connection_id, source_name)
+    now = datetime.now()
+
+    history_entry = {
+        "timestamp":      now,
+        "quality_score":  result.get("quality_score"),
+        "total_problems": result.get("total_problems"),
+        "rows":           result.get("dataset_info", {}).get("rows"),
+        "columns":        result.get("dataset_info", {}).get("columns"),
+    }
+
+    await mongo_db.analysis_results.update_one(
+        {"userId": user["userId"], "sourceKey": source_key},
+        {
+            "$set": {
+                "userId":       user["userId"],
+                "sourceKey":    source_key,
+                "sourceName":   source_name,
+                "connectionId": connection_id or None,
+                "result":       result,
+                "updatedAt":    now,
+            },
+            "$setOnInsert": {"createdAt": now},
+            "$push": {
+                "history": {
+                    "$each": [history_entry],
+                    "$slice": -MAX_ANALYSIS_HISTORY,
+                }
+            },
+        },
+        upsert=True,
+    )
+    await log_audit(user["userId"], "analysis.saved", "analysis_result", source_key,
+                     {"sourceName": source_name, "qualityScore": history_entry["quality_score"]})
+    return {"success": True, "sourceKey": source_key}
+
+
+@app.get("/api/analysis-results/{source_key:path}")
+async def get_analysis_result(request: Request, source_key: str):
+    """
+    Fetch the latest saved analysis for a single source. source_key is
+    either a connection_id or a raw source_name (URL-encoded) — same
+    resolution rule as save_analysis_result.
+    """
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+
+    doc = await mongo_db.analysis_results.find_one({
+        "userId": user["userId"],
+        "sourceKey": source_key,
+    })
+    if not doc:
+        return {"found": False}
+
+    return {
+        "found":        True,
+        "sourceName":   doc.get("sourceName", ""),
+        "connectionId": doc.get("connectionId"),
+        "result":       doc.get("result", {}),
+        "history":      doc.get("history", []),
+        "updatedAt":    doc.get("updatedAt").isoformat() if doc.get("updatedAt") else None,
+    }
+
+
+@app.get("/api/analysis-results")
+async def list_analysis_results(request: Request):
+    """
+    Bulk fetch — used by DataSources.tsx to badge every connected source
+    with 'Last Run' in a single call instead of one request per source.
+    Returns only the lightweight bits, not the full result payload.
+    """
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+
+    cursor = mongo_db.analysis_results.find(
+        {"userId": user["userId"]},
+        {"sourceKey": 1, "sourceName": 1, "connectionId": 1, "updatedAt": 1,
+         "result.quality_score": 1, "result.total_problems": 1, "result.dataset_info": 1}
+    )
+    docs = await cursor.to_list(length=1000)
+    return [
+        {
+            "sourceKey":    d.get("sourceKey", ""),
+            "sourceName":   d.get("sourceName", ""),
+            "connectionId": d.get("connectionId"),
+            "updatedAt":    d.get("updatedAt").isoformat() if d.get("updatedAt") else None,
+            "qualityScore": d.get("result", {}).get("quality_score"),
+            "totalProblems": d.get("result", {}).get("total_problems"),
+            "rows":         d.get("result", {}).get("dataset_info", {}).get("rows"),
+        }
+        for d in docs
+    ]
+
+
 @app.post("/api/ai-usage")
 async def ai_usage_route(request: Request):
     auth_header = request.headers.get("Authorization", "")
