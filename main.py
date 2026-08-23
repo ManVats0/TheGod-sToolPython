@@ -3331,6 +3331,160 @@ async def list_analysis_results(request: Request):
     ]
 
 
+# ── Data Catalog persistence (user-authored overlay on analysis_results) ───
+
+@app.post("/api/catalog")
+async def save_catalog_metadata(request: Request, body: dict):
+    """
+    Upsert catalog metadata (description, tags, owner, column definitions)
+    for one source. Only fields present in body are set — omitted fields
+    are left untouched, so the frontend can send partial updates.
+    """
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+
+    source_name   = body.get("source_name", "").strip()
+    connection_id = body.get("connection_id", "").strip()
+    if not source_name:
+        return {"error": "source_name is required"}
+
+    source_key = _analysis_source_key(connection_id, source_name)
+    now = datetime.now()
+
+    set_fields: dict = {
+        "userId":       user["userId"],
+        "sourceKey":    source_key,
+        "sourceName":   source_name,
+        "connectionId": connection_id or None,
+        "updatedAt":    now,
+    }
+    if "description" in body:
+        set_fields["description"] = body.get("description", "")
+    if "tags" in body and isinstance(body.get("tags"), list):
+        set_fields["tags"] = [str(t) for t in body["tags"]]
+    if "owner" in body:
+        set_fields["owner"] = body.get("owner", "")
+
+    column_overrides = body.get("column_overrides")
+    if isinstance(column_overrides, dict):
+        for col_name, override in column_overrides.items():
+            if not isinstance(override, dict):
+                continue
+            safe_col = str(col_name).replace(".", "_").replace("$", "_")
+            for field in ("definition", "sensitivity", "pii"):
+                if field in override:
+                    set_fields[f"columnOverrides.{safe_col}.{field}"] = override[field]
+
+    await mongo_db.catalog_metadata.update_one(
+        {"userId": user["userId"], "sourceKey": source_key},
+        {"$set": set_fields, "$setOnInsert": {"createdAt": now}},
+        upsert=True,
+    )
+    await log_audit(user["userId"], "catalog.updated", "catalog_metadata", source_key,
+                     {"sourceName": source_name})
+    return {"success": True, "sourceKey": source_key}
+
+
+@app.get("/api/catalog/{source_key:path}")
+async def get_catalog_metadata(request: Request, source_key: str):
+    """Single-source catalog doc, merged with its latest analysis for column info."""
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+
+    catalog_doc = await mongo_db.catalog_metadata.find_one(
+        {"userId": user["userId"], "sourceKey": source_key})
+    analysis_doc = await mongo_db.analysis_results.find_one(
+        {"userId": user["userId"], "sourceKey": source_key})
+
+    return {
+        "found":           catalog_doc is not None,
+        "sourceKey":       source_key,
+        "description":     (catalog_doc or {}).get("description", ""),
+        "tags":            (catalog_doc or {}).get("tags", []),
+        "owner":           (catalog_doc or {}).get("owner", ""),
+        "columnOverrides": (catalog_doc or {}).get("columnOverrides", {}),
+        "colInfo":         (analysis_doc or {}).get("result", {}).get("col_info", []),
+        "qualityScore":    (analysis_doc or {}).get("result", {}).get("quality_score"),
+        "updatedAt":       catalog_doc.get("updatedAt").isoformat() if catalog_doc and catalog_doc.get("updatedAt") else None,
+    }
+
+
+@app.get("/api/catalog")
+async def list_catalog_metadata(request: Request):
+    """
+    Bulk fetch — one call to populate the whole catalog grid, joined with
+    each source's latest analysis so descriptions/tags/columns come back
+    together with quality_score/col_info in a single round trip.
+    """
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+
+    catalog_docs = await mongo_db.catalog_metadata.find({"userId": user["userId"]}).to_list(length=1000)
+    analysis_docs = await mongo_db.analysis_results.find(
+        {"userId": user["userId"]},
+        {"sourceKey": 1, "sourceName": 1, "result.quality_score": 1, "result.col_info": 1, "result.dataset_info": 1}
+    ).to_list(length=1000)
+    analysis_by_key = {d.get("sourceKey", ""): d for d in analysis_docs}
+
+    out = []
+    seen_keys = set()
+    for d in catalog_docs:
+        key = d.get("sourceKey", "")
+        seen_keys.add(key)
+        a = analysis_by_key.get(key, {})
+        out.append({
+            "sourceKey":       key,
+            "sourceName":      d.get("sourceName", ""),
+            "description":     d.get("description", ""),
+            "tags":            d.get("tags", []),
+            "owner":           d.get("owner", ""),
+            "columnOverrides": d.get("columnOverrides", {}),
+            "colInfo":         a.get("result", {}).get("col_info", []),
+            "qualityScore":    a.get("result", {}).get("quality_score"),
+            "rows":            a.get("result", {}).get("dataset_info", {}).get("rows"),
+        })
+
+    # Sources with analysis history but no catalog doc yet still get a
+    # lightweight entry so the frontend has col_info before anyone edits.
+    for key, a in analysis_by_key.items():
+        if key in seen_keys or not key:
+            continue
+        out.append({
+            "sourceKey":       key,
+            "sourceName":      a.get("sourceName", ""),
+            "description":     "",
+            "tags":            [],
+            "owner":           "",
+            "columnOverrides": {},
+            "colInfo":         a.get("result", {}).get("col_info", []),
+            "qualityScore":    a.get("result", {}).get("quality_score"),
+            "rows":            a.get("result", {}).get("dataset_info", {}).get("rows"),
+        })
+
+    return out
+
+
+@app.delete("/api/catalog/{source_key:path}")
+async def delete_catalog_metadata(request: Request, source_key: str):
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+    result = await mongo_db.catalog_metadata.delete_one(
+        {"userId": user["userId"], "sourceKey": source_key})
+    return {"success": True, "deleted": result.deleted_count > 0}
+
+
 @app.post("/api/ai-usage")
 async def ai_usage_route(request: Request):
     auth_header = request.headers.get("Authorization", "")
