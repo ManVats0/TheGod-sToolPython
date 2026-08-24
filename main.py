@@ -49,6 +49,8 @@ JWT_SECRET = os.getenv("JWT_SECRET", "")
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 from cryptography.fernet import Fernet
+from datetime import timedelta
+from pymongo.errors import DuplicateKeyError
 
 MONGODB_URI = os.getenv("MONGODB_URI", "")
 mongo_client = AsyncIOMotorClient(MONGODB_URI) if MONGODB_URI else None
@@ -728,6 +730,13 @@ async def reveal_connection(request: Request, connection_id: str):
     localStorage entry on a browser/device that never ran the original
     Test Connection flow, so DB-backed sources (mongo, mysql, postgres…)
     work cross-device without re-entering the URI/password.
+
+    SECURITY NOTE: this ships the plaintext secret to the browser, which
+    defeats server-side encryption-at-rest as a boundary. Left in place
+    because the frontend depends on it today. Every call is now audited
+    below so reveals are at least traceable. Longer-term fix: change the
+    frontend to send connection_id in requests (as /api/analyze already
+    does) instead of ever holding the raw secret client-side.
     """
     user = require_user(request)
     if not user:
@@ -735,6 +744,7 @@ async def reveal_connection(request: Request, connection_id: str):
     conn = await get_decrypted_connection(connection_id, user["userId"])
     if not conn:
         return {"error": "Connection not found"}
+    await log_audit(user["userId"], "connection.revealed", "connection", connection_id)
     return conn
 
 async def get_decrypted_connection(connection_id: str, user_id: str) -> dict | None:
@@ -794,6 +804,12 @@ async def save_pipeline(request: Request, body: dict):
         "destinationId": body.get("destinationId", ""),
         "sourceName": body.get("sourceName", ""),
         "destinationName": body.get("destinationName", ""),
+        # NEW: link to /api/connections._id so the server-side executor can
+        # resolve credentials without the browser. Optional — pipelines saved
+        # before this change simply won't be executable via /execute until
+        # re-saved with these set; nothing else about them breaks.
+        "sourceConnectionId": body.get("sourceConnectionId"),
+        "destinationConnectionId": body.get("destinationConnectionId"),
         "destinationMode": body.get("destinationMode", "replace"),
         "transformations": body.get("transformations", []),
         "schedule": body.get("schedule"),
@@ -830,6 +846,590 @@ async def delete_pipeline(request: Request, pipeline_id: str):
     result = await mongo_db.pipelines.delete_one({"_id": ObjectId(pipeline_id), "userId": user["userId"]})
     await log_audit(user["userId"], "pipeline.deleted", "pipeline", pipeline_id)
     return {"success": result.deleted_count > 0}
+
+
+# ── Pipeline execution engine ───────────────────────────────────────────────
+# Runs entirely server-side: no browser tab required, no localStorage
+# credentials. Scoped to mongodb + mysql source/destination types for now —
+# add more branches following the same shape once these are verified.
+
+async def log_pipeline_run(user_id: str, pipeline_id: str, status: str, rows_in: int,
+                            rows_out: int, duration_ms: int, steps: list,
+                            triggered_by: str = "manual", error: str | None = None):
+    if mongo_db is None:
+        return
+    try:
+        await mongo_db.runs.insert_one({
+            "ts": datetime.now(),
+            "pipelineId": pipeline_id,
+            "userId": user_id,
+            "status": status,
+            "rowsIn": rows_in,
+            "rowsOut": rows_out,
+            "durationMs": duration_ms,
+            "steps": steps,
+            "triggeredBy": triggered_by,
+            "error": error,
+        })
+    except Exception as e:
+        print(f"Run log write failed: {e}")
+
+
+async def _fetch_mongo_source_df(uri: str, database: str, collection: str,
+                                  max_docs: int = 500000) -> pd.DataFrame:
+    """
+    Streams the collection via async cursor iteration with an explicit
+    batch_size, instead of the single .to_list(length=500000) call used
+    elsewhere in this file. Avoids also writing/re-reading a CSV file that
+    the old fetch-then-download-then-reload path forced.
+    """
+    client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=8000)
+    try:
+        coll = client[database][collection]
+        docs = []
+        cursor = coll.find({}, {"_id": 0}).batch_size(2000)
+        async for doc in cursor:
+            docs.append(doc)
+            if len(docs) >= max_docs:
+                break
+        if not docs:
+            raise RuntimeError(f"Collection '{collection}' is empty or has no documents.")
+        df = pd.DataFrame(docs)
+        for col in df.columns:
+            if df[col].apply(lambda x: isinstance(x, (dict, list))).any():
+                df[col] = df[col].apply(lambda x: json.dumps(x, default=str) if isinstance(x, (dict, list)) else x)
+        return df
+    finally:
+        client.close()
+
+
+def _apply_deterministic_transforms(df: pd.DataFrame, transformations: list):
+    """
+    Mirrors the plain-transform logic in /api/clean-data, applied by
+    transformation `type` rather than form-encoded booleans. Returns
+    (df, unsupported_types) — unsupported types (ai_custom, sql_custom,
+    etc.) are reported, never silently dropped or silently misapplied.
+    """
+    types_present = {t.get("type") for t in transformations if isinstance(t, dict)}
+
+    if "remove_duplicates" in types_present:
+        df = df.drop_duplicates()
+    if "remove_empty_rows" in types_present:
+        df = df.dropna(how="all")
+    if "standardize_text" in types_present:
+        for col in df.select_dtypes(include="object").columns:
+            df[col] = df[col].astype(str).str.lower().str.strip()
+    if "fill_missing" in types_present or "ai_clean" in types_present:
+        for col in df.select_dtypes(include=[np.number]).columns:
+            df[col] = df[col].fillna(df[col].median())
+        for col in df.select_dtypes(include="object").columns:
+            df[col] = df[col].fillna(df[col].mode()[0] if not df[col].mode().empty else "unknown")
+    if "cap_outliers" in types_present:
+        for col in df.select_dtypes(include=[np.number]).columns:
+            col_data = df[col].dropna()
+            if len(col_data) == 0:
+                continue
+            median = col_data.median()
+            mad = np.median(np.abs(col_data - median))
+            if mad == 0:
+                continue
+            lower = median - (3.5 * mad / 0.6745)
+            upper = median + (3.5 * mad / 0.6745)
+            df[col] = df[col].clip(lower, upper)
+    if "fix_dates" in types_present:
+        for col in df.select_dtypes(include="object").columns:
+            try:
+                parsed = pd.to_datetime(df[col], errors="coerce")
+                if parsed.notna().sum() > len(df) * 0.5:
+                    df[col] = parsed.dt.strftime("%Y-%m-%d")
+            except Exception:
+                pass
+
+    unsupported = sorted(types_present - {
+        "remove_duplicates", "remove_empty_rows", "standardize_text",
+        "fill_missing", "cap_outliers", "fix_dates", "ai_clean",
+    })
+    return df, unsupported
+
+
+async def _fetch_source_df(conn_type: str, cfg: dict, creds: dict) -> pd.DataFrame:
+    """Returns a DataFrame for any supported source connection type."""
+    if conn_type == "mongodb":
+        uri = creds.get("uri") or cfg.get("uri", "")
+        database = cfg.get("database", "")
+        collections = cfg.get("collections") or []
+        collection = cfg.get("collection") or (collections[0] if collections else "")
+        if not all([uri, database, collection]):
+            raise RuntimeError("MongoDB source is missing uri/database/collection.")
+        return await _fetch_mongo_source_df(uri, database, collection)
+
+    if conn_type == "mysql":
+        tables = cfg.get("tables") or []
+        table = cfg.get("table") or (tables[0] if tables else "")
+        result = await mysql_fetch_table({
+            "host": cfg.get("host", ""), "port": cfg.get("port", 3306),
+            "user": creds.get("user", ""), "password": creds.get("password", ""),
+            "database": cfg.get("database", ""), "table": table, "ssl": cfg.get("ssl", False),
+        })
+        if result.get("error"):
+            raise RuntimeError(f"MySQL fetch failed: {result['error']}")
+        return pd.read_csv(os.path.join(UPLOAD_DIR, result["filename"]))
+
+    if conn_type == "postgres":
+        tables = cfg.get("tables") or []
+        table = cfg.get("table") or (tables[0] if tables else "")
+        result = await postgres_fetch_table({
+            "host": cfg.get("host", ""), "port": cfg.get("port", 5432),
+            "user": creds.get("user", ""), "password": creds.get("password", ""),
+            "database": cfg.get("database", ""), "table": table, "ssl": cfg.get("ssl", False),
+        })
+        if result.get("error"):
+            raise RuntimeError(f"PostgreSQL fetch failed: {result['error']}")
+        return pd.read_csv(os.path.join(UPLOAD_DIR, result["filename"]))
+
+    if conn_type == "cloudsql":
+        tables = cfg.get("tables") or []
+        table = cfg.get("table") or (tables[0] if tables else "")
+        db_type = cfg.get("dbType", "postgres")
+        fetch_fn = mysql_fetch_table if db_type == "mysql" else postgres_fetch_table
+        port_default = 3306 if db_type == "mysql" else 5432
+        result = await fetch_fn({
+            "host": cfg.get("instanceConnectionName", ""), "port": cfg.get("port", port_default),
+            "user": creds.get("user", ""), "password": creds.get("password", ""),
+            "database": cfg.get("database", ""), "table": table, "ssl": True,
+        })
+        if result.get("error"):
+            raise RuntimeError(f"Cloud SQL fetch failed: {result['error']}")
+        return pd.read_csv(os.path.join(UPLOAD_DIR, result["filename"]))
+
+    if conn_type == "bigquery":
+        tables = cfg.get("tables") or []
+        table = cfg.get("table") or (tables[0] if tables else "")
+        result = await bigquery_fetch_table({
+            "key_json": creds.get("key_json", ""), "project": cfg.get("project", ""),
+            "dataset": cfg.get("dataset", ""), "table": table,
+        })
+        if result.get("error"):
+            raise RuntimeError(f"BigQuery fetch failed: {result['error']}")
+        return pd.read_csv(os.path.join(UPLOAD_DIR, result["filename"]))
+
+    if conn_type == "gcs":
+        files = cfg.get("files") or []
+        file_path = cfg.get("file") or (files[0] if files else "")
+        result = await gcs_fetch_file({
+            "key_json": creds.get("key_json", ""), "project": cfg.get("project", ""),
+            "bucket": cfg.get("bucket", ""), "file": file_path,
+        })
+        if result.get("error"):
+            raise RuntimeError(f"GCS fetch failed: {result['error']}")
+        return pd.read_csv(os.path.join(UPLOAD_DIR, result["filename"]))
+
+    if conn_type == "databricks":
+        tables = cfg.get("tables") or []
+        table = cfg.get("table") or (tables[0] if tables else "")
+        result = await databricks_fetch_table({
+            "host": cfg.get("host", ""), "httpPath": cfg.get("httpPath", ""),
+            "token": creds.get("token", ""), "catalog": cfg.get("catalog", "hive_metastore"),
+            "schema": cfg.get("schema", "default"), "table": table,
+        })
+        if result.get("error"):
+            raise RuntimeError(f"Databricks fetch failed: {result['error']}")
+        return pd.read_csv(os.path.join(UPLOAD_DIR, result["filename"]))
+
+    if conn_type == "aws":
+        tables = cfg.get("tables") or []
+        table = cfg.get("table") or (tables[0] if tables else "")
+        result = await aws_fetch_table({
+            "service": cfg.get("service", "rds-mysql"), "region": cfg.get("region", "us-east-1"),
+            "accessKeyId": creds.get("accessKeyId", ""), "secretAccessKey": creds.get("secretAccessKey", ""),
+            "table": table, "bucket": cfg.get("bucket", ""), "host": cfg.get("host", ""),
+            "port": cfg.get("port", ""), "user": creds.get("user", ""), "password": creds.get("password", ""),
+            "database": cfg.get("database", ""),
+        })
+        if result.get("error"):
+            raise RuntimeError(f"AWS fetch failed: {result['error']}")
+        return pd.read_csv(os.path.join(UPLOAD_DIR, result["filename"]))
+
+    if conn_type == "rest":
+        result = await rest_fetch_endpoint({
+            "base_url": cfg.get("base_url", ""), "endpoint": cfg.get("endpoint", "/"),
+            "headers": cfg.get("headers", {}), "verify_ssl": cfg.get("verify_ssl", True),
+        })
+        if result.get("error"):
+            raise RuntimeError(f"REST API fetch failed: {result['error']}")
+        return pd.read_csv(os.path.join(UPLOAD_DIR, result["filename"]))
+
+    if conn_type == "ga4":
+        result = await ga4_fetch_report({
+            "key_json": creds.get("key_json", ""), "property_id": cfg.get("property_id", ""),
+            "metrics": cfg.get("metrics", "sessions,activeUsers"), "dimensions": cfg.get("dimensions", "date"),
+            "start_date": cfg.get("start_date", "30daysAgo"), "end_date": cfg.get("end_date", "today"),
+        })
+        if result.get("error"):
+            raise RuntimeError(f"GA4 fetch failed: {result['error']}")
+        return pd.read_csv(os.path.join(UPLOAD_DIR, result["filename"]))
+
+    raise RuntimeError(f"Source type '{conn_type}' is not supported by the server-side executor.")
+
+
+async def _write_destination_df(conn_type: str, cfg: dict, creds: dict, df: pd.DataFrame, mode: str) -> dict:
+    """Writes a DataFrame to any supported destination connection type."""
+    buf = io.StringIO()
+    df.to_csv(buf, index=False)
+    csv_data = buf.getvalue()
+
+    if conn_type == "mongodb":
+        collections = cfg.get("collections") or []
+        collection = cfg.get("collection") or (collections[0] if collections else "")
+        result = await mongo_write_collection({
+            "uri": creds.get("uri") or cfg.get("uri", ""), "database": cfg.get("database", ""),
+            "collection": collection, "csvData": csv_data, "mode": mode,
+        })
+        if not result.get("success"):
+            raise RuntimeError(f"MongoDB write failed: {result.get('error')}")
+        return result
+
+    if conn_type == "mysql":
+        tables = cfg.get("tables") or []
+        table = cfg.get("table") or (tables[0] if tables else "")
+        result = await mysql_write_table({
+            "host": cfg.get("host", ""), "port": cfg.get("port", 3306),
+            "user": creds.get("user", ""), "password": creds.get("password", ""),
+            "database": cfg.get("database", ""), "table": table, "ssl": cfg.get("ssl", False),
+            "csvData": csv_data, "mode": mode,
+        })
+        if not result.get("success"):
+            raise RuntimeError(f"MySQL write failed: {result.get('error')}")
+        return result
+
+    if conn_type == "postgres":
+        tables = cfg.get("tables") or []
+        table = cfg.get("table") or (tables[0] if tables else "")
+        result = await postgres_write_table({
+            "host": cfg.get("host", ""), "port": cfg.get("port", 5432),
+            "user": creds.get("user", ""), "password": creds.get("password", ""),
+            "database": cfg.get("database", ""), "table": table, "ssl": cfg.get("ssl", False),
+            "csvData": csv_data, "mode": mode,
+        })
+        if not result.get("success"):
+            raise RuntimeError(f"PostgreSQL write failed: {result.get('error')}")
+        return result
+
+    if conn_type == "cloudsql":
+        tables = cfg.get("tables") or []
+        table = cfg.get("table") or (tables[0] if tables else "")
+        db_type = cfg.get("dbType", "postgres")
+        write_fn = mysql_write_table if db_type == "mysql" else postgres_write_table
+        port_default = 3306 if db_type == "mysql" else 5432
+        result = await write_fn({
+            "host": cfg.get("instanceConnectionName", ""), "port": cfg.get("port", port_default),
+            "user": creds.get("user", ""), "password": creds.get("password", ""),
+            "database": cfg.get("database", ""), "table": table, "ssl": True,
+            "csvData": csv_data, "mode": mode,
+        })
+        if not result.get("success"):
+            raise RuntimeError(f"Cloud SQL write failed: {result.get('error')}")
+        return result
+
+    if conn_type == "bigquery":
+        tables = cfg.get("tables") or []
+        table = cfg.get("table") or (tables[0] if tables else "")
+        result = await bigquery_write_table({
+            "key_json": creds.get("key_json", ""), "project": cfg.get("project", ""),
+            "dataset": cfg.get("dataset", ""), "table": table, "csvData": csv_data, "mode": mode,
+        })
+        if not result.get("success"):
+            raise RuntimeError(f"BigQuery write failed: {result.get('error')}")
+        return result
+
+    if conn_type == "gcs":
+        files = cfg.get("files") or []
+        file_path = cfg.get("file") or (files[0] if files else "")
+        result = await gcs_write_file({
+            "key_json": creds.get("key_json", ""), "project": cfg.get("project", ""),
+            "bucket": cfg.get("bucket", ""), "file": file_path, "csvData": csv_data, "mode": mode,
+        })
+        if not result.get("success"):
+            raise RuntimeError(f"GCS write failed: {result.get('error')}")
+        return result
+
+    if conn_type == "databricks":
+        tables = cfg.get("tables") or []
+        table = cfg.get("table") or (tables[0] if tables else "")
+        result = await databricks_write_table({
+            "host": cfg.get("host", ""), "httpPath": cfg.get("httpPath", ""),
+            "token": creds.get("token", ""), "catalog": cfg.get("catalog", "hive_metastore"),
+            "schema": cfg.get("schema", "default"), "table": table, "csvData": csv_data, "mode": mode,
+        })
+        if not result.get("success"):
+            raise RuntimeError(f"Databricks write failed: {result.get('error')}")
+        return result
+
+    if conn_type == "aws":
+        tables = cfg.get("tables") or []
+        table = cfg.get("table") or (tables[0] if tables else "")
+        result = await aws_write_table({
+            "service": cfg.get("service", "rds-mysql"), "region": cfg.get("region", "us-east-1"),
+            "accessKeyId": creds.get("accessKeyId", ""), "secretAccessKey": creds.get("secretAccessKey", ""),
+            "table": table, "host": cfg.get("host", ""), "port": cfg.get("port", ""),
+            "user": creds.get("user", ""), "password": creds.get("password", ""),
+            "database": cfg.get("database", ""), "csvData": csv_data, "mode": mode,
+        })
+        if not result.get("success"):
+            raise RuntimeError(f"AWS write failed: {result.get('error')}")
+        return result
+
+    if conn_type == "rest":
+        result = await rest_write_endpoint({
+            "base_url": cfg.get("base_url", ""), "endpoint": cfg.get("endpoint", "/"),
+            "headers": cfg.get("headers", {}), "verify_ssl": cfg.get("verify_ssl", True),
+            "csvData": csv_data, "mode": mode,
+        })
+        if not result.get("success"):
+            raise RuntimeError(f"REST API write failed: {result.get('error')}")
+        return result
+
+    raise RuntimeError(
+        f"Destination type '{conn_type}' is not supported by the server-side executor "
+        f"(GA4 is read-only by design — it has no write-back path)."
+    )
+
+
+async def _run_pipeline(pipeline: dict, triggered_by: str = "manual") -> dict:
+    start = time.time()
+    pipeline_id = str(pipeline["_id"])
+    user_id = pipeline["userId"]
+    steps_log = []
+
+    try:
+        source_conn_id = pipeline.get("sourceConnectionId")
+        if not source_conn_id:
+            raise RuntimeError(
+                "Pipeline has no linked sourceConnectionId — re-save the pipeline "
+                "after connecting its source via /api/connections."
+            )
+        source_conn = await get_decrypted_connection(source_conn_id, user_id)
+        if not source_conn:
+            raise RuntimeError("Source connection not found or could not be decrypted.")
+
+        source_type = source_conn["type"]
+        cfg = source_conn.get("config", {})
+        creds = source_conn.get("credentials", {})
+
+        df = await _fetch_source_df(source_type, cfg, creds)
+        rows_in = len(df)
+
+        steps_log.append({"name": "fetch_source", "status": "success"})
+
+        df, unsupported = _apply_deterministic_transforms(df, pipeline.get("transformations", []))
+        for u in unsupported:
+            steps_log.append({"name": u, "status": "skipped",
+                               "message": "Not yet supported by server-side executor"})
+
+        rows_out = len(df)
+        dest_conn_id = pipeline.get("destinationConnectionId")
+        dest_mode = pipeline.get("destinationMode", "replace")
+        result_info: dict = {}
+
+        if dest_conn_id:
+            dest_conn = await get_decrypted_connection(dest_conn_id, user_id)
+            if not dest_conn:
+                raise RuntimeError("Destination connection not found or could not be decrypted.")
+            dest_type = dest_conn["type"]
+            dcfg = dest_conn.get("config", {})
+            dcreds = dest_conn.get("credentials", {})
+            result_info = await _write_destination_df(dest_type, dcfg, dcreds, df, dest_mode)
+        else:
+            filename = f"pipeline_{pipeline_id}_{uuid.uuid4().hex[:8]}.csv"
+            df.to_csv(os.path.join(UPLOAD_DIR, filename), index=False)
+            result_info = {"download_url": f"/api/download/{filename}"}
+
+        steps_log.append({"name": "write_destination", "status": "success"})
+        duration_ms = int((time.time() - start) * 1000)
+
+        await mongo_db.pipelines.update_one(
+            {"_id": pipeline["_id"]},
+            {"$set": {"lastRun": datetime.now()}, "$inc": {"runCount": 1}},
+        )
+        await log_pipeline_run(user_id, pipeline_id, "success", rows_in, rows_out,
+                                duration_ms, steps_log, triggered_by)
+        return {"status": "success", "rowsIn": rows_in, "rowsOut": rows_out,
+                "durationMs": duration_ms, **result_info}
+
+    except Exception as e:
+        duration_ms = int((time.time() - start) * 1000)
+        steps_log.append({"name": "error", "status": "failed", "message": str(e)})
+        try:
+            await mongo_db.pipelines.update_one(
+                {"_id": pipeline["_id"]},
+                {"$set": {"lastRun": datetime.now()}, "$inc": {"runCount": 1}},
+            )
+        except Exception:
+            pass
+        await log_pipeline_run(user_id, pipeline_id, "failed", 0, 0, duration_ms,
+                                steps_log, triggered_by, error=str(e))
+        return {"status": "failed", "error": str(e)}
+
+
+@app.post("/api/pipelines/{pipeline_id}/execute")
+async def execute_pipeline_route(request: Request, pipeline_id: str):
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+    pipeline = await mongo_db.pipelines.find_one({"_id": ObjectId(pipeline_id), "userId": user["userId"]})
+    if not pipeline:
+        return {"error": "Pipeline not found"}
+    got_lock = await _try_acquire_pipeline_lock(pipeline_id, ttl_seconds=600)
+    if not got_lock:
+        return {"status": "failed", "error": "Pipeline is already running (scheduled or manual run in progress)."}
+    try:
+        result = await _run_pipeline(pipeline, triggered_by="manual")
+    finally:
+        await _release_pipeline_lock(pipeline_id)
+    await log_audit(user["userId"], "pipeline.executed", "pipeline", pipeline_id,
+                     {"status": result.get("status")})
+    return result
+
+
+@app.get("/api/pipelines/{pipeline_id}/runs")
+async def list_pipeline_runs(request: Request, pipeline_id: str, limit: int = 50):
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+    capped = min(limit, 200)
+    cursor = mongo_db.runs.find(
+        {"pipelineId": pipeline_id, "userId": user["userId"]}
+    ).sort("ts", -1).limit(capped)
+    docs = await cursor.to_list(length=capped)
+    return [serialize_doc(d) for d in docs]
+
+
+# ── Server-side scheduler ───────────────────────────────────────────────────
+# Polling-based, keyed off the existing scheduleMs/lastRun fields already
+# saved by the frontend — no cron parser added, no new dependency. Runs in
+# this process only; if you scale to multiple backend workers later, this
+# in-memory _pipelines_running guard needs to move to a Mongo-based lock
+# (e.g. a TTL "lock" document) so two workers can't double-fire the same
+# pipeline. Single-worker deployments (current setup) are safe as-is.
+
+_SCHEDULER_POLL_SECONDS = 30
+
+
+async def _ensure_lock_indexes():
+    if mongo_db is None:
+        return
+    try:
+        await mongo_db.pipeline_locks.create_index("pipelineId", unique=True)
+        await mongo_db.pipeline_locks.create_index("expiresAt", expireAfterSeconds=0)
+    except Exception as e:
+        print(f"Could not ensure lock indexes: {e}")
+
+
+async def _try_acquire_pipeline_lock(pipeline_id: str, ttl_seconds: int = 300) -> bool:
+    """
+    Cross-process/cross-replica safe claim, backed by a unique index on
+    pipelineId. A crashed worker can't hold a lock forever — expiresAt has a
+    TTL index, so Mongo auto-deletes the doc once it expires. Falls back to
+    always-allow if Mongo isn't configured (same as the old single-worker
+    behavior, so no regression there).
+    """
+    if mongo_db is None:
+        return True
+    now = datetime.now()
+    try:
+        await mongo_db.pipeline_locks.insert_one({
+            "pipelineId": pipeline_id,
+            "lockedAt": now,
+            "expiresAt": now + timedelta(seconds=ttl_seconds),
+        })
+        return True
+    except DuplicateKeyError:
+        return False
+    except Exception as e:
+        print(f"Lock acquire error for {pipeline_id}: {e}")
+        return False
+
+
+async def _release_pipeline_lock(pipeline_id: str):
+    if mongo_db is None:
+        return
+    try:
+        await mongo_db.pipeline_locks.delete_one({"pipelineId": pipeline_id})
+    except Exception:
+        pass
+
+
+async def _run_scheduled_pipeline(pipeline: dict, pid: str):
+    try:
+        await _run_pipeline(pipeline, triggered_by="schedule")
+    finally:
+        await _release_pipeline_lock(pid)
+
+
+async def _scheduler_loop():
+    while True:
+        try:
+            if mongo_db is not None:
+                now = datetime.now()
+                cursor = mongo_db.pipelines.find({"isActive": True, "scheduleMs": {"$gt": 0}})
+                async for pipeline in cursor:
+                    pid = str(pipeline["_id"])
+                    interval_ms = pipeline.get("scheduleMs") or 0
+                    last_run = pipeline.get("lastRun")
+                    due = last_run is None or (now - last_run).total_seconds() * 1000 >= interval_ms
+
+                    start_date = pipeline.get("scheduleStartDate")
+                    if due and start_date:
+                        try:
+                            if now.date() < datetime.strptime(start_date, "%Y-%m-%d").date():
+                                due = False
+                        except Exception:
+                            pass
+
+                    if due:
+                        got_lock = await _try_acquire_pipeline_lock(pid, ttl_seconds=max(300, int(interval_ms / 1000)))
+                        if got_lock:
+                            asyncio.create_task(_run_scheduled_pipeline(pipeline, pid))
+        except Exception as e:
+            print(f"Scheduler loop error: {e}")
+        await asyncio.sleep(_SCHEDULER_POLL_SECONDS)
+
+
+async def _ensure_runs_collection():
+    if mongo_db is None:
+        return
+    try:
+        existing = await mongo_db.list_collection_names()
+        if "runs" not in existing:
+            await mongo_db.create_collection(
+                "runs",
+                timeseries={"timeField": "ts", "metaField": "pipelineId", "granularity": "minutes"},
+            )
+            print("✓ Created 'runs' time-series collection")
+    except Exception as e:
+        print(f"Could not create 'runs' as time-series (falling back to normal collection): {e}")
+
+
+async def _ensure_pipeline_indexes():
+    if mongo_db is None:
+        return
+    try:
+        await mongo_db.runs.create_index([("pipelineId", 1), ("ts", -1)])
+        await mongo_db.pipelines.create_index([("userId", 1), ("sourceId", 1), ("destinationId", 1)])
+    except Exception as e:
+        print(f"Could not ensure indexes: {e}")
+
+
+@app.on_event("startup")
+async def _on_startup_pipeline_engine():
+    await _ensure_runs_collection()
+    await _ensure_pipeline_indexes()
+    await _ensure_lock_indexes()
+    asyncio.create_task(_scheduler_loop())
 
 
 # ── Audit logs ────────────────────────────────────────────────────────────
