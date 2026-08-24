@@ -903,27 +903,183 @@ async def _fetch_mongo_source_df(uri: str, database: str, collection: str,
         client.close()
 
 
-def _apply_deterministic_transforms(df: pd.DataFrame, transformations: list):
+async def _write_gsheet_df(session_id: str, sheet_id: str, sheet_name: str,
+                            df: pd.DataFrame, mode: str) -> dict:
     """
-    Mirrors the plain-transform logic in /api/clean-data, applied by
-    transformation `type` rather than form-encoded booleans. Returns
-    (df, unsupported_types) — unsupported types (ai_custom, sql_custom,
-    etc.) are reported, never silently dropped or silently misapplied.
+    Writes to Google Sheets using the OAuth session tokens already stored
+    for `session_id` (same store update_gsheet/sheet_to_csv use). The
+    connection's 'credentials' holds a sessionId reference, not a static
+    secret. If that session has logged out with no refresh token, this
+    fails with a clear, actionable error rather than silently no-op'ing.
     """
-    types_present = {t.get("type") for t in transformations if isinstance(t, dict)}
+    if not session_id:
+        return {"success": False, "error": "No Google session linked to this destination. Reconnect Google Sheets for this pipeline in Flow."}
+    tokens = await _get_session_tokens(session_id)
+    if "access_token" not in tokens:
+        return {"success": False, "error": "Google Sheets session expired or not authenticated. Reconnect in Flow."}
+    try:
+        creds = Credentials(
+            token=tokens.get("access_token"),
+            refresh_token=tokens.get("refresh_token"),
+            token_uri=tokens.get("token_uri", "https://oauth2.googleapis.com/token"),
+            client_id=tokens.get("client_id", GOOGLE_CLIENT_ID),
+            client_secret=tokens.get("client_secret", GOOGLE_CLIENT_SECRET),
+            scopes=tokens.get("scopes"),
+        )
+        if creds.expired and creds.refresh_token:
+            creds.refresh(GoogleAuthRequest())
+            tokens["access_token"] = creds.token
+            await _save_session_tokens(session_id, tokens)
+        if not creds.token:
+            return {"success": False, "error": "Google Sheets not authenticated."}
 
-    if "remove_duplicates" in types_present:
+        with _gsheets_write_lock:
+            last = _gsheets_last_write.get(sheet_id, 0)
+            elapsed = time.time() - last
+            if elapsed < GSHEETS_MIN_INTERVAL_SECONDS:
+                return {"success": False, "skipped": True,
+                        "error": f"Rate-limited: wrote to this sheet {round(elapsed,1)}s ago. Min interval {GSHEETS_MIN_INTERVAL_SECONDS}s."}
+            _gsheets_last_write[sheet_id] = time.time()
+
+        service = build("sheets", "v4", credentials=creds)
+        tab = "Sheet1"
+
+        if mode == "append":
+            try:
+                existing = service.spreadsheets().values().get(spreadsheetId=sheet_id, range=tab).execute()
+                values_existing = existing.get("values", [])
+                if values_existing:
+                    headers = values_existing[0]
+                    rows = [dict(zip(headers, r + [""] * (len(headers) - len(r)))) for r in values_existing[1:]]
+                    existing_df = pd.DataFrame(rows)
+                    all_cols = list(dict.fromkeys(list(existing_df.columns) + list(df.columns)))
+                    existing_df = existing_df.reindex(columns=all_cols)
+                    df = df.reindex(columns=all_cols)
+                    df = pd.concat([existing_df, df], ignore_index=True)
+            except Exception as e:
+                print(f"Sheets append merge skipped (no existing data or fetch error): {e}")
+
+        str_df = df.fillna("").astype(str)
+        values = [str_df.columns.tolist()] + str_df.values.tolist()
+
+        service.spreadsheets().values().clear(spreadsheetId=sheet_id, range=f"{tab}!A1:ZZ1000000").execute()
+        service.spreadsheets().values().update(
+            spreadsheetId=sheet_id, range=f"{tab}!A1",
+            valueInputOption="RAW", body={"values": values},
+        ).execute()
+
+        print(f"✅ Sheets write (pipeline executor): {sheet_name} ({sheet_id}) — {len(df)} rows")
+        return {"success": True, "rows_written": len(df), "sheet_id": sheet_id}
+    except Exception as e:
+        err_str = str(e)
+        if "RATE_LIMIT_EXCEEDED" in err_str or "429" in err_str or "quota" in err_str.lower():
+            return {"success": False, "error": "Google Sheets rate limit hit. Wait 60 seconds and run again."}
+        return {"success": False, "error": err_str}
+
+
+def _is_safe_readonly_sql(sql: str) -> tuple[bool, str]:
+    """Same allow-list logic as /api/sql-clean's inline check, factored out
+    so the executor's sql_custom steps get the same protection."""
+    import re
+    no_block = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
+    no_line = re.sub(r"--[^\n]*", "", no_block)
+    stripped = no_line.strip().lstrip("(").strip()
+    lowered = stripped.lower()
+    if not (lowered.startswith("select") or lowered.startswith("with")):
+        return False, "Only SELECT / WITH queries are allowed."
+    blocked = ["attach ", "pragma ", "copy ", "install ", "load ", "create ",
+               "insert ", "update ", "delete ", "drop ", "call "]
+    if any(b in lowered for b in blocked):
+        return False, "Query contains a disallowed keyword."
+    return True, ""
+
+
+async def _apply_sql_custom_step(df: pd.DataFrame, sql: str) -> tuple[pd.DataFrame, str | None]:
+    import duckdb
+    ok, reason = _is_safe_readonly_sql(sql)
+    if not ok:
+        return df, reason
+    try:
+        con = duckdb.connect(database=":memory:")
+        con.register("source", df)
+        result_df = con.execute(sql).fetchdf()
+        con.close()
+        return result_df, None
+    except Exception as e:
+        return df, f"SQL error: {e}"
+
+
+async def _apply_ai_custom_rule(df: pd.DataFrame, instruction: str) -> tuple[pd.DataFrame, str | None]:
+    """Same prompt/exec pattern as /api/clean-data's ai_custom_instructions
+    loop, applied to one instruction at a time."""
+    api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return df, "ANTHROPIC_API_KEY not set — AI custom rule skipped."
+    if not instruction:
+        return df, "Empty instruction — skipped."
+    try:
+        import anthropic
+        preview_cols = list(df.columns)
+        sample = df.head(5).fillna("").to_dict("records")
+        client = anthropic.Anthropic(api_key=api_key)
+        message = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=1024,
+            messages=[{
+                "role": "user",
+                "content": f"""You are a pandas data cleaning expert. Given this DataFrame info and instruction, write ONLY the pandas Python code to apply the transformation.
+
+Columns: {preview_cols}
+Sample rows: {sample}
+Instruction: {instruction}
+
+Rules:
+- The DataFrame variable is called `df`
+- Write only the transformation code, no imports, no print statements
+- Do not reassign df to a new variable name, use df = ... or df.drop(..., inplace=True) etc
+- If replacing a value in a numeric column with a non-numeric value, convert the column to string first (df['col'] = df['col'].astype(str))
+- Keep it simple and safe
+
+Reply with ONLY the Python code, nothing else, no markdown, no backticks."""
+            }]
+        )
+        code = message.content[0].text.strip()
+        code = code.replace("```python", "").replace("```", "").strip()
+        local_vars = {"df": df, "pd": pd, "np": np}
+        exec(code, {"pd": pd, "np": np}, local_vars)
+        return local_vars.get("df", df), None
+    except Exception as e:
+        return df, f"AI custom rule failed: {e}"
+
+
+async def _apply_transformations(df: pd.DataFrame, transformations: list) -> tuple[pd.DataFrame, list]:
+    """
+    Deterministic steps mirror /api/clean-data, grouped by type (order-
+    independent, same as the client-side preview). ai_custom and sql_custom
+    now actually execute here (previously reported as 'skipped' by the
+    server-side executor) — applied per-instance, in pipeline order, since
+    each carries its own query/instruction. Returns (df, steps_log).
+    """
+    steps_log: list = []
+    types_present = {t.get("type") for t in transformations if isinstance(t, dict)}
+    ai_clean_on = "ai_clean" in types_present
+
+    if "remove_duplicates" in types_present or ai_clean_on:
         df = df.drop_duplicates()
-    if "remove_empty_rows" in types_present:
+        steps_log.append({"name": "remove_duplicates", "status": "success"})
+    if "remove_empty_rows" in types_present or ai_clean_on:
         df = df.dropna(how="all")
-    if "standardize_text" in types_present:
+        steps_log.append({"name": "remove_empty_rows", "status": "success"})
+    if "standardize_text" in types_present or ai_clean_on:
         for col in df.select_dtypes(include="object").columns:
             df[col] = df[col].astype(str).str.lower().str.strip()
-    if "fill_missing" in types_present or "ai_clean" in types_present:
+        steps_log.append({"name": "standardize_text", "status": "success"})
+    if "fill_missing" in types_present or ai_clean_on:
         for col in df.select_dtypes(include=[np.number]).columns:
             df[col] = df[col].fillna(df[col].median())
         for col in df.select_dtypes(include="object").columns:
             df[col] = df[col].fillna(df[col].mode()[0] if not df[col].mode().empty else "unknown")
+        steps_log.append({"name": "fill_missing", "status": "success"})
     if "cap_outliers" in types_present:
         for col in df.select_dtypes(include=[np.number]).columns:
             col_data = df[col].dropna()
@@ -936,6 +1092,7 @@ def _apply_deterministic_transforms(df: pd.DataFrame, transformations: list):
             lower = median - (3.5 * mad / 0.6745)
             upper = median + (3.5 * mad / 0.6745)
             df[col] = df[col].clip(lower, upper)
+        steps_log.append({"name": "cap_outliers", "status": "success"})
     if "fix_dates" in types_present:
         for col in df.select_dtypes(include="object").columns:
             try:
@@ -944,12 +1101,30 @@ def _apply_deterministic_transforms(df: pd.DataFrame, transformations: list):
                     df[col] = parsed.dt.strftime("%Y-%m-%d")
             except Exception:
                 pass
+        steps_log.append({"name": "fix_dates", "status": "success"})
 
-    unsupported = sorted(types_present - {
+    for t in transformations:
+        if not isinstance(t, dict):
+            continue
+        if t.get("type") == "sql_custom":
+            df, err = await _apply_sql_custom_step(df, t.get("sql", ""))
+            steps_log.append({"name": t.get("label", "SQL Query"),
+                               "status": "failed" if err else "success", "message": err})
+        elif t.get("type") == "ai_custom":
+            df, err = await _apply_ai_custom_rule(df, t.get("instruction", ""))
+            steps_log.append({"name": t.get("label", "AI Custom Rule"),
+                               "status": "failed" if err else "success", "message": err})
+
+    known_types = {
         "remove_duplicates", "remove_empty_rows", "standardize_text",
         "fill_missing", "cap_outliers", "fix_dates", "ai_clean",
-    })
-    return df, unsupported
+        "sql_custom", "ai_custom",
+    }
+    for u in sorted(types_present - known_types):
+        steps_log.append({"name": u, "status": "skipped",
+                           "message": "Not yet supported by server-side executor"})
+
+    return df, steps_log
 
 
 async def _fetch_source_df(conn_type: str, cfg: dict, creds: dict) -> pd.DataFrame:
@@ -1189,6 +1364,14 @@ async def _write_destination_df(conn_type: str, cfg: dict, creds: dict, df: pd.D
             raise RuntimeError(f"REST API write failed: {result.get('error')}")
         return result
 
+    if conn_type == "google_sheets":
+        result = await _write_gsheet_df(
+            creds.get("sessionId", ""), cfg.get("sheetId", ""), cfg.get("sheetName", ""), df, mode,
+        )
+        if not result.get("success"):
+            raise RuntimeError(f"Google Sheets write failed: {result.get('error')}")
+        return result
+
     raise RuntimeError(
         f"Destination type '{conn_type}' is not supported by the server-side executor "
         f"(GA4 is read-only by design — it has no write-back path)."
@@ -1221,10 +1404,8 @@ async def _run_pipeline(pipeline: dict, triggered_by: str = "manual") -> dict:
 
         steps_log.append({"name": "fetch_source", "status": "success"})
 
-        df, unsupported = _apply_deterministic_transforms(df, pipeline.get("transformations", []))
-        for u in unsupported:
-            steps_log.append({"name": u, "status": "skipped",
-                               "message": "Not yet supported by server-side executor"})
+        df, transform_steps = await _apply_transformations(df, pipeline.get("transformations", []))
+        steps_log.extend(transform_steps)
 
         rows_out = len(df)
         dest_conn_id = pipeline.get("destinationConnectionId")
