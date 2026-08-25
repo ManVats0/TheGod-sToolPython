@@ -237,6 +237,29 @@ _gsheets_write_lock = _threading.Lock()
 _gsheets_last_write: dict = {}
 GSHEETS_MIN_INTERVAL_SECONDS = 60
 
+# ── Generalized destination write rate-limit guard ────────────────────────
+# Same protection as the Google Sheets guard above, applied to every other
+# writable destination (MySQL, PostgreSQL, BigQuery, MongoDB, GCS,
+# Databricks, AWS). Lives inside the write-table/write-collection route
+# handlers themselves, so it protects against ANY caller — fast client-side
+# polling, the server-side pipeline executor, or a direct API call.
+_destination_write_lock = _threading.Lock()
+_destination_last_write: dict = {}
+WRITE_MIN_INTERVAL_SECONDS = 30  # matches the backend scheduler's poll interval
+
+def _check_write_rate_limit(dest_key: str) -> dict | None:
+    """Call after validating required fields, before doing the real write.
+    Returns a skip-response dict if written too recently; else claims the
+    slot and returns None."""
+    with _destination_write_lock:
+        last = _destination_last_write.get(dest_key, 0)
+        elapsed = time.time() - last
+        if elapsed < WRITE_MIN_INTERVAL_SECONDS:
+            return {"success": False, "skipped": True,
+                    "error": f"Rate-limited: wrote to this destination {round(elapsed,1)}s ago. Min interval {WRITE_MIN_INTERVAL_SECONDS}s."}
+        _destination_last_write[dest_key] = time.time()
+        return None
+
 UPLOAD_DIR = "uploads"
 META_DIR = "meta"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -3840,6 +3863,10 @@ async def mongo_write_collection(body: dict):
     if not all([uri, database, collection]):
         return {"success": False, "error": "uri, database, and collection are required"}
 
+    rl = _check_write_rate_limit(f"mongodb:{database}.{collection}")
+    if rl:
+        return rl
+
     try:
         df = pd.read_csv(io.StringIO(csv_data))
     except Exception as e:
@@ -4544,6 +4571,10 @@ async def mysql_write_table(body: dict):
     if not all([host, user, database, table]):
         return {"success": False, "error": "host, user, database, and table are required"}
 
+    rl = _check_write_rate_limit(f"mysql:{database}@{host}:{table}")
+    if rl:
+        return rl
+
     try:
         df = pd.read_csv(_io.StringIO(csv_data))
     except Exception as e:
@@ -4809,6 +4840,10 @@ async def postgres_write_table(body: dict):
     if not all([host, user, database, table]):
         return {"success": False, "error": "host, user, database, and table are required"}
 
+    rl = _check_write_rate_limit(f"postgres:{database}@{host}:{table}")
+    if rl:
+        return rl
+
     try:
         df = pd.read_csv(_io.StringIO(csv_data))
     except Exception as e:
@@ -5038,6 +5073,10 @@ async def bigquery_write_table(body: dict):
     if not all([key_json, project, dataset, table]):
         return {"success": False, "error": "key_json, project, dataset, and table are required"}
 
+    rl = _check_write_rate_limit(f"bigquery:{project}.{dataset}.{table}")
+    if rl:
+        return rl
+
     import io as _io
     try:
         df = pd.read_csv(_io.StringIO(csv_data))
@@ -5205,6 +5244,10 @@ async def gcs_write_file(body: dict):
         return {"success": False, "error": "No CSV data provided"}
     if not all([key_json, project, bucket, file_path]):
         return {"success": False, "error": "key_json, project, bucket, and file are all required"}
+
+    rl = _check_write_rate_limit(f"gcs:{bucket}/{file_path}")
+    if rl:
+        return rl
 
     try:
         info = json.loads(key_json)
@@ -5409,6 +5452,10 @@ async def databricks_write_table(body: dict):
         return {"success": False, "error": "No CSV data provided"}
     if not all([host, http_path, token, table]):
         return {"success": False, "error": "host, httpPath, token, and table are all required"}
+
+    rl = _check_write_rate_limit(f"databricks:{catalog}.{schema}.{table}@{host}")
+    if rl:
+        return rl
 
     try:
         df = pd.read_csv(_io.StringIO(csv_data))
@@ -6465,6 +6512,10 @@ async def aws_write_table(body: dict):
         df = pd.read_csv(_io.StringIO(csv_data))
     except Exception as e:
         return {"success": False, "error": f"Could not parse CSV: {e}"}
+
+    rl = _check_write_rate_limit(f"aws:{service}:{table}")
+    if rl:
+        return rl
 
     if service == "rds-mysql":
         host     = body.get("host", "").strip()
