@@ -713,6 +713,56 @@ async def create_connection(request: Request, body: dict):
     return serialize_doc(doc, drop=["credentialsEncrypted"])
 
 
+@app.put("/api/connections/{connection_id}")
+async def update_connection(request: Request, connection_id: str, body: dict):
+    """
+    Refresh an existing connection's config (and credentials, when a real
+    value is actually provided). Used by the pipeline-save sync flow: when
+    resolveConnectionId() matches an already-existing connection by
+    name+type, it now pushes the freshly-built config here instead of
+    silently reusing whatever was saved the first time — which previously
+    meant a connection created early with a blank/incomplete config (e.g.
+    before a working MongoDB URI existed locally) stayed broken forever.
+    Credentials are only overwritten when at least one field is non-empty,
+    so a retry that couldn't find fresh credentials never wipes out a
+    working secret that was already stored.
+    """
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+
+    existing = await mongo_db.connections.find_one({"_id": ObjectId(connection_id), "userId": user["userId"]})
+    if not existing:
+        return {"error": "Connection not found"}
+
+    name = body.get("name", existing.get("name", ""))
+    conn_type = body.get("type", existing.get("type", ""))
+    config = body.get("config", existing.get("config", {}))
+    credentials = body.get("credentials") or {}
+    has_real_credentials = any(bool(v) for v in credentials.values())
+
+    update_fields: dict = {
+        "name": name,
+        "type": conn_type,
+        "config": config,
+        "updatedAt": datetime.now(),
+    }
+    if has_real_credentials:
+        update_fields["credentialsEncrypted"] = encrypt_credentials(credentials)
+
+    await mongo_db.connections.update_one(
+        {"_id": ObjectId(connection_id), "userId": user["userId"]},
+        {"$set": update_fields},
+    )
+    doc = await mongo_db.connections.find_one({"_id": ObjectId(connection_id)})
+    await log_audit(user["userId"], "connection.updated", "connection", connection_id,
+                     metadata={"name": name, "type": conn_type, "credentialsUpdated": has_real_credentials},
+                     resource_name=name)
+    return serialize_doc(doc, drop=["credentialsEncrypted"])
+
+
 @app.delete("/api/connections/{connection_id}")
 async def delete_connection(request: Request, connection_id: str):
     user = require_user(request)
