@@ -708,7 +708,8 @@ async def create_connection(request: Request, body: dict):
     }
     result = await mongo_db.connections.insert_one(doc)
     doc["_id"] = result.inserted_id
-    await log_audit(user["userId"], "connection.created", "connection", str(doc["_id"]), {"name": name, "type": conn_type})
+    await log_audit(user["userId"], "connection.created", "connection", str(doc["_id"]),
+                     metadata={"name": name, "type": conn_type}, resource_name=name)
     return serialize_doc(doc, drop=["credentialsEncrypted"])
 
 
@@ -719,8 +720,10 @@ async def delete_connection(request: Request, connection_id: str):
         return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
+    prev_conn = await mongo_db.connections.find_one({"_id": ObjectId(connection_id), "userId": user["userId"]})
     result = await mongo_db.connections.delete_one({"_id": ObjectId(connection_id), "userId": user["userId"]})
-    await log_audit(user["userId"], "connection.deleted", "connection", connection_id)
+    await log_audit(user["userId"], "connection.deleted", "connection", connection_id,
+                     resource_name=(prev_conn or {}).get("name", ""), severity="warning")
     return {"success": result.deleted_count > 0}
 
 
@@ -767,7 +770,8 @@ async def reveal_connection(request: Request, connection_id: str):
     conn = await get_decrypted_connection(connection_id, user["userId"])
     if not conn:
         return {"error": "Connection not found"}
-    await log_audit(user["userId"], "connection.revealed", "connection", connection_id)
+    await log_audit(user["userId"], "connection.revealed", "connection", connection_id,
+                     resource_name=conn.get("name", ""), severity="warning")
     return conn
 
 async def get_decrypted_connection(connection_id: str, user_id: str) -> dict | None:
@@ -845,16 +849,21 @@ async def save_pipeline(request: Request, body: dict):
     }
 
     if pipeline_id:
+        prev_doc = await mongo_db.pipelines.find_one({"_id": ObjectId(pipeline_id), "userId": user["userId"]})
         await mongo_db.pipelines.update_one({"_id": ObjectId(pipeline_id), "userId": user["userId"]}, {"$set": payload})
         doc = await mongo_db.pipelines.find_one({"_id": ObjectId(pipeline_id)})
-        await log_audit(user["userId"], "pipeline.updated", "pipeline", pipeline_id, {"name": payload["name"]})
+        diff = _diff_dict(prev_doc or {}, payload, ignore={"updatedAt"}) if prev_doc else None
+        await log_audit(user["userId"], "pipeline.updated", "pipeline", pipeline_id,
+                         metadata={"name": payload["name"]}, resource_name=payload["name"],
+                         changes=diff)
     else:
         payload["createdAt"] = datetime.now()
         payload["runCount"] = 0
         payload["lastRun"] = None
         result = await mongo_db.pipelines.insert_one(payload)
         doc = await mongo_db.pipelines.find_one({"_id": result.inserted_id})
-        await log_audit(user["userId"], "pipeline.created", "pipeline", str(result.inserted_id), {"name": payload["name"]})
+        await log_audit(user["userId"], "pipeline.created", "pipeline", str(result.inserted_id),
+                         metadata={"name": payload["name"]}, resource_name=payload["name"])
 
     return serialize_doc(doc)
 
@@ -866,8 +875,10 @@ async def delete_pipeline(request: Request, pipeline_id: str):
         return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
+    prev_pipeline = await mongo_db.pipelines.find_one({"_id": ObjectId(pipeline_id), "userId": user["userId"]})
     result = await mongo_db.pipelines.delete_one({"_id": ObjectId(pipeline_id), "userId": user["userId"]})
-    await log_audit(user["userId"], "pipeline.deleted", "pipeline", pipeline_id)
+    await log_audit(user["userId"], "pipeline.deleted", "pipeline", pipeline_id,
+                     resource_name=(prev_pipeline or {}).get("name", ""), severity="warning")
     return {"success": result.deleted_count > 0}
 
 
@@ -878,7 +889,8 @@ async def delete_pipeline(request: Request, pipeline_id: str):
 
 async def log_pipeline_run(user_id: str, pipeline_id: str, status: str, rows_in: int,
                             rows_out: int, duration_ms: int, steps: list,
-                            triggered_by: str = "manual", error: str | None = None):
+                            triggered_by: str = "manual", error: str | None = None,
+                            correlation_id: str | None = None):
     if mongo_db is None:
         return
     try:
@@ -893,6 +905,7 @@ async def log_pipeline_run(user_id: str, pipeline_id: str, status: str, rows_in:
             "steps": steps,
             "triggeredBy": triggered_by,
             "error": error,
+            "correlationId": correlation_id,
         })
     except Exception as e:
         print(f"Run log write failed: {e}")
@@ -1405,6 +1418,8 @@ async def _run_pipeline(pipeline: dict, triggered_by: str = "manual") -> dict:
     start = time.time()
     pipeline_id = str(pipeline["_id"])
     user_id = pipeline["userId"]
+    pipeline_name = pipeline.get("name", "")
+    correlation_id = str(uuid.uuid4())
     steps_log = []
 
     try:
@@ -1443,6 +1458,14 @@ async def _run_pipeline(pipeline: dict, triggered_by: str = "manual") -> dict:
             dcfg = dest_conn.get("config", {})
             dcreds = dest_conn.get("credentials", {})
             result_info = await _write_destination_df(dest_type, dcfg, dcreds, df, dest_mode)
+            await log_audit(
+                user_id, "destination.write", "connection", dest_conn_id,
+                metadata={"destType": dest_type, "mode": dest_mode, "rowsOut": rows_out,
+                          "pipelineId": pipeline_id, "triggeredBy": triggered_by},
+                resource_name=dest_conn.get("name", dest_type),
+                correlation_id=correlation_id,
+                actor_type="user" if triggered_by == "manual" else "scheduler",
+            )
         else:
             filename = f"pipeline_{pipeline_id}_{uuid.uuid4().hex[:8]}.csv"
             df.to_csv(os.path.join(UPLOAD_DIR, filename), index=False)
@@ -1456,7 +1479,16 @@ async def _run_pipeline(pipeline: dict, triggered_by: str = "manual") -> dict:
             {"$set": {"lastRun": datetime.now()}, "$inc": {"runCount": 1}},
         )
         await log_pipeline_run(user_id, pipeline_id, "success", rows_in, rows_out,
-                                duration_ms, steps_log, triggered_by)
+                                duration_ms, steps_log, triggered_by, correlation_id=correlation_id)
+        await log_audit(
+            user_id, "pipeline.executed", "pipeline", pipeline_id,
+            metadata={"triggeredBy": triggered_by, "rowsIn": rows_in, "rowsOut": rows_out,
+                      "durationMs": duration_ms},
+            resource_name=pipeline_name,
+            status="success",
+            correlation_id=correlation_id,
+            actor_type="user" if triggered_by == "manual" else "scheduler",
+        )
         return {"status": "success", "rowsIn": rows_in, "rowsOut": rows_out,
                 "durationMs": duration_ms, **result_info}
 
@@ -1471,7 +1503,16 @@ async def _run_pipeline(pipeline: dict, triggered_by: str = "manual") -> dict:
         except Exception:
             pass
         await log_pipeline_run(user_id, pipeline_id, "failed", 0, 0, duration_ms,
-                                steps_log, triggered_by, error=str(e))
+                                steps_log, triggered_by, error=str(e), correlation_id=correlation_id)
+        await log_audit(
+            user_id, "pipeline.executed", "pipeline", pipeline_id,
+            metadata={"triggeredBy": triggered_by, "error": str(e), "durationMs": duration_ms},
+            resource_name=pipeline_name,
+            status="failure",
+            severity="warning",
+            correlation_id=correlation_id,
+            actor_type="user" if triggered_by == "manual" else "scheduler",
+        )
         return {"status": "failed", "error": str(e)}
 
 
@@ -1492,8 +1533,6 @@ async def execute_pipeline_route(request: Request, pipeline_id: str):
         result = await _run_pipeline(pipeline, triggered_by="manual")
     finally:
         await _release_pipeline_lock(pipeline_id)
-    await log_audit(user["userId"], "pipeline.executed", "pipeline", pipeline_id,
-                     {"status": result.get("status")})
     return result
 
 
@@ -1628,37 +1667,185 @@ async def _ensure_pipeline_indexes():
         print(f"Could not ensure indexes: {e}")
 
 
+async def _ensure_audit_indexes():
+    if mongo_db is None:
+        return
+    try:
+        await mongo_db.audit_logs.create_index([("userId", 1), ("createdAt", -1)])
+        await mongo_db.audit_logs.create_index([("userId", 1), ("resourceId", 1), ("createdAt", -1)])
+        await mongo_db.audit_logs.create_index([("userId", 1), ("action", 1), ("createdAt", -1)])
+        await mongo_db.audit_logs.create_index([("userId", 1), ("category", 1), ("createdAt", -1)])
+    except Exception as e:
+        print(f"Could not ensure audit indexes: {e}")
+
+
 @app.on_event("startup")
 async def _on_startup_pipeline_engine():
     await _ensure_runs_collection()
     await _ensure_pipeline_indexes()
     await _ensure_lock_indexes()
+    await _ensure_audit_indexes()
     asyncio.create_task(_scheduler_loop())
 
 
 # ── Audit logs ────────────────────────────────────────────────────────────
-async def log_audit(user_id: str, action: str, resource_type: str, resource_id: str = "", metadata: dict | None = None):
+AUDIT_ACTION_CATEGORY = {
+    "connection.created": "connection",
+    "connection.deleted": "connection",
+    "connection.revealed": "connection",
+    "pipeline.created": "pipeline",
+    "pipeline.updated": "pipeline",
+    "pipeline.deleted": "pipeline",
+    "pipeline.executed": "pipeline",
+    "destination.write": "data",
+    "catalog.updated": "data",
+    "analysis.saved": "data",
+}
+
+def _diff_dict(old: dict, new: dict, ignore: set = frozenset()) -> dict | None:
+    """Field-level diff between two dicts. Returns None if nothing changed."""
+    changes = {}
+    for k in set(old.keys()) | set(new.keys()):
+        if k in ignore:
+            continue
+        old_v, new_v = old.get(k), new.get(k)
+        if old_v != new_v:
+            changes[k] = {"from": old_v, "to": new_v}
+    return changes or None
+
+async def log_audit(user_id: str, action: str, resource_type: str, resource_id: str = "",
+                     metadata: dict | None = None, status: str = "success",
+                     severity: str = "info", resource_name: str = "",
+                     changes: dict | None = None, correlation_id: str | None = None,
+                     actor_type: str = "user"):
     if mongo_db is None:
         return
     try:
         await mongo_db.audit_logs.insert_one({
-            "userId": user_id, "action": action, "resourceType": resource_type,
-            "resourceId": resource_id, "metadata": metadata or {}, "createdAt": datetime.now(),
+            "userId": user_id,
+            "actorId": user_id,
+            "actorType": actor_type,
+            "action": action,
+            "category": AUDIT_ACTION_CATEGORY.get(action, resource_type or "other"),
+            "resourceType": resource_type,
+            "resourceId": resource_id,
+            "resourceName": resource_name,
+            "status": status,
+            "severity": severity,
+            "changes": changes,
+            "metadata": metadata or {},
+            "correlationId": correlation_id,
+            "createdAt": datetime.now(),
         })
     except Exception as e:
         print(f"Audit log write failed: {e}")
 
 
 @app.get("/api/audit-logs")
-async def list_audit_logs(request: Request):
+async def list_audit_logs(
+    request: Request,
+    action: str = "",
+    category: str = "",
+    resource_type: str = "",
+    resource_id: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    limit: int = 200,
+):
     user = require_user(request)
     if not user:
         return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
-    cursor = mongo_db.audit_logs.find({"userId": user["userId"]}).sort("createdAt", -1).limit(200)
-    docs = await cursor.to_list(length=200)
+    query: dict = {"userId": user["userId"]}
+    if action:
+        query["action"] = action
+    if category:
+        query["category"] = category
+    if resource_type:
+        query["resourceType"] = resource_type
+    if resource_id:
+        query["resourceId"] = resource_id
+    if date_from or date_to:
+        date_q: dict = {}
+        if date_from:
+            try:
+                date_q["$gte"] = datetime.fromisoformat(date_from)
+            except ValueError:
+                pass
+        if date_to:
+            try:
+                date_q["$lte"] = datetime.fromisoformat(date_to)
+            except ValueError:
+                pass
+        if date_q:
+            query["createdAt"] = date_q
+    capped = min(limit, 200)
+    cursor = mongo_db.audit_logs.find(query).sort("createdAt", -1).limit(capped)
+    docs = await cursor.to_list(length=capped)
     return [serialize_doc(d) for d in docs]
+
+
+@app.get("/api/audit-logs/export")
+async def export_audit_logs(
+    request: Request,
+    action: str = "",
+    category: str = "",
+    resource_type: str = "",
+    resource_id: str = "",
+    date_from: str = "",
+    date_to: str = "",
+):
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+    query: dict = {"userId": user["userId"]}
+    if action:
+        query["action"] = action
+    if category:
+        query["category"] = category
+    if resource_type:
+        query["resourceType"] = resource_type
+    if resource_id:
+        query["resourceId"] = resource_id
+    if date_from or date_to:
+        date_q: dict = {}
+        if date_from:
+            try:
+                date_q["$gte"] = datetime.fromisoformat(date_from)
+            except ValueError:
+                pass
+        if date_to:
+            try:
+                date_q["$lte"] = datetime.fromisoformat(date_to)
+            except ValueError:
+                pass
+        if date_q:
+            query["createdAt"] = date_q
+    cursor = mongo_db.audit_logs.find(query).sort("createdAt", -1).limit(5000)
+    docs = await cursor.to_list(length=5000)
+
+    import csv as _csv
+    buf = io.StringIO()
+    fieldnames = ["createdAt", "action", "category", "status", "severity",
+                  "actorId", "resourceType", "resourceId", "resourceName",
+                  "correlationId", "metadata", "changes"]
+    writer = _csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for d in docs:
+        row = {k: d.get(k, "") for k in fieldnames}
+        row["createdAt"] = d["createdAt"].isoformat() if d.get("createdAt") else ""
+        row["metadata"] = json.dumps(d.get("metadata", {}))
+        row["changes"] = json.dumps(d.get("changes")) if d.get("changes") else ""
+        writer.writerow(row)
+
+    export_filename = f"audit_log_export_{uuid.uuid4().hex[:8]}.csv"
+    export_path = os.path.join(UPLOAD_DIR, export_filename)
+    with open(export_path, "w", newline="") as f:
+        f.write(buf.getvalue())
+    return FileResponse(export_path, media_type="text/csv", filename="audit_log_export.csv")
 
 
 @app.post("/api/feedback")
