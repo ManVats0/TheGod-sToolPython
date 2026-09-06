@@ -368,6 +368,60 @@ def detect_primary_key(df):
             return col
     return None
 
+
+# ── PII / SENSITIVE DATA DETECTION ──────────────────────────────────────────
+def detect_pii_columns(df):
+    """
+    Best-effort, read-only scan of column names + a data sample for common
+    PII patterns (PAN, Aadhaar, GSTIN, email, phone, name-like columns).
+    Returns {column_name: {"pii": True, "type": str, "confidence": str}}.
+    Never modifies df. Never raises — any per-column error is skipped.
+    """
+    import re
+    patterns = {
+        "pan":     re.compile(r"^[A-Z]{5}[0-9]{4}[A-Z]$"),
+        "aadhaar": re.compile(r"^\d{4}\s?\d{4}\s?\d{4}$"),
+        "gstin":   re.compile(r"^\d{2}[A-Z]{5}\d{4}[A-Z]\d[A-Z\d]Z[A-Z\d]$"),
+        "email":   re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$"),
+        "phone":   re.compile(r"^(\+?91[\-\s]?)?[6-9]\d{9}$"),
+    }
+    name_hints = {
+        "pan":     ["pan", "pan_no", "pan_number"],
+        "aadhaar": ["aadhaar", "aadhar", "uidai"],
+        "gstin":   ["gstin", "gst_no", "gst_number"],
+        "email":   ["email", "e_mail", "mail"],
+        "phone":   ["phone", "mobile", "contact_no", "phone_number"],
+        "name":    ["name", "full_name", "customer_name", "first_name", "last_name"],
+    }
+    results = {}
+    for col in df.columns:
+        try:
+            col_lower = str(col).strip().lower().replace(" ", "_")
+            matched_type = None
+            confidence = "low"
+
+            for pii_type, hints in name_hints.items():
+                if any(h == col_lower or h in col_lower for h in hints):
+                    matched_type = pii_type
+                    confidence = "medium"
+                    break
+
+            sample = df[col].dropna().astype(str).head(50)
+            if len(sample) > 0:
+                for pii_type, pattern in patterns.items():
+                    hit_count = int(sample.apply(lambda v: bool(pattern.match(v.strip()))).sum())
+                    if hit_count / len(sample) > 0.6:
+                        matched_type = pii_type
+                        confidence = "high"
+                        break
+
+            if matched_type:
+                results[col] = {"pii": True, "type": matched_type, "confidence": confidence}
+        except Exception:
+            continue
+
+    return results
+
 # ── TIME SERIES ────────────────────────────────────────────────────────────────
 def detect_time_series(df):
     date_col = None
@@ -777,6 +831,68 @@ async def delete_connection(request: Request, connection_id: str):
     return {"success": result.deleted_count > 0}
 
 
+@app.post("/api/connections/{connection_id}/retention")
+async def set_connection_retention(request: Request, connection_id: str, body: dict):
+    """
+    Sets or clears a data-retention window (in days) for one connection.
+    When set, the scheduler's _retention_sweep will automatically erase all
+    data this connection points at once it has gone untouched (by
+    connection.updatedAt) for longer than retention_days. Pass
+    retention_days: null or 0 to disable retention for this connection.
+    """
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+    retention_days = body.get("retention_days")
+    if retention_days is not None:
+        try:
+            retention_days = int(retention_days)
+            if retention_days <= 0:
+                retention_days = None
+        except (TypeError, ValueError):
+            return {"error": "retention_days must be a positive integer or null"}
+    existing = await mongo_db.connections.find_one({"_id": ObjectId(connection_id), "userId": user["userId"]})
+    if not existing:
+        return {"error": "Connection not found"}
+    await mongo_db.connections.update_one(
+        {"_id": ObjectId(connection_id), "userId": user["userId"]},
+        {"$set": {"config.retentionDays": retention_days, "updatedAt": datetime.now()}},
+    )
+    await log_audit(
+        user["userId"], "connection.retention_updated", "connection", connection_id,
+        metadata={"retentionDays": retention_days},
+        resource_name=existing.get("name", ""),
+    )
+    doc = await mongo_db.connections.find_one({"_id": ObjectId(connection_id)})
+    return serialize_doc(doc, drop=["credentialsEncrypted"])
+
+
+@app.post("/api/connections/{connection_id}/erase")
+async def erase_connection_data(request: Request, connection_id: str):
+    """
+    Manually triggers full erasure of the data this connection points at
+    (drops the table / collection / file — not row-level filtering). Used
+    for DPDP/GDPR "right to erasure" requests. Irreversible.
+    """
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    conn = await get_decrypted_connection(connection_id, user["userId"])
+    if not conn:
+        return {"error": "Connection not found"}
+    result = await _erase_connection_data(conn["type"], conn.get("config", {}), conn.get("credentials", {}))
+    await log_audit(
+        user["userId"], "connection.erased", "connection", connection_id,
+        metadata={"detail": result.get("detail", "")},
+        resource_name=conn.get("name", ""),
+        status="success" if result.get("success") else "failure",
+        severity="warning",
+    )
+    return result
+
+
 @app.get("/api/analysis-results/latest")
 async def get_latest_analysis_result(request: Request, source_key: str):
     """
@@ -852,6 +968,204 @@ async def get_decrypted_connection(connection_id: str, user_id: str) -> dict | N
     }
 
 
+async def _erase_connection_data(conn_type: str, cfg: dict, creds: dict) -> dict:
+    """
+    Permanently deletes ALL data this connection points at — drops the
+    whole table / collection / file, not row-level filtering by data
+    subject. Used for DPDP/GDPR "right to erasure" requests and retention-
+    window auto-purge. Irreversible. Returns {"success": bool, "detail": str}
+    and never raises — callers must check "success".
+    """
+    try:
+        if conn_type == "mysql" or (conn_type == "cloudsql" and cfg.get("dbType", "postgres") == "mysql"):
+            import aiomysql, ssl as ssl_lib
+            host = cfg.get("instanceConnectionName") or cfg.get("host", "")
+            port = int(cfg.get("port", 3306))
+            database = cfg.get("database", "")
+            tables = cfg.get("tables") or []
+            table = cfg.get("table") or (tables[0] if tables else "")
+            ssl_ctx = ssl_lib.create_default_context() if cfg.get("ssl") else None
+            conn = await asyncio.wait_for(
+                aiomysql.connect(host=host, port=port, user=creds.get("user", ""),
+                    password=creds.get("password", ""), db=database, ssl=ssl_ctx, connect_timeout=10),
+                timeout=12,
+            )
+            async with conn.cursor() as cur:
+                await cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+                await conn.commit()
+            conn.close()
+            return {"success": True, "detail": f"Dropped MySQL table {database}.{table}"}
+
+        if conn_type == "postgres" or (conn_type == "cloudsql" and cfg.get("dbType", "postgres") != "mysql"):
+            import asyncpg, ssl as ssl_lib
+            host = cfg.get("instanceConnectionName") or cfg.get("host", "")
+            port = int(cfg.get("port", 5432))
+            database = cfg.get("database", "")
+            tables = cfg.get("tables") or []
+            table = cfg.get("table") or (tables[0] if tables else "")
+            ssl_ctx = ssl_lib.create_default_context() if cfg.get("ssl") else None
+            conn = await asyncio.wait_for(
+                asyncpg.connect(host=host, port=port, user=creds.get("user", ""),
+                    password=creds.get("password", ""), database=database, ssl=ssl_ctx, timeout=10),
+                timeout=12,
+            )
+            await conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+            await conn.close()
+            return {"success": True, "detail": f"Dropped PostgreSQL table {database}.{table}"}
+
+        if conn_type == "mongodb":
+            uri = creds.get("uri") or cfg.get("uri", "")
+            database = cfg.get("database", "")
+            collections = cfg.get("collections") or []
+            collection = cfg.get("collection") or (collections[0] if collections else "")
+            client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=8000)
+            await client[database][collection].drop()
+            client.close()
+            return {"success": True, "detail": f"Dropped MongoDB collection {database}.{collection}"}
+
+        if conn_type == "bigquery":
+            from google.cloud import bigquery as bq
+            from google.oauth2 import service_account
+            info = json.loads(creds.get("key_json", "{}"))
+            project = cfg.get("project", "")
+            dataset = cfg.get("dataset", "")
+            tables = cfg.get("tables") or []
+            table = cfg.get("table") or (tables[0] if tables else "")
+            gcreds = service_account.Credentials.from_service_account_info(
+                info, scopes=["https://www.googleapis.com/auth/bigquery"])
+            client = bq.Client(project=project, credentials=gcreds)
+            client.delete_table(f"{project}.{dataset}.{table}", not_found_ok=True)
+            return {"success": True, "detail": f"Deleted BigQuery table {project}.{dataset}.{table}"}
+
+        if conn_type == "gcs":
+            from google.cloud import storage as gcs_lib
+            from google.oauth2 import service_account
+            info = json.loads(creds.get("key_json", "{}"))
+            project = cfg.get("project", "")
+            bucket = cfg.get("bucket", "")
+            files = cfg.get("files") or []
+            file_path = cfg.get("file") or (files[0] if files else "")
+            gcreds = service_account.Credentials.from_service_account_info(
+                info, scopes=["https://www.googleapis.com/auth/devstorage.read_write"])
+            client = gcs_lib.Client(project=project, credentials=gcreds)
+            blob = client.bucket(bucket).blob(file_path)
+            if blob.exists():
+                blob.delete()
+            return {"success": True, "detail": f"Deleted GCS file {bucket}/{file_path}"}
+
+        if conn_type == "databricks":
+            from databricks import sql as databricks_sql
+            host = cfg.get("host", "")
+            http_path = cfg.get("httpPath", "")
+            token = creds.get("token", "")
+            catalog = cfg.get("catalog", "hive_metastore")
+            schema = cfg.get("schema", "default")
+            tables = cfg.get("tables") or []
+            table = cfg.get("table") or (tables[0] if tables else "")
+            loop = asyncio.get_event_loop()
+            def _drop():
+                conn = databricks_sql.connect(server_hostname=host, http_path=http_path, access_token=token)
+                cursor = conn.cursor()
+                cursor.execute(f"DROP TABLE IF EXISTS {catalog}.{schema}.{table}")
+                cursor.close()
+                conn.close()
+            await loop.run_in_executor(None, _drop)
+            return {"success": True, "detail": f"Dropped Databricks table {catalog}.{schema}.{table}"}
+
+        if conn_type == "aws":
+            import boto3
+            service = cfg.get("service", "")
+            region = cfg.get("region", "us-east-1")
+            access_key_id = creds.get("accessKeyId", "")
+            secret_key = creds.get("secretAccessKey", "")
+            if service == "s3":
+                bucket = cfg.get("bucket", "")
+                tables = cfg.get("tables") or []
+                key = cfg.get("table") or (tables[0] if tables else "")
+                s3 = boto3.client("s3", region_name=region,
+                    aws_access_key_id=access_key_id, aws_secret_access_key=secret_key)
+                s3.delete_object(Bucket=bucket, Key=key)
+                return {"success": True, "detail": f"Deleted S3 object {bucket}/{key}"}
+            if service == "dynamodb":
+                tables = cfg.get("tables") or []
+                table_name = cfg.get("table") or (tables[0] if tables else "")
+                dynamo = boto3.resource("dynamodb", region_name=region,
+                    aws_access_key_id=access_key_id, aws_secret_access_key=secret_key)
+                dyn_table = dynamo.Table(table_name)
+                scan = dyn_table.scan(ProjectionExpression=",".join(
+                    [attr["AttributeName"] for attr in dyn_table.key_schema]
+                ))
+                with dyn_table.batch_writer() as batch:
+                    for item in scan.get("Items", []):
+                        batch.delete_item(Key=item)
+                return {"success": True, "detail": f"Deleted all items from DynamoDB table {table_name}"}
+            return {"success": False, "detail": f"Erasure not supported for AWS service '{service}'"}
+
+        return {"success": False, "detail": f"Erasure not supported for connection type '{conn_type}'"}
+    except Exception as e:
+        return {"success": False, "detail": str(e)}
+
+
+async def _retention_sweep():
+    """
+    Auto-purges connections whose retention window (config.retentionDays)
+    has elapsed since the connection document was last updated. Runs
+    alongside the pipeline scheduler in _scheduler_loop.
+
+    LIMITATION: uses connection.updatedAt as the freshness signal — the
+    connections collection has no per-record write timestamp, so a
+    connection whose underlying table was refreshed by a pipeline run
+    (which does not touch this doc) is NOT treated as "freshly written."
+    This is a conservative proxy, not exact data-age tracking. Erasure
+    resets updatedAt to now, so the purge recurs each time the window
+    elapses again.
+    """
+    if mongo_db is None:
+        return
+    try:
+        now = datetime.now()
+        cursor = mongo_db.connections.find({"config.retentionDays": {"$gt": 0}})
+        async for conn_doc in cursor:
+            retention_days = conn_doc.get("config", {}).get("retentionDays")
+            if not retention_days:
+                continue
+            updated_at = conn_doc.get("updatedAt") or conn_doc.get("createdAt")
+            if not updated_at:
+                continue
+            age_days = (now - updated_at).total_seconds() / 86400
+            if age_days < retention_days:
+                continue
+            connection_id = str(conn_doc["_id"])
+            got_lock = await _try_acquire_pipeline_lock(f"retention_{connection_id}", ttl_seconds=300)
+            if not got_lock:
+                continue
+            try:
+                creds = {}
+                if conn_doc.get("credentialsEncrypted"):
+                    try:
+                        creds = decrypt_credentials(conn_doc["credentialsEncrypted"])
+                    except Exception as e:
+                        print(f"Retention sweep: credential decryption failed for {connection_id}: {e}")
+                        continue
+                result = await _erase_connection_data(conn_doc.get("type", ""), conn_doc.get("config", {}), creds)
+                await mongo_db.connections.update_one(
+                    {"_id": conn_doc["_id"]},
+                    {"$set": {"updatedAt": datetime.now()}},
+                )
+                await log_audit(
+                    conn_doc.get("userId", ""), "connection.retention_erased", "connection", connection_id,
+                    metadata={"retentionDays": retention_days, "detail": result.get("detail", "")},
+                    resource_name=conn_doc.get("name", ""),
+                    status="success" if result.get("success") else "failure",
+                    severity="warning",
+                    actor_type="scheduler",
+                )
+            finally:
+                await _release_pipeline_lock(f"retention_{connection_id}")
+    except Exception as e:
+        print(f"Retention sweep error: {e}")
+
+
 # ── Pipelines ─────────────────────────────────────────────────────────────
 @app.get("/api/pipelines")
 async def list_pipelines(request: Request):
@@ -874,6 +1188,17 @@ async def save_pipeline(request: Request, body: dict):
         return {"error": "MongoDB not configured"}
 
     pipeline_id = body.get("id")
+    # Preserve an existing approval status across ordinary edits (e.g. the
+    # Flow.tsx "Save Pipeline" button) so a pipeline someone marked
+    # pending_approval doesn't silently flip back to approved just because
+    # it was re-saved without explicitly touching status.
+    existing_status = "approved"
+    if pipeline_id:
+        prev_status_doc = await mongo_db.pipelines.find_one(
+            {"_id": ObjectId(pipeline_id), "userId": user["userId"]}, {"status": 1}
+        )
+        if prev_status_doc:
+            existing_status = prev_status_doc.get("status", "approved")
     payload = {
         "userId": user["userId"],
         "name": body.get("name", ""),
@@ -895,6 +1220,7 @@ async def save_pipeline(request: Request, body: dict):
         "scheduleTimezone": body.get("scheduleTimezone"),
         "scheduleStartDate": body.get("scheduleStartDate"),
         "isActive": body.get("isActive", False),
+        "status": body.get("status", existing_status),
         "updatedAt": datetime.now(),
     }
 
@@ -930,6 +1256,40 @@ async def delete_pipeline(request: Request, pipeline_id: str):
     await log_audit(user["userId"], "pipeline.deleted", "pipeline", pipeline_id,
                      resource_name=(prev_pipeline or {}).get("name", ""), severity="warning")
     return {"success": result.deleted_count > 0}
+
+
+@app.post("/api/pipelines/{pipeline_id}/status")
+async def set_pipeline_status(request: Request, pipeline_id: str, body: dict):
+    """
+    Sets a pipeline's approval status. Valid values: "approved",
+    "pending_approval". A pipeline in "pending_approval" cannot be executed
+    manually (see execute_pipeline_route) or auto-triggered by the
+    scheduler (see _scheduler_loop's query filter) until moved back to
+    "approved".
+    """
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+    new_status = body.get("status", "")
+    if new_status not in ("approved", "pending_approval"):
+        return {"error": "status must be 'approved' or 'pending_approval'"}
+    prev_doc = await mongo_db.pipelines.find_one({"_id": ObjectId(pipeline_id), "userId": user["userId"]})
+    if not prev_doc:
+        return {"error": "Pipeline not found"}
+    await mongo_db.pipelines.update_one(
+        {"_id": ObjectId(pipeline_id), "userId": user["userId"]},
+        {"$set": {"status": new_status, "updatedAt": datetime.now()}},
+    )
+    await log_audit(
+        user["userId"], "pipeline.status_changed", "pipeline", pipeline_id,
+        metadata={"from": prev_doc.get("status", "approved"), "to": new_status},
+        resource_name=prev_doc.get("name", ""),
+        severity="warning" if new_status == "pending_approval" else "info",
+    )
+    doc = await mongo_db.pipelines.find_one({"_id": ObjectId(pipeline_id)})
+    return serialize_doc(doc)
 
 
 # ── Pipeline execution engine ───────────────────────────────────────────────
@@ -1576,6 +1936,8 @@ async def execute_pipeline_route(request: Request, pipeline_id: str):
     pipeline = await mongo_db.pipelines.find_one({"_id": ObjectId(pipeline_id), "userId": user["userId"]})
     if not pipeline:
         return {"error": "Pipeline not found"}
+    if pipeline.get("status", "approved") == "pending_approval":
+        return {"status": "failed", "error": "Pipeline is pending approval and cannot be run until approved."}
     got_lock = await _try_acquire_pipeline_lock(pipeline_id, ttl_seconds=600)
     if not got_lock:
         return {"status": "failed", "error": "Pipeline is already running (scheduled or manual run in progress)."}
@@ -1668,7 +2030,11 @@ async def _scheduler_loop():
         try:
             if mongo_db is not None:
                 now = datetime.now()
-                cursor = mongo_db.pipelines.find({"isActive": True, "scheduleMs": {"$gt": 0}})
+                cursor = mongo_db.pipelines.find({
+                    "isActive": True,
+                    "scheduleMs": {"$gt": 0},
+                    "status": {"$ne": "pending_approval"},
+                })
                 async for pipeline in cursor:
                     pid = str(pipeline["_id"])
                     interval_ms = pipeline.get("scheduleMs") or 0
@@ -1687,6 +2053,8 @@ async def _scheduler_loop():
                         got_lock = await _try_acquire_pipeline_lock(pid, ttl_seconds=max(300, int(interval_ms / 1000)))
                         if got_lock:
                             asyncio.create_task(_run_scheduled_pipeline(pipeline, pid))
+
+                asyncio.create_task(_retention_sweep())
         except Exception as e:
             print(f"Scheduler loop error: {e}")
         await asyncio.sleep(_SCHEDULER_POLL_SECONDS)
@@ -1743,10 +2111,14 @@ AUDIT_ACTION_CATEGORY = {
     "connection.created": "connection",
     "connection.deleted": "connection",
     "connection.revealed": "connection",
+    "connection.erased": "connection",
+    "connection.retention_updated": "connection",
+    "connection.retention_erased": "connection",
     "pipeline.created": "pipeline",
     "pipeline.updated": "pipeline",
     "pipeline.deleted": "pipeline",
     "pipeline.executed": "pipeline",
+    "pipeline.status_changed": "pipeline",
     "destination.write": "data",
     "catalog.updated": "data",
     "analysis.saved": "data",
@@ -2639,6 +3011,7 @@ async def analyze(
     memory_mb = round(df.memory_usage(deep=True).sum() / 1024 / 1024, 2)
 
     pk_col = detect_primary_key(df)
+    pii_columns = detect_pii_columns(df)
     missing_count = int(df.isnull().sum().sum())
     duplicate_count = int(df.duplicated(keep=False).sum())
     outlier_count, outlier_cols = count_real_outliers(df)
@@ -2771,6 +3144,7 @@ async def analyze(
         "top_missing": top_missing_list,
         "insight": insight,
         "primary_key": pk_col,
+        "pii_columns": pii_columns,
         "problems": problems_preview,
         "total_problems": total_problems,
         "problem_counts": {
@@ -4517,6 +4891,7 @@ async def get_catalog_metadata(request: Request, source_key: str):
         "owner":           (catalog_doc or {}).get("owner", ""),
         "columnOverrides": (catalog_doc or {}).get("columnOverrides", {}),
         "colInfo":         (analysis_doc or {}).get("result", {}).get("col_info", []),
+        "piiColumns":      (analysis_doc or {}).get("result", {}).get("pii_columns", {}),
         "qualityScore":    (analysis_doc or {}).get("result", {}).get("quality_score"),
         "updatedAt":       catalog_doc.get("updatedAt").isoformat() if catalog_doc and catalog_doc.get("updatedAt") else None,
     }
@@ -4538,7 +4913,7 @@ async def list_catalog_metadata(request: Request):
     catalog_docs = await mongo_db.catalog_metadata.find({"userId": user["userId"]}).to_list(length=1000)
     analysis_docs = await mongo_db.analysis_results.find(
         {"userId": user["userId"]},
-        {"sourceKey": 1, "sourceName": 1, "result.quality_score": 1, "result.col_info": 1, "result.dataset_info": 1}
+        {"sourceKey": 1, "sourceName": 1, "result.quality_score": 1, "result.col_info": 1, "result.dataset_info": 1, "result.pii_columns": 1}
     ).to_list(length=1000)
     analysis_by_key = {d.get("sourceKey", ""): d for d in analysis_docs}
 
@@ -4556,6 +4931,7 @@ async def list_catalog_metadata(request: Request):
             "owner":           d.get("owner", ""),
             "columnOverrides": d.get("columnOverrides", {}),
             "colInfo":         a.get("result", {}).get("col_info", []),
+            "piiColumns":      a.get("result", {}).get("pii_columns", {}),
             "qualityScore":    a.get("result", {}).get("quality_score"),
             "rows":            a.get("result", {}).get("dataset_info", {}).get("rows"),
         })
@@ -4573,6 +4949,7 @@ async def list_catalog_metadata(request: Request):
             "owner":           "",
             "columnOverrides": {},
             "colInfo":         a.get("result", {}).get("col_info", []),
+            "piiColumns":      a.get("result", {}).get("pii_columns", {}),
             "qualityScore":    a.get("result", {}).get("quality_score"),
             "rows":            a.get("result", {}).get("dataset_info", {}).get("rows"),
         })
