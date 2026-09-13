@@ -824,6 +824,8 @@ async def delete_connection(request: Request, connection_id: str):
         return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
+    if not await _check_permission(user["userId"], "connection.delete"):
+        return Response(status_code=403)
     prev_conn = await mongo_db.connections.find_one({"_id": ObjectId(connection_id), "userId": user["userId"]})
     result = await mongo_db.connections.delete_one({"_id": ObjectId(connection_id), "userId": user["userId"]})
     await log_audit(user["userId"], "connection.deleted", "connection", connection_id,
@@ -879,6 +881,10 @@ async def erase_connection_data(request: Request, connection_id: str):
     user = require_user(request)
     if not user:
         return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+    if not await _check_permission(user["userId"], "connection.erase"):
+        return Response(status_code=403)
     conn = await get_decrypted_connection(connection_id, user["userId"])
     if not conn:
         return {"error": "Connection not found"}
@@ -933,6 +939,10 @@ async def reveal_connection(request: Request, connection_id: str):
     user = require_user(request)
     if not user:
         return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+    if not await _check_permission(user["userId"], "connection.revealCredentials"):
+        return Response(status_code=403)
     conn = await get_decrypted_connection(connection_id, user["userId"])
     if not conn:
         return {"error": "Connection not found"}
@@ -1251,6 +1261,8 @@ async def delete_pipeline(request: Request, pipeline_id: str):
         return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
+    if not await _check_permission(user["userId"], "pipeline.delete"):
+        return Response(status_code=403)
     prev_pipeline = await mongo_db.pipelines.find_one({"_id": ObjectId(pipeline_id), "userId": user["userId"]})
     result = await mongo_db.pipelines.delete_one({"_id": ObjectId(pipeline_id), "userId": user["userId"]})
     await log_audit(user["userId"], "pipeline.deleted", "pipeline", pipeline_id,
@@ -1272,6 +1284,8 @@ async def set_pipeline_status(request: Request, pipeline_id: str, body: dict):
         return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
+    if not await _check_permission(user["userId"], "pipeline.approve"):
+        return Response(status_code=403)
     new_status = body.get("status", "")
     if new_status not in ("approved", "pending_approval"):
         return {"error": "status must be 'approved' or 'pending_approval'"}
@@ -1933,6 +1947,8 @@ async def execute_pipeline_route(request: Request, pipeline_id: str):
         return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
+    if not await _check_permission(user["userId"], "pipeline.execute"):
+        return Response(status_code=403)
     pipeline = await mongo_db.pipelines.find_one({"_id": ObjectId(pipeline_id), "userId": user["userId"]})
     if not pipeline:
         return {"error": "Pipeline not found"}
@@ -2097,12 +2113,180 @@ async def _ensure_audit_indexes():
         print(f"Could not ensure audit indexes: {e}")
 
 
+async def _ensure_org_indexes():
+    if mongo_db is None:
+        return
+    try:
+        await mongo_db.organizations.create_index("slug", unique=True)
+        await mongo_db.organizations.create_index("ownerId")
+        await mongo_db.role_definitions.create_index([("orgId", 1), ("key", 1)], unique=True)
+        await mongo_db.org_members.create_index([("orgId", 1), ("userId", 1)], unique=True)
+        await mongo_db.org_members.create_index([("userId", 1), ("status", 1)])
+        await mongo_db.resource_grants.create_index([("orgId", 1), ("resourceType", 1), ("resourceId", 1)])
+        await mongo_db.resource_grants.create_index([("granteeUserId", 1), ("resourceType", 1)])
+    except Exception as e:
+        print(f"Could not ensure org indexes: {e}")
+
+# ── IAM: organizations, membership, roles (auto-provisioning) ──────────────
+
+DEFAULT_ROLE_PERMISSIONS = {
+    "owner": {
+        "connection.delete": True,
+        "connection.erase": True,
+        "connection.revealCredentials": True,
+        "pipeline.delete": True,
+        "pipeline.approve": True,
+        "pipeline.execute": True,
+        "catalog.assignOwner": True,
+        "org.manageMembers": True,
+        "org.transferOwnership": True,
+    },
+    "admin": {
+        "connection.delete": True,
+        "connection.erase": True,
+        "connection.revealCredentials": True,
+        "pipeline.delete": True,
+        "pipeline.approve": True,
+        "pipeline.execute": True,
+        "catalog.assignOwner": True,
+        "org.manageMembers": True,
+        "org.transferOwnership": False,
+    },
+    "steward": {
+        "connection.delete": False,
+        "connection.erase": False,
+        "connection.revealCredentials": False,
+        "pipeline.delete": False,
+        "pipeline.approve": True,
+        "pipeline.execute": True,
+        "catalog.assignOwner": True,
+        "org.manageMembers": False,
+        "org.transferOwnership": False,
+    },
+    "viewer": {
+        "connection.delete": False,
+        "connection.erase": False,
+        "connection.revealCredentials": False,
+        "pipeline.delete": False,
+        "pipeline.approve": False,
+        "pipeline.execute": False,
+        "catalog.assignOwner": False,
+        "org.manageMembers": False,
+        "org.transferOwnership": False,
+    },
+}
+
+
+async def _seed_role_definitions(org_id):
+    """Idempotent — only inserts a role doc if it doesn't already exist for
+    this org, so calling it every time _ensure_org_for_user runs is safe."""
+    for role_key, perms in DEFAULT_ROLE_PERMISSIONS.items():
+        existing = await mongo_db.role_definitions.find_one({"orgId": org_id, "key": role_key})
+        if not existing:
+            await mongo_db.role_definitions.insert_one({
+                "orgId": org_id,
+                "key": role_key,
+                "name": role_key.capitalize(),
+                "permissions": perms,
+                "createdAt": datetime.now(),
+            })
+
+
+async def _ensure_org_for_user(user_id: str) -> dict:
+    """
+    Returns {org, membership} for user_id. If the user has no active
+    membership anywhere yet, auto-provisions a personal organization with
+    them as Owner. This is what lets every existing userId-scoped route
+    keep working unmodified today — organizations exist underneath, but
+    nothing requires them yet unless a route calls _check_permission.
+    """
+    membership = await mongo_db.org_members.find_one({"userId": user_id, "status": "active"})
+    if membership:
+        org = await mongo_db.organizations.find_one({"_id": membership["orgId"]})
+        return {"org": org, "membership": membership}
+
+    org_doc = {
+        "name": f"Personal — {user_id}",
+        "slug": f"personal-{user_id}",
+        "ownerId": user_id,
+        "createdAt": datetime.now(),
+    }
+    try:
+        result = await mongo_db.organizations.insert_one(org_doc)
+        org_id = result.inserted_id
+    except DuplicateKeyError:
+        org_doc = await mongo_db.organizations.find_one({"slug": org_doc["slug"]})
+        org_id = org_doc["_id"]
+
+    await _seed_role_definitions(org_id)
+
+    membership_doc = {
+        "orgId": org_id,
+        "userId": user_id,
+        "roleKey": "owner",
+        "status": "active",
+        "joinedAt": datetime.now(),
+    }
+    try:
+        await mongo_db.org_members.insert_one(membership_doc)
+    except DuplicateKeyError:
+        membership_doc = await mongo_db.org_members.find_one({"orgId": org_id, "userId": user_id})
+
+    org_doc["_id"] = org_id
+    await log_audit(user_id, "org.autoprovisioned", "organization", str(org_id),
+                     metadata={"slug": org_doc["slug"]}, resource_name=org_doc["name"])
+    return {"org": org_doc, "membership": membership_doc}
+
+
+async def _get_permissions(user_id: str) -> dict:
+    """Returns {org, membership, permissions} for the given user, auto-
+    provisioning a personal org on first use via _ensure_org_for_user."""
+    ctx = await _ensure_org_for_user(user_id)
+    role_def = await mongo_db.role_definitions.find_one(
+        {"orgId": ctx["membership"]["orgId"], "key": ctx["membership"]["roleKey"]}
+    )
+    permissions = role_def.get("permissions", {}) if role_def else {}
+    return {"org": ctx["org"], "membership": ctx["membership"], "permissions": permissions}
+
+
+async def _check_permission(user_id: str, permission_key: str) -> bool:
+    """Convenience wrapper: True if the caller's role grants permission_key."""
+    ctx = await _get_permissions(user_id)
+    return bool(ctx["permissions"].get(permission_key))
+
+
+@app.post("/api/org/backfill-resources")
+async def backfill_org_resources(request: Request):
+    """
+    One-time, idempotent backfill: stamps orgId onto every existing
+    connections/pipelines/catalog_metadata/audit_logs document owned by the
+    caller's userId that doesn't have orgId set yet. Safe to call repeatedly.
+    """
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+    ctx = await _get_permissions(user["userId"])
+    org_id = ctx["membership"]["orgId"]
+    uid = user["userId"]
+    results = {}
+    for coll_name in ("connections", "pipelines", "catalog_metadata", "audit_logs"):
+        coll = getattr(mongo_db, coll_name)
+        res = await coll.update_many(
+            {"userId": uid, "orgId": {"$exists": False}},
+            {"$set": {"orgId": org_id}},
+        )
+        results[coll_name] = res.modified_count
+    return {"success": True, "orgId": org_id, "backfilled": results}
+
 @app.on_event("startup")
 async def _on_startup_pipeline_engine():
     await _ensure_runs_collection()
     await _ensure_pipeline_indexes()
     await _ensure_lock_indexes()
     await _ensure_audit_indexes()
+    await _ensure_org_indexes()
     asyncio.create_task(_scheduler_loop())
 
 
@@ -2122,6 +2306,11 @@ AUDIT_ACTION_CATEGORY = {
     "destination.write": "data",
     "catalog.updated": "data",
     "analysis.saved": "data",
+    "org.autoprovisioned": "security",
+    "org.member_added": "security",
+    "org.member_role_changed": "security",
+    "org.member_removed": "security",
+    "org.ownership_transferred": "security",
 }
 
 def _diff_dict(old: dict, new: dict, ignore: set = frozenset()) -> dict | None:
@@ -4847,7 +5036,18 @@ async def save_catalog_metadata(request: Request, body: dict):
     if "tags" in body and isinstance(body.get("tags"), list):
         set_fields["tags"] = [str(t) for t in body["tags"]]
     if "owner" in body:
-        set_fields["owner"] = body.get("owner", "")
+        new_owner = body.get("owner", "")
+        if new_owner:
+            owner_ctx = await _get_permissions(user["userId"])
+            if not owner_ctx["permissions"].get("catalog.assignOwner"):
+                return Response(status_code=403)
+            owner_org_id = owner_ctx["membership"]["orgId"]
+            owner_membership = await mongo_db.org_members.find_one(
+                {"orgId": owner_org_id, "userId": new_owner, "status": "active"}
+            )
+            if not owner_membership:
+                return {"error": "owner must be an active member of your organization (use their userId)"}
+        set_fields["owner"] = new_owner
 
     column_overrides = body.get("column_overrides")
     if isinstance(column_overrides, dict):
