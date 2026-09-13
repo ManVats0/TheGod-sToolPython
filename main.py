@@ -2280,6 +2280,153 @@ async def backfill_org_resources(request: Request):
         results[coll_name] = res.modified_count
     return {"success": True, "orgId": org_id, "backfilled": results}
 
+
+@app.get("/api/org")
+async def get_my_org(request: Request):
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+    ctx = await _get_permissions(user["userId"])
+    org = ctx["org"]
+    return {
+        "org": {"id": str(org["_id"]), "name": org.get("name", ""), "slug": org.get("slug", "")},
+        "role": ctx["membership"]["roleKey"],
+        "permissions": ctx["permissions"],
+    }
+
+
+@app.get("/api/org/members")
+async def list_org_members(request: Request):
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+    ctx = await _get_permissions(user["userId"])
+    org_id = ctx["membership"]["orgId"]
+    cursor = mongo_db.org_members.find({"orgId": org_id})
+    docs = await cursor.to_list(length=500)
+    return [
+        {
+            "userId": d.get("userId", ""),
+            "roleKey": d.get("roleKey", ""),
+            "status": d.get("status", ""),
+            "invitedAt": d.get("invitedAt").isoformat() if d.get("invitedAt") else None,
+            "joinedAt": d.get("joinedAt").isoformat() if d.get("joinedAt") else None,
+        }
+        for d in docs
+    ]
+
+
+@app.post("/api/org/members/invite")
+async def invite_org_member(request: Request, body: dict):
+    """Adds an existing userId (already resolved from email by the caller's
+    auth service — see TeamSettings.tsx) to the caller's org. Requires
+    org.manageMembers. Refuses to invite someone who already has an active
+    membership anywhere, matching the one-active-org-per-user assumption
+    in _ensure_org_for_user."""
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+    if not await _check_permission(user["userId"], "org.manageMembers"):
+        return Response(status_code=403)
+
+    target_user_id = (body.get("userId") or "").strip()
+    role_key = (body.get("roleKey") or "").strip()
+    if not target_user_id or not role_key:
+        return {"error": "userId and roleKey are required"}
+
+    ctx = await _get_permissions(user["userId"])
+    org_id = ctx["membership"]["orgId"]
+
+    role_def = await mongo_db.role_definitions.find_one({"orgId": org_id, "key": role_key})
+    if not role_def:
+        return {"error": f"Unknown role '{role_key}' for this organization"}
+
+    existing = await mongo_db.org_members.find_one({"userId": target_user_id, "status": "active"})
+    if existing:
+        return {"error": "This user already belongs to an organization."}
+
+    await mongo_db.org_members.update_one(
+        {"orgId": org_id, "userId": target_user_id},
+        {"$set": {"orgId": org_id, "userId": target_user_id, "roleKey": role_key,
+                   "status": "active", "joinedAt": datetime.now()}},
+        upsert=True,
+    )
+    await log_audit(user["userId"], "org.member_added", "organization", str(org_id),
+                     metadata={"targetUserId": target_user_id, "roleKey": role_key})
+    return {"success": True}
+
+
+@app.post("/api/org/members/{target_user_id}/role")
+async def update_org_member_role(request: Request, target_user_id: str, body: dict):
+    """Requires org.manageMembers. Refuses to touch the 'owner' role —
+    ownership transfer is a separate, more sensitive action, not wired up."""
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+    if not await _check_permission(user["userId"], "org.manageMembers"):
+        return Response(status_code=403)
+
+    new_role = (body.get("roleKey") or "").strip()
+    if not new_role:
+        return {"error": "roleKey is required"}
+    if new_role == "owner":
+        return {"error": "Ownership transfer isn't supported here."}
+
+    ctx = await _get_permissions(user["userId"])
+    org_id = ctx["membership"]["orgId"]
+
+    member = await mongo_db.org_members.find_one({"orgId": org_id, "userId": target_user_id})
+    if not member:
+        return {"error": "Member not found in this organization"}
+    if member.get("roleKey") == "owner":
+        return {"error": "Cannot change the organization owner's role here."}
+
+    role_def = await mongo_db.role_definitions.find_one({"orgId": org_id, "key": new_role})
+    if not role_def:
+        return {"error": f"Unknown role '{new_role}' for this organization"}
+
+    await mongo_db.org_members.update_one(
+        {"orgId": org_id, "userId": target_user_id},
+        {"$set": {"roleKey": new_role}},
+    )
+    await log_audit(user["userId"], "org.member_role_changed", "organization", str(org_id),
+                     metadata={"targetUserId": target_user_id, "from": member.get("roleKey"), "to": new_role})
+    return {"success": True}
+
+
+@app.delete("/api/org/members/{target_user_id}")
+async def remove_org_member(request: Request, target_user_id: str):
+    """Requires org.manageMembers. Refuses to remove the owner."""
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+    if not await _check_permission(user["userId"], "org.manageMembers"):
+        return Response(status_code=403)
+
+    ctx = await _get_permissions(user["userId"])
+    org_id = ctx["membership"]["orgId"]
+
+    member = await mongo_db.org_members.find_one({"orgId": org_id, "userId": target_user_id})
+    if not member:
+        return {"error": "Member not found in this organization"}
+    if member.get("roleKey") == "owner":
+        return {"error": "Cannot remove the organization owner."}
+
+    result = await mongo_db.org_members.delete_one({"orgId": org_id, "userId": target_user_id})
+    await log_audit(user["userId"], "org.member_removed", "organization", str(org_id),
+                     metadata={"targetUserId": target_user_id}, severity="warning")
+    return {"success": result.deleted_count > 0}
+
 @app.on_event("startup")
 async def _on_startup_pipeline_engine():
     await _ensure_runs_collection()
