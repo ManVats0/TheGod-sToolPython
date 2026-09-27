@@ -361,6 +361,44 @@ def send_email_alert(to_email: str, filename: str, alerts: list):
     except Exception as e:
         print(f"✗ Email error: {e}")
 
+def send_invite_email(to_email: str, org_name: str, role_label: str, inviter_label: str, token: str):
+    if not to_email:
+        return
+    try:
+        import resend
+        resend.api_key = os.getenv("RESEND_API_KEY", "")
+        accept_url = f"{_frontend_url or 'https://www.thegodstool.com'}/accept-invite?token={token}"
+        html = f"""
+        <html><body style="margin:0;padding:0;background:#0f0a1e;font-family:-apple-system,sans-serif;">
+        <div style="max-width:600px;margin:40px auto;background:#1a1040;border-radius:16px;
+          overflow:hidden;border:1px solid #2d1b69;">
+          <div style="background:linear-gradient(135deg,#6d28d9,#3b82f6);padding:28px 32px;">
+            <h1 style="color:white;margin:0;font-size:24px;font-weight:900;">The God's Tool</h1>
+          </div>
+          <div style="padding:24px;">
+            <p style="color:#e2e8f0;font-size:15px;margin:0 0 16px;">
+              <strong>{inviter_label}</strong> invited you to join
+              <strong style="color:#a78bfa;">{org_name}</strong> as a
+              <strong style="color:#a78bfa;">{role_label}</strong>.
+            </p>
+            <a href="{accept_url}" style="display:inline-block;margin-top:8px;padding:12px 28px;
+              background:linear-gradient(135deg,#7c3aed,#4f46e5);color:white;border-radius:6px;
+              text-decoration:none;font-weight:700;">Accept Invite</a>
+            <p style="color:#64748b;font-size:12px;margin:24px 0 0;">
+              This invite expires in 7 days. If you weren't expecting this, you can ignore this email.</p>
+          </div>
+        </div>
+        </body></html>"""
+        resend.Emails.send({
+            "from": "The Gods Tool <noreply@thegodstool.com>",
+            "to": [to_email],
+            "subject": f"You've been invited to join {org_name} on The God's Tool",
+            "html": html,
+        })
+        print(f"✓ Invite email sent to {to_email}")
+    except Exception as e:
+        print(f"✗ Invite email error: {e}")
+
 # ── PRIMARY KEY ────────────────────────────────────────────────────────────────
 def detect_primary_key(df):
     for col in df.columns:
@@ -2124,6 +2162,8 @@ async def _ensure_org_indexes():
         await mongo_db.org_members.create_index([("userId", 1), ("status", 1)])
         await mongo_db.resource_grants.create_index([("orgId", 1), ("resourceType", 1), ("resourceId", 1)])
         await mongo_db.resource_grants.create_index([("granteeUserId", 1), ("resourceType", 1)])
+        await mongo_db.org_invites.create_index("token", unique=True)
+        await mongo_db.org_invites.create_index([("orgId", 1), ("email", 1), ("status", 1)])
     except Exception as e:
         print(f"Could not ensure org indexes: {e}")
 
@@ -2427,6 +2467,181 @@ async def remove_org_member(request: Request, target_user_id: str):
                      metadata={"targetUserId": target_user_id}, severity="warning")
     return {"success": result.deleted_count > 0}
 
+
+@app.post("/api/org/invites")
+async def create_org_invite(request: Request, background_tasks: BackgroundTasks, body: dict):
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+    if not await _check_permission(user["userId"], "org.manageMembers"):
+        return Response(status_code=403)
+
+    email = (body.get("email") or "").strip().lower()
+    role_key = (body.get("roleKey") or "").strip()
+    if not email or not role_key:
+        return {"error": "email and roleKey are required"}
+
+    ctx = await _get_permissions(user["userId"])
+    org_id = ctx["membership"]["orgId"]
+    org = ctx["org"]
+
+    role_def = await mongo_db.role_definitions.find_one({"orgId": org_id, "key": role_key})
+    if not role_def:
+        return {"error": f"Unknown role '{role_key}' for this organization"}
+
+    existing_user = await mongo_db.users.find_one({"email": email})
+
+    if existing_user:
+        target_user_id = str(existing_user["_id"])
+        already_member = await mongo_db.org_members.find_one({"userId": target_user_id, "status": "active"})
+        if already_member:
+            return {"error": "This user already belongs to an organization."}
+        await mongo_db.org_members.update_one(
+            {"orgId": org_id, "userId": target_user_id},
+            {"$set": {"orgId": org_id, "userId": target_user_id, "roleKey": role_key,
+                       "status": "active", "joinedAt": datetime.now()}},
+            upsert=True,
+        )
+        await log_audit(user["userId"], "org.member_added", "organization", str(org_id),
+                         metadata={"targetUserId": target_user_id, "roleKey": role_key, "email": email})
+        return {"success": True, "addedImmediately": True}
+
+    existing_invite = await mongo_db.org_invites.find_one(
+        {"orgId": org_id, "email": email, "status": "pending"}
+    )
+    token = secrets.token_urlsafe(32)
+    now = datetime.now()
+    expires_at = now + timedelta(days=7)
+
+    if existing_invite:
+        await mongo_db.org_invites.update_one(
+            {"_id": existing_invite["_id"]},
+            {"$set": {"token": token, "roleKey": role_key, "expiresAt": expires_at,
+                       "invitedBy": user["userId"], "updatedAt": now}},
+        )
+    else:
+        await mongo_db.org_invites.insert_one({
+            "orgId": org_id, "email": email, "roleKey": role_key, "token": token,
+            "status": "pending", "invitedBy": user["userId"],
+            "createdAt": now, "expiresAt": expires_at,
+        })
+
+    role_label = role_def.get("name", role_key.capitalize())
+    inviter_label = user.get("email", "A teammate")
+    background_tasks.add_task(send_invite_email, email, org.get("name", "your team"), role_label, inviter_label, token)
+
+    await log_audit(user["userId"], "org.invite_sent", "organization", str(org_id),
+                     metadata={"email": email, "roleKey": role_key})
+    return {"success": True, "addedImmediately": False, "invited": True}
+
+
+@app.get("/api/org/invites")
+async def list_org_invites(request: Request):
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+    if not await _check_permission(user["userId"], "org.manageMembers"):
+        return Response(status_code=403)
+    ctx = await _get_permissions(user["userId"])
+    org_id = ctx["membership"]["orgId"]
+    cursor = mongo_db.org_invites.find({"orgId": org_id, "status": {"$in": ["pending", "expired"]}})
+    docs = await cursor.to_list(length=500)
+    now = datetime.now()
+    out = []
+    for d in docs:
+        status = d.get("status")
+        if status == "pending" and d.get("expiresAt") and d["expiresAt"] < now:
+            status = "expired"
+        out.append({
+            "id": str(d["_id"]), "email": d.get("email", ""), "roleKey": d.get("roleKey", ""),
+            "status": status,
+            "invitedAt": d.get("createdAt").isoformat() if d.get("createdAt") else None,
+            "expiresAt": d.get("expiresAt").isoformat() if d.get("expiresAt") else None,
+        })
+    return out
+
+
+@app.delete("/api/org/invites/{invite_id}")
+async def revoke_org_invite(request: Request, invite_id: str):
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+    if not await _check_permission(user["userId"], "org.manageMembers"):
+        return Response(status_code=403)
+    ctx = await _get_permissions(user["userId"])
+    org_id = ctx["membership"]["orgId"]
+    result = await mongo_db.org_invites.update_one(
+        {"_id": ObjectId(invite_id), "orgId": org_id},
+        {"$set": {"status": "revoked"}},
+    )
+    if result.matched_count:
+        await log_audit(user["userId"], "org.invite_revoked", "organization", str(org_id),
+                         metadata={"inviteId": invite_id})
+    return {"success": result.matched_count > 0}
+
+
+@app.get("/api/org/invites/{token}/info")
+async def get_invite_info(token: str):
+    if mongo_db is None:
+        return {"valid": False, "error": "MongoDB not configured"}
+    invite = await mongo_db.org_invites.find_one({"token": token})
+    if not invite:
+        return {"valid": False, "error": "Invite not found"}
+    if invite.get("status") != "pending":
+        return {"valid": False, "error": f"This invite has been {invite.get('status')}."}
+    if invite.get("expiresAt") and invite["expiresAt"] < datetime.now():
+        return {"valid": False, "error": "This invite has expired."}
+    org = await mongo_db.organizations.find_one({"_id": invite["orgId"]})
+    role_def = await mongo_db.role_definitions.find_one({"orgId": invite["orgId"], "key": invite["roleKey"]})
+    return {
+        "valid": True,
+        "orgName": org.get("name", "") if org else "",
+        "roleKey": invite["roleKey"],
+        "roleLabel": role_def.get("name", invite["roleKey"]) if role_def else invite["roleKey"],
+        "email": invite["email"],
+    }
+
+
+@app.post("/api/org/invites/{token}/accept")
+async def accept_org_invite(request: Request, token: str):
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+    invite = await mongo_db.org_invites.find_one({"token": token})
+    if not invite:
+        return {"error": "Invite not found"}
+    if invite.get("status") != "pending":
+        return {"error": f"This invite has been {invite.get('status')}."}
+    if invite.get("expiresAt") and invite["expiresAt"] < datetime.now():
+        await mongo_db.org_invites.update_one({"_id": invite["_id"]}, {"$set": {"status": "expired"}})
+        return {"error": "This invite has expired. Ask for a new one."}
+    if user.get("email", "").strip().lower() != invite["email"]:
+        return {"error": "This invite was sent to a different email address."}
+
+    already_member = await mongo_db.org_members.find_one({"userId": user["userId"], "status": "active"})
+    if already_member:
+        return {"error": "You already belong to an organization."}
+
+    await mongo_db.org_members.update_one(
+        {"orgId": invite["orgId"], "userId": user["userId"]},
+        {"$set": {"orgId": invite["orgId"], "userId": user["userId"], "roleKey": invite["roleKey"],
+                   "status": "active", "joinedAt": datetime.now()}},
+        upsert=True,
+    )
+    await mongo_db.org_invites.update_one({"_id": invite["_id"]}, {"$set": {"status": "accepted"}})
+    await log_audit(user["userId"], "org.invite_accepted", "organization", str(invite["orgId"]),
+                     metadata={"roleKey": invite["roleKey"]})
+    return {"success": True, "orgId": str(invite["orgId"])}
+
+
 @app.on_event("startup")
 async def _on_startup_pipeline_engine():
     await _ensure_runs_collection()
@@ -2458,6 +2673,9 @@ AUDIT_ACTION_CATEGORY = {
     "org.member_role_changed": "security",
     "org.member_removed": "security",
     "org.ownership_transferred": "security",
+    "org.invite_sent": "security",
+    "org.invite_accepted": "security",
+    "org.invite_revoked": "security",
 }
 
 def _diff_dict(old: dict, new: dict, ignore: set = frozenset()) -> dict | None:
