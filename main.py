@@ -2203,6 +2203,17 @@ DEFAULT_ROLE_PERMISSIONS = {
         "org.manageMembers": False,
         "org.transferOwnership": False,
     },
+    "editor": {
+        "connection.delete": False,
+        "connection.erase": False,
+        "connection.revealCredentials": False,
+        "pipeline.delete": False,
+        "pipeline.approve": False,
+        "pipeline.execute": True,
+        "catalog.assignOwner": False,
+        "org.manageMembers": False,
+        "org.transferOwnership": False,
+    },
     "viewer": {
         "connection.delete": False,
         "connection.erase": False,
@@ -2293,6 +2304,19 @@ async def _check_permission(user_id: str, permission_key: str) -> bool:
     """Convenience wrapper: True if the caller's role grants permission_key."""
     ctx = await _get_permissions(user_id)
     return bool(ctx["permissions"].get(permission_key))
+
+
+@app.post("/api/org/backfill-roles")
+async def backfill_org_roles(request: Request):
+    user = require_user(request)
+    if not user:
+        return Response(status_code=401)
+    if mongo_db is None:
+        return {"error": "MongoDB not configured"}
+    ctx = await _get_permissions(user["userId"])
+    org_id = ctx["membership"]["orgId"]
+    await _seed_role_definitions(org_id)
+    return {"success": True}
 
 
 @app.post("/api/org/backfill-resources")
