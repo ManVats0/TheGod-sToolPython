@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from pathlib import Path
 
 
-# ── Pydantic Models ────────────────────────────────────────────────────────
+# ── Pydantic Models ───────────────────────────────────────────────────────
 class ContactFormRequest(BaseModel):
     name: str
     email: str
