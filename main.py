@@ -2372,9 +2372,22 @@ async def list_org_members(request: Request):
     org_id = ctx["membership"]["orgId"]
     cursor = mongo_db.org_members.find({"orgId": org_id})
     docs = await cursor.to_list(length=500)
+
+    user_ids = []
+    for d in docs:
+        try:
+            user_ids.append(ObjectId(d.get("userId", "")))
+        except Exception:
+            pass
+    users_by_id = {}
+    if user_ids:
+        async for u in mongo_db.users.find({"_id": {"$in": user_ids}}):
+            users_by_id[str(u["_id"])] = u.get("email", "")
+
     return [
         {
             "userId": d.get("userId", ""),
+            "email": users_by_id.get(d.get("userId", ""), ""),
             "roleKey": d.get("roleKey", ""),
             "status": d.get("status", ""),
             "invitedAt": d.get("invitedAt").isoformat() if d.get("invitedAt") else None,
@@ -2409,7 +2422,15 @@ async def invite_org_member(request: Request, body: dict):
 
     role_def = await mongo_db.role_definitions.find_one({"orgId": org_id, "key": role_key})
     if not role_def:
-        return {"error": f"Unknown role '{role_key}' for this organization"}
+        if role_key not in DEFAULT_ROLE_PERMISSIONS:
+            return {"error": f"Unknown role '{role_key}' for this organization"}
+        role_def = {
+            "orgId": org_id, "key": role_key,
+            "name": role_key.capitalize(),
+            "permissions": DEFAULT_ROLE_PERMISSIONS[role_key],
+            "createdAt": datetime.now(),
+        }
+        await mongo_db.role_definitions.insert_one(role_def)
 
     existing = await mongo_db.org_members.find_one({"userId": target_user_id, "status": "active"})
     if existing:
@@ -2455,7 +2476,15 @@ async def update_org_member_role(request: Request, target_user_id: str, body: di
 
     role_def = await mongo_db.role_definitions.find_one({"orgId": org_id, "key": new_role})
     if not role_def:
-        return {"error": f"Unknown role '{new_role}' for this organization"}
+        if new_role not in DEFAULT_ROLE_PERMISSIONS:
+            return {"error": f"Unknown role '{new_role}' for this organization"}
+        role_def = {
+            "orgId": org_id, "key": new_role,
+            "name": new_role.capitalize(),
+            "permissions": DEFAULT_ROLE_PERMISSIONS[new_role],
+            "createdAt": datetime.now(),
+        }
+        await mongo_db.role_definitions.insert_one(role_def)
 
     await mongo_db.org_members.update_one(
         {"orgId": org_id, "userId": target_user_id},
@@ -2513,7 +2542,15 @@ async def create_org_invite(request: Request, background_tasks: BackgroundTasks,
 
     role_def = await mongo_db.role_definitions.find_one({"orgId": org_id, "key": role_key})
     if not role_def:
-        return {"error": f"Unknown role '{role_key}' for this organization"}
+        if role_key not in DEFAULT_ROLE_PERMISSIONS:
+            return {"error": f"Unknown role '{role_key}' for this organization"}
+        role_def = {
+            "orgId": org_id, "key": role_key,
+            "name": role_key.capitalize(),
+            "permissions": DEFAULT_ROLE_PERMISSIONS[role_key],
+            "createdAt": datetime.now(),
+        }
+        await mongo_db.role_definitions.insert_one(role_def)
 
     existing_user = await mongo_db.users.find_one({"email": email})
 
@@ -2522,15 +2559,6 @@ async def create_org_invite(request: Request, background_tasks: BackgroundTasks,
         already_member = await mongo_db.org_members.find_one({"userId": target_user_id, "status": "active"})
         if already_member:
             return {"error": "This user already belongs to an organization."}
-        await mongo_db.org_members.update_one(
-            {"orgId": org_id, "userId": target_user_id},
-            {"$set": {"orgId": org_id, "userId": target_user_id, "roleKey": role_key,
-                       "status": "active", "joinedAt": datetime.now()}},
-            upsert=True,
-        )
-        await log_audit(user["userId"], "org.member_added", "organization", str(org_id),
-                         metadata={"targetUserId": target_user_id, "roleKey": role_key, "email": email})
-        return {"success": True, "addedImmediately": True}
 
     existing_invite = await mongo_db.org_invites.find_one(
         {"orgId": org_id, "email": email, "status": "pending"}
