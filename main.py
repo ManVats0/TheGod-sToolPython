@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from pathlib import Path
 
 
-# ── Pydantic Models ───────────────────────────────────────────────────────
+# ── Pydantic Models ────────────────────────────────────────────────────────
 class ContactFormRequest(BaseModel):
     name: str
     email: str
@@ -363,7 +363,7 @@ def send_email_alert(to_email: str, filename: str, alerts: list):
 
 def send_invite_email(to_email: str, org_name: str, role_label: str, inviter_label: str, token: str):
     if not to_email:
-        return
+        return False, "No recipient email provided."
     try:
         import resend
         resend.api_key = os.getenv("RESEND_API_KEY", "")
@@ -389,15 +389,21 @@ def send_invite_email(to_email: str, org_name: str, role_label: str, inviter_lab
           </div>
         </div>
         </body></html>"""
-        resend.Emails.send({
+        if not os.getenv("RESEND_API_KEY", ""):
+            print("✗ Invite email error: RESEND_API_KEY not set")
+            return False, "RESEND_API_KEY is not set on the backend."
+        resp = resend.Emails.send({
             "from": "The Gods Tool <noreply@thegodstool.com>",
             "to": [to_email],
             "subject": f"You've been invited to join {org_name} on The God's Tool",
             "html": html,
+            "text": f"{inviter_label} invited you to join {org_name} as a {role_label}. Accept here: {accept_url}",
         })
-        print(f"✓ Invite email sent to {to_email}")
+        print(f"✓ Invite email accepted by Resend for {to_email}: {resp}")
+        return True, ""
     except Exception as e:
         print(f"✗ Invite email error: {e}")
+        return False, str(e)
 
 # ── PRIMARY KEY ────────────────────────────────────────────────────────────────
 def detect_primary_key(df):
@@ -2582,10 +2588,15 @@ async def create_org_invite(request: Request, background_tasks: BackgroundTasks,
 
     role_label = role_def.get("name", role_key.capitalize())
     inviter_label = user.get("email", "A teammate")
-    background_tasks.add_task(send_invite_email, email, org.get("name", "your team"), role_label, inviter_label, token)
+    email_ok, email_err = await asyncio.to_thread(
+        send_invite_email, email, org.get("name", "your team"), role_label, inviter_label, token
+    )
 
     await log_audit(user["userId"], "org.invite_sent", "organization", str(org_id),
-                     metadata={"email": email, "roleKey": role_key})
+                     metadata={"email": email, "roleKey": role_key, "emailSent": email_ok, "emailError": email_err},
+                     status="success" if email_ok else "failure")
+    if not email_ok:
+        return {"error": f"Invite saved, but the email could not be sent: {email_err}"}
     return {"success": True, "addedImmediately": False, "invited": True}
 
 
