@@ -2653,22 +2653,28 @@ async def revoke_org_invite(request: Request, invite_id: str):
 async def get_invite_info(token: str):
     if mongo_db is None:
         return {"valid": False, "error": "MongoDB not configured"}
-    invite = await mongo_db.org_invites.find_one({"token": token})
-    if not invite:
-        return {"valid": False, "error": "Invite not found"}
-    if invite.get("status") != "pending":
-        return {"valid": False, "error": f"This invite has been {invite.get('status')}."}
-    if invite.get("expiresAt") and invite["expiresAt"] < datetime.now():
-        return {"valid": False, "error": "This invite has expired."}
-    org = await mongo_db.organizations.find_one({"_id": invite["orgId"]})
-    role_def = await mongo_db.role_definitions.find_one({"orgId": invite["orgId"], "key": invite["roleKey"]})
-    return {
-        "valid": True,
-        "orgName": org.get("name", "") if org else "",
-        "roleKey": invite["roleKey"],
-        "roleLabel": role_def.get("name", invite["roleKey"]) if role_def else invite["roleKey"],
-        "email": invite["email"],
-    }
+    try:
+        invite = await mongo_db.org_invites.find_one({"token": token})
+        if not invite:
+            return {"valid": False, "error": "Invite not found"}
+        if invite.get("status") != "pending":
+            return {"valid": False, "error": f"This invite has been {invite.get('status')}."}
+        if invite.get("expiresAt") and invite["expiresAt"] < datetime.now():
+            return {"valid": False, "error": "This invite has expired."}
+        org = await mongo_db.organizations.find_one({"_id": invite["orgId"]})
+        role_def = await mongo_db.role_definitions.find_one(
+            {"orgId": invite["orgId"], "key": invite["roleKey"]}
+        )
+        return {
+            "valid": True,
+            "orgName": org.get("name", "") if org else "",
+            "roleKey": invite["roleKey"],
+            "roleLabel": role_def.get("name", invite["roleKey"]) if role_def else invite["roleKey"],
+            "email": invite["email"],
+        }
+    except Exception as e:
+        print(f"Invite info error: {e}")
+        return {"valid": False, "error": "Could not load invite. Please try again."}
 
 
 @app.post("/api/org/invites/{token}/accept")
@@ -2688,10 +2694,6 @@ async def accept_org_invite(request: Request, token: str):
         return {"error": "This invite has expired. Ask for a new one."}
     if user.get("email", "").strip().lower() != invite["email"]:
         return {"error": "This invite was sent to a different email address."}
-
-    already_member = await mongo_db.org_members.find_one({"userId": user["userId"], "status": "active"})
-    if already_member:
-        return {"error": "You already belong to an organization."}
 
     await mongo_db.org_members.update_one(
         {"orgId": invite["orgId"], "userId": user["userId"]},
