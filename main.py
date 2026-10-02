@@ -2710,7 +2710,16 @@ async def accept_org_invite(request: Request, token: str):
     await mongo_db.org_invites.update_one({"_id": invite["_id"]}, {"$set": {"status": "accepted"}})
     await log_audit(user["userId"], "org.invite_accepted", "organization", str(invite["orgId"]),
                      metadata={"roleKey": invite["roleKey"]})
-    return {"success": True, "orgId": str(invite["orgId"])}
+
+    org = await mongo_db.organizations.find_one({"_id": invite["orgId"]})
+    role_def = await mongo_db.role_definitions.find_one({"orgId": invite["orgId"], "key": invite["roleKey"]})
+    return {
+        "success": True,
+        "orgId": str(invite["orgId"]),
+        "orgName": org.get("name", "") if org else "",
+        "roleKey": invite["roleKey"],
+        "roleLabel": role_def.get("name", invite["roleKey"]) if role_def else invite["roleKey"],
+    }
 
 
 @app.on_event("startup")
