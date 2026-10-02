@@ -2695,6 +2695,12 @@ async def accept_org_invite(request: Request, token: str):
     if user.get("email", "").strip().lower() != invite["email"]:
         return {"error": "This invite was sent to a different email address."}
 
+    # One active org per user: retire any other active membership (e.g. the
+    # auto-created personal org) before joining the invited org.
+    await mongo_db.org_members.update_many(
+        {"userId": user["userId"], "status": "active", "orgId": {"$ne": invite["orgId"]}},
+        {"$set": {"status": "left"}},
+    )
     await mongo_db.org_members.update_one(
         {"orgId": invite["orgId"], "userId": user["userId"]},
         {"$set": {"orgId": invite["orgId"], "userId": user["userId"], "roleKey": invite["roleKey"],
