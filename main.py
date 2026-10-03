@@ -769,23 +769,24 @@ async def test_jwt_auth(request: Request):
 # ── Connections ───────────────────────────────────────────────────────────
 @app.get("/api/connections")
 async def list_connections(request: Request):
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
-    cursor = mongo_db.connections.find({"userId": user["userId"]}).sort("createdAt", -1)
+    ctx, err = await _auth(request, "connection.view")
+    if err:
+        return err
+    cursor = mongo_db.connections.find({"orgId": ctx["orgId"]}).sort("createdAt", -1)
     docs = await cursor.to_list(length=500)
     return [serialize_doc(d, drop=["credentialsEncrypted"]) for d in docs]
 
 
 @app.post("/api/connections")
 async def create_connection(request: Request, body: dict):
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
+    ctx, err = await _auth(request, "connection.create")
+    if err:
+        return err
+    user = ctx
 
     name = body.get("name", "")
     conn_type = body.get("type", "")
@@ -795,7 +796,9 @@ async def create_connection(request: Request, body: dict):
         return {"error": "name and type are required"}
 
     doc = {
-        "userId": user["userId"],
+        "userId": ctx["userId"],
+        "orgId": ctx["orgId"],
+        "createdBy": ctx["userId"],
         "name": name,
         "type": conn_type,
         "config": config,
@@ -825,13 +828,14 @@ async def update_connection(request: Request, connection_id: str, body: dict):
     so a retry that couldn't find fresh credentials never wipes out a
     working secret that was already stored.
     """
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
+    ctx, err = await _auth(request, "connection.edit")
+    if err:
+        return err
+    user = ctx
 
-    existing = await mongo_db.connections.find_one({"_id": ObjectId(connection_id), "userId": user["userId"]})
+    existing = await mongo_db.connections.find_one({"_id": ObjectId(connection_id), "orgId": ctx["orgId"]})
     if not existing:
         return {"error": "Connection not found"}
 
@@ -851,7 +855,7 @@ async def update_connection(request: Request, connection_id: str, body: dict):
         update_fields["credentialsEncrypted"] = encrypt_credentials(credentials)
 
     await mongo_db.connections.update_one(
-        {"_id": ObjectId(connection_id), "userId": user["userId"]},
+        {"_id": ObjectId(connection_id), "orgId": ctx["orgId"]},
         {"$set": update_fields},
     )
     doc = await mongo_db.connections.find_one({"_id": ObjectId(connection_id)})
@@ -863,15 +867,20 @@ async def update_connection(request: Request, connection_id: str, body: dict):
 
 @app.delete("/api/connections/{connection_id}")
 async def delete_connection(request: Request, connection_id: str):
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
-    if not await _check_permission(user["userId"], "connection.delete"):
-        return Response(status_code=403)
-    prev_conn = await mongo_db.connections.find_one({"_id": ObjectId(connection_id), "userId": user["userId"]})
-    result = await mongo_db.connections.delete_one({"_id": ObjectId(connection_id), "userId": user["userId"]})
+    ctx, err = await _auth(request)
+    if err:
+        return err
+    user = ctx
+    prev_conn = await mongo_db.connections.find_one({"_id": ObjectId(connection_id), "orgId": ctx["orgId"]})
+    if not prev_conn:
+        return {"success": False, "error": "Connection not found"}
+    own = prev_conn.get("createdBy") == ctx["userId"]
+    if not (ctx["permissions"].get("connection.delete")
+            or (own and ctx["permissions"].get("connection.deleteOwn"))):
+        return _require_perm(ctx, "connection.delete")
+    result = await mongo_db.connections.delete_one({"_id": ObjectId(connection_id), "orgId": ctx["orgId"]})
     await log_audit(user["userId"], "connection.deleted", "connection", connection_id,
                      resource_name=(prev_conn or {}).get("name", ""), severity="warning")
     return {"success": result.deleted_count > 0}
@@ -886,11 +895,12 @@ async def set_connection_retention(request: Request, connection_id: str, body: d
     connection.updatedAt) for longer than retention_days. Pass
     retention_days: null or 0 to disable retention for this connection.
     """
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
+    ctx, err = await _auth(request, "connection.erase")
+    if err:
+        return err
+    user = ctx
     retention_days = body.get("retention_days")
     if retention_days is not None:
         try:
@@ -899,11 +909,11 @@ async def set_connection_retention(request: Request, connection_id: str, body: d
                 retention_days = None
         except (TypeError, ValueError):
             return {"error": "retention_days must be a positive integer or null"}
-    existing = await mongo_db.connections.find_one({"_id": ObjectId(connection_id), "userId": user["userId"]})
+    existing = await mongo_db.connections.find_one({"_id": ObjectId(connection_id), "orgId": ctx["orgId"]})
     if not existing:
         return {"error": "Connection not found"}
     await mongo_db.connections.update_one(
-        {"_id": ObjectId(connection_id), "userId": user["userId"]},
+        {"_id": ObjectId(connection_id), "orgId": ctx["orgId"]},
         {"$set": {"config.retentionDays": retention_days, "updatedAt": datetime.now()}},
     )
     await log_audit(
@@ -922,14 +932,13 @@ async def erase_connection_data(request: Request, connection_id: str):
     (drops the table / collection / file — not row-level filtering). Used
     for DPDP/GDPR "right to erasure" requests. Irreversible.
     """
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
-    if not await _check_permission(user["userId"], "connection.erase"):
-        return Response(status_code=403)
-    conn = await get_decrypted_connection(connection_id, user["userId"])
+    ctx, err = await _auth(request, "connection.erase")
+    if err:
+        return err
+    user = ctx
+    conn = await get_decrypted_connection(connection_id, ctx["orgId"])
     if not conn:
         return {"error": "Connection not found"}
     result = await _erase_connection_data(conn["type"], conn.get("config", {}), conn.get("credentials", {}))
@@ -951,13 +960,13 @@ async def get_latest_analysis_result(request: Request, source_key: str):
     (e.g. 'this Google Sheet changed since it was last analyzed on another
     device').
     """
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
     if mongo_db is None:
         return {"result": None}
+    ctx, err = await _auth(request, "analysis.view")
+    if err:
+        return err
     doc = await mongo_db.analysis_results.find_one(
-        {"userId": user["userId"], "sourceKey": source_key},
+        {"orgId": ctx["orgId"], "sourceKey": source_key},
         sort=[("createdAt", -1)],
     )
     if not doc:
@@ -980,30 +989,33 @@ async def reveal_connection(request: Request, connection_id: str):
     frontend to send connection_id in requests (as /api/analyze already
     does) instead of ever holding the raw secret client-side.
     """
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
-    if not await _check_permission(user["userId"], "connection.revealCredentials"):
-        return Response(status_code=403)
-    conn = await get_decrypted_connection(connection_id, user["userId"])
+    ctx, err = await _auth(request, "connection.revealCredentials")
+    if err:
+        return err
+    user = ctx
+    conn = await get_decrypted_connection(connection_id, ctx["orgId"])
     if not conn:
         return {"error": "Connection not found"}
     await log_audit(user["userId"], "connection.revealed", "connection", connection_id,
                      resource_name=conn.get("name", ""), severity="warning")
     return conn
 
-async def get_decrypted_connection(connection_id: str, user_id: str) -> dict | None:
+async def get_decrypted_connection(connection_id: str, org_id, legacy_user_id: str | None = None) -> dict | None:
     """
-    Internal helper — NOT a route. Fetches a connection by id (scoped to user_id)
+    Internal helper — NOT a route. Fetches a connection by id (scoped to org_id;
+    legacy_user_id is used only when a pipeline has no orgId yet)
     and decrypts its credentials. Used by the scheduler / pipeline runner to
     reconnect to a source without the browser being open. Never expose the
     decrypted result directly to the frontend — it's for server-side use only.
     """
     if mongo_db is None:
         return None
-    doc = await mongo_db.connections.find_one({"_id": ObjectId(connection_id), "userId": user_id})
+    if org_id is None and not legacy_user_id:
+        return None
+    scope = {"orgId": org_id} if org_id is not None else {"userId": legacy_user_id}
+    doc = await mongo_db.connections.find_one({"_id": ObjectId(connection_id), **scope})
     if not doc:
         return None
     creds = {}
@@ -1223,25 +1235,29 @@ async def _retention_sweep():
 # ── Pipelines ─────────────────────────────────────────────────────────────
 @app.get("/api/pipelines")
 async def list_pipelines(request: Request):
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
-    cursor = mongo_db.pipelines.find({"userId": user["userId"]}).sort("updatedAt", -1)
+    ctx, err = await _auth(request, "pipeline.view")
+    if err:
+        return err
+    cursor = mongo_db.pipelines.find({"orgId": ctx["orgId"]}).sort("updatedAt", -1)
     docs = await cursor.to_list(length=500)
     return [serialize_doc(d) for d in docs]
 
 
 @app.post("/api/pipelines")
 async def save_pipeline(request: Request, body: dict):
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
+    ctx, err = await _auth(request)
+    if err:
+        return err
+    user = ctx
 
     pipeline_id = body.get("id")
+    denied = _require_perm(ctx, "pipeline.edit" if pipeline_id else "pipeline.create")
+    if denied:
+        return denied
     # Preserve an existing approval status across ordinary edits (e.g. the
     # Flow.tsx "Save Pipeline" button) so a pipeline someone marked
     # pending_approval doesn't silently flip back to approved just because
@@ -1249,12 +1265,12 @@ async def save_pipeline(request: Request, body: dict):
     existing_status = "approved"
     if pipeline_id:
         prev_status_doc = await mongo_db.pipelines.find_one(
-            {"_id": ObjectId(pipeline_id), "userId": user["userId"]}, {"status": 1}
+            {"_id": ObjectId(pipeline_id), "orgId": ctx["orgId"]}, {"status": 1}
         )
         if prev_status_doc:
             existing_status = prev_status_doc.get("status", "approved")
     payload = {
-        "userId": user["userId"],
+        "orgId": ctx["orgId"],
         "name": body.get("name", ""),
         "sourceId": body.get("sourceId", ""),
         "destinationId": body.get("destinationId", ""),
@@ -1274,19 +1290,26 @@ async def save_pipeline(request: Request, body: dict):
         "scheduleTimezone": body.get("scheduleTimezone"),
         "scheduleStartDate": body.get("scheduleStartDate"),
         "isActive": body.get("isActive", False),
-        "status": body.get("status", existing_status),
+        "status": (body.get("status")
+                   if ctx["permissions"].get("pipeline.approve")
+                   and body.get("status") in ("approved", "pending_approval", "rejected")
+                   else existing_status),
         "updatedAt": datetime.now(),
     }
 
     if pipeline_id:
-        prev_doc = await mongo_db.pipelines.find_one({"_id": ObjectId(pipeline_id), "userId": user["userId"]})
-        await mongo_db.pipelines.update_one({"_id": ObjectId(pipeline_id), "userId": user["userId"]}, {"$set": payload})
+        prev_doc = await mongo_db.pipelines.find_one({"_id": ObjectId(pipeline_id), "orgId": ctx["orgId"]})
+        if not prev_doc:
+            return {"error": "Pipeline not found"}
+        await mongo_db.pipelines.update_one({"_id": ObjectId(pipeline_id), "orgId": ctx["orgId"]}, {"$set": payload})
         doc = await mongo_db.pipelines.find_one({"_id": ObjectId(pipeline_id)})
         diff = _diff_dict(prev_doc or {}, payload, ignore={"updatedAt"}) if prev_doc else None
         await log_audit(user["userId"], "pipeline.updated", "pipeline", pipeline_id,
                          metadata={"name": payload["name"]}, resource_name=payload["name"],
                          changes=diff)
     else:
+        payload["userId"] = ctx["userId"]
+        payload["createdBy"] = ctx["userId"]
         payload["createdAt"] = datetime.now()
         payload["runCount"] = 0
         payload["lastRun"] = None
@@ -1300,15 +1323,14 @@ async def save_pipeline(request: Request, body: dict):
 
 @app.delete("/api/pipelines/{pipeline_id}")
 async def delete_pipeline(request: Request, pipeline_id: str):
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
-    if not await _check_permission(user["userId"], "pipeline.delete"):
-        return Response(status_code=403)
-    prev_pipeline = await mongo_db.pipelines.find_one({"_id": ObjectId(pipeline_id), "userId": user["userId"]})
-    result = await mongo_db.pipelines.delete_one({"_id": ObjectId(pipeline_id), "userId": user["userId"]})
+    ctx, err = await _auth(request, "pipeline.delete")
+    if err:
+        return err
+    user = ctx
+    prev_pipeline = await mongo_db.pipelines.find_one({"_id": ObjectId(pipeline_id), "orgId": ctx["orgId"]})
+    result = await mongo_db.pipelines.delete_one({"_id": ObjectId(pipeline_id), "orgId": ctx["orgId"]})
     await log_audit(user["userId"], "pipeline.deleted", "pipeline", pipeline_id,
                      resource_name=(prev_pipeline or {}).get("name", ""), severity="warning")
     return {"success": result.deleted_count > 0}
@@ -1323,21 +1345,23 @@ async def set_pipeline_status(request: Request, pipeline_id: str, body: dict):
     scheduler (see _scheduler_loop's query filter) until moved back to
     "approved".
     """
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
-    if not await _check_permission(user["userId"], "pipeline.approve"):
-        return Response(status_code=403)
+    ctx, err = await _auth(request)
+    if err:
+        return err
+    user = ctx
     new_status = body.get("status", "")
-    if new_status not in ("approved", "pending_approval"):
-        return {"error": "status must be 'approved' or 'pending_approval'"}
-    prev_doc = await mongo_db.pipelines.find_one({"_id": ObjectId(pipeline_id), "userId": user["userId"]})
+    if new_status not in ("approved", "pending_approval", "rejected"):
+        return {"error": "status must be 'approved', 'pending_approval' or 'rejected'"}
+    denied = _require_perm(ctx, "pipeline.edit" if new_status == "pending_approval" else "pipeline.approve")
+    if denied:
+        return denied
+    prev_doc = await mongo_db.pipelines.find_one({"_id": ObjectId(pipeline_id), "orgId": ctx["orgId"]})
     if not prev_doc:
         return {"error": "Pipeline not found"}
     await mongo_db.pipelines.update_one(
-        {"_id": ObjectId(pipeline_id), "userId": user["userId"]},
+        {"_id": ObjectId(pipeline_id), "orgId": ctx["orgId"]},
         {"$set": {"status": new_status, "updatedAt": datetime.now()}},
     )
     await log_audit(
@@ -1366,6 +1390,7 @@ async def log_pipeline_run(user_id: str, pipeline_id: str, status: str, rows_in:
             "ts": datetime.now(),
             "pipelineId": pipeline_id,
             "userId": user_id,
+            "orgId": await _org_id_for_user(user_id),
             "status": status,
             "rowsIn": rows_in,
             "rowsOut": rows_out,
@@ -1885,7 +1910,8 @@ async def _write_destination_df(conn_type: str, cfg: dict, creds: dict, df: pd.D
 async def _run_pipeline(pipeline: dict, triggered_by: str = "manual") -> dict:
     start = time.time()
     pipeline_id = str(pipeline["_id"])
-    user_id = pipeline["userId"]
+    user_id = pipeline.get("userId") or pipeline.get("createdBy", "")
+    org_id = pipeline.get("orgId")
     pipeline_name = pipeline.get("name", "")
     correlation_id = str(uuid.uuid4())
     steps_log = []
@@ -1897,7 +1923,7 @@ async def _run_pipeline(pipeline: dict, triggered_by: str = "manual") -> dict:
                 "Pipeline has no linked sourceConnectionId — re-save the pipeline "
                 "after connecting its source via /api/connections."
             )
-        source_conn = await get_decrypted_connection(source_conn_id, user_id)
+        source_conn = await get_decrypted_connection(source_conn_id, org_id, user_id)
         if not source_conn:
             raise RuntimeError("Source connection not found or could not be decrypted.")
 
@@ -1919,7 +1945,7 @@ async def _run_pipeline(pipeline: dict, triggered_by: str = "manual") -> dict:
         result_info: dict = {}
 
         if dest_conn_id:
-            dest_conn = await get_decrypted_connection(dest_conn_id, user_id)
+            dest_conn = await get_decrypted_connection(dest_conn_id, org_id, user_id)
             if not dest_conn:
                 raise RuntimeError("Destination connection not found or could not be decrypted.")
             dest_type = dest_conn["type"]
@@ -1986,18 +2012,16 @@ async def _run_pipeline(pipeline: dict, triggered_by: str = "manual") -> dict:
 
 @app.post("/api/pipelines/{pipeline_id}/execute")
 async def execute_pipeline_route(request: Request, pipeline_id: str):
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
-    if not await _check_permission(user["userId"], "pipeline.execute"):
-        return Response(status_code=403)
-    pipeline = await mongo_db.pipelines.find_one({"_id": ObjectId(pipeline_id), "userId": user["userId"]})
+    ctx, err = await _auth(request, "pipeline.execute")
+    if err:
+        return err
+    pipeline = await mongo_db.pipelines.find_one({"_id": ObjectId(pipeline_id), "orgId": ctx["orgId"]})
     if not pipeline:
         return {"error": "Pipeline not found"}
-    if pipeline.get("status", "approved") == "pending_approval":
-        return {"status": "failed", "error": "Pipeline is pending approval and cannot be run until approved."}
+    if pipeline.get("status", "approved") in ("pending_approval", "rejected"):
+        return {"status": "failed", "error": "Pipeline is not approved and cannot be run until approved."}
     got_lock = await _try_acquire_pipeline_lock(pipeline_id, ttl_seconds=600)
     if not got_lock:
         return {"status": "failed", "error": "Pipeline is already running (scheduled or manual run in progress)."}
@@ -2010,15 +2034,18 @@ async def execute_pipeline_route(request: Request, pipeline_id: str):
 
 @app.get("/api/pipelines/{pipeline_id}/runs")
 async def list_pipeline_runs(request: Request, pipeline_id: str, limit: int = 50):
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
+    ctx, err = await _auth(request, "pipeline.view")
+    if err:
+        return err
+    # runs is a time-series collection (old docs can't be back-stamped), so org
+    # ownership is verified through the pipeline itself.
+    owned = await mongo_db.pipelines.find_one({"_id": ObjectId(pipeline_id), "orgId": ctx["orgId"]}, {"_id": 1})
+    if not owned:
+        return []
     capped = min(limit, 200)
-    cursor = mongo_db.runs.find(
-        {"pipelineId": pipeline_id, "userId": user["userId"]}
-    ).sort("ts", -1).limit(capped)
+    cursor = mongo_db.runs.find({"pipelineId": pipeline_id}).sort("ts", -1).limit(capped)
     docs = await cursor.to_list(length=capped)
     return [serialize_doc(d) for d in docs]
 
@@ -2093,7 +2120,7 @@ async def _scheduler_loop():
                 cursor = mongo_db.pipelines.find({
                     "isActive": True,
                     "scheduleMs": {"$gt": 0},
-                    "status": {"$ne": "pending_approval"},
+                    "status": {"$nin": ["pending_approval", "rejected"]},
                 })
                 async for pipeline in cursor:
                     pid = str(pipeline["_id"])
@@ -2175,9 +2202,49 @@ async def _ensure_org_indexes():
 
 # ── IAM: organizations, membership, roles (auto-provisioning) ──────────────
 
+_ALL_PERMISSION_KEYS = [
+    "connection.view", "connection.create", "connection.edit", "connection.deleteOwn",
+    "connection.delete", "connection.erase", "connection.revealCredentials",
+    "catalog.view", "catalog.editText", "catalog.editLabels", "catalog.assignOwner", "catalog.delete",
+    "pipeline.view", "pipeline.create", "pipeline.edit", "pipeline.execute",
+    "pipeline.approve", "pipeline.delete",
+    "analysis.view", "analysis.run",
+    "audit.view", "audit.export",
+    "org.manageMembers", "org.transferOwnership",
+    "tunnel.use", "tunnel.manage",
+]
+
+def _perm_set(*granted: str) -> dict:
+    return {k: (k in granted) for k in _ALL_PERMISSION_KEYS}
+
+_FULL_ACCESS = [k for k in _ALL_PERMISSION_KEYS if k != "org.transferOwnership"]
+
 DEFAULT_ROLE_PERMISSIONS = {
-    "owner": {
-        "connection.delete": True,
+    "owner": _perm_set(*_FULL_ACCESS),
+    "admin": _perm_set(*_FULL_ACCESS),
+    "steward": _perm_set(
+        "connection.view",
+        "catalog.view", "catalog.editText", "catalog.editLabels", "catalog.assignOwner", "catalog.delete",
+        "pipeline.view", "pipeline.approve",
+        "analysis.view", "analysis.run",
+        "audit.view",
+    ),
+    "editor": _perm_set(
+        "connection.view", "connection.create", "connection.edit", "connection.deleteOwn",
+        "connection.revealCredentials",
+        "catalog.view", "catalog.editText",
+        "pipeline.view", "pipeline.create", "pipeline.edit", "pipeline.execute",
+        "analysis.view", "analysis.run",
+        "tunnel.use",
+    ),
+    "viewer": _perm_set("connection.view", "catalog.view", "pipeline.view", "analysis.view"),
+}
+
+ROLE_LABELS = {
+    "owner": "Organization Owner", "admin": "Admin", "steward": "Data Steward",
+    "editor": "Editor", "viewer": "Viewer",
+}
+ASSIGNABLE_ROLES = ("admin", "steward", "editor", "viewer")
         "connection.erase": True,
         "connection.revealCredentials": True,
         "pipeline.delete": True,
@@ -2299,10 +2366,7 @@ async def _get_permissions(user_id: str) -> dict:
     """Returns {org, membership, permissions} for the given user, auto-
     provisioning a personal org on first use via _ensure_org_for_user."""
     ctx = await _ensure_org_for_user(user_id)
-    role_def = await mongo_db.role_definitions.find_one(
-        {"orgId": ctx["membership"]["orgId"], "key": ctx["membership"]["roleKey"]}
-    )
-    permissions = role_def.get("permissions", {}) if role_def else {}
+    permissions = dict(DEFAULT_ROLE_PERMISSIONS.get(ctx["membership"]["roleKey"], {}))
     return {"org": ctx["org"], "membership": ctx["membership"], "permissions": permissions}
 
 
@@ -2310,6 +2374,94 @@ async def _check_permission(user_id: str, permission_key: str) -> bool:
     """Convenience wrapper: True if the caller's role grants permission_key."""
     ctx = await _get_permissions(user_id)
     return bool(ctx["permissions"].get(permission_key))
+
+
+from fastapi.responses import JSONResponse
+
+_ORG_CACHE_TTL = 60
+_org_cache: dict = {}          # user_id -> (timestamp, orgId)
+_legacy_stamped: set = set()   # user_ids already stamped in this process
+
+
+async def _org_id_for_user(user_id: str):
+    """Active-membership orgId for a user, cached 60s. Never provisions."""
+    if mongo_db is None or not user_id:
+        return None
+    hit = _org_cache.get(user_id)
+    if hit and time.time() - hit[0] < _ORG_CACHE_TTL:
+        return hit[1]
+    try:
+        m = await mongo_db.org_members.find_one({"userId": user_id, "status": "active"})
+    except Exception:
+        return None
+    if not m:
+        return None
+    _org_cache[user_id] = (time.time(), m["orgId"])
+    return m["orgId"]
+
+
+async def _stamp_legacy_docs(user_id: str, org_id) -> None:
+    """Stamps orgId (and createdBy for connections/pipelines) onto this user's
+    pre-teams docs. Once per user per process. Callers must only pass an owner."""
+    if mongo_db is None or user_id in _legacy_stamped:
+        return
+    _legacy_stamped.add(user_id)
+    for coll_name in ("connections", "pipelines", "runs", "audit_logs", "analysis_results", "catalog_metadata"):
+        try:
+            fields = {"orgId": org_id}
+            if coll_name in ("connections", "pipelines"):
+                fields["createdBy"] = user_id
+            await getattr(mongo_db, coll_name).update_many(
+                {"userId": user_id, "$or": [{"orgId": {"$exists": False}}, {"orgId": None}]},
+                {"$set": fields},
+            )
+        except Exception as e:
+            print(f"Legacy stamp skipped for {coll_name}: {e}")
+
+
+async def _get_ctx(request: Request) -> dict | None:
+    """None -> caller should return 401."""
+    user = require_user(request)
+    if not user or mongo_db is None:
+        return None
+    uid = str(user.get("userId", ""))
+    if not uid:
+        return None
+    base = await _get_permissions(uid)
+    membership = base["membership"]
+    ctx = {
+        "userId": uid,
+        "email": user.get("email", ""),
+        "orgId": membership["orgId"],
+        "roleKey": membership["roleKey"],
+        "permissions": base["permissions"],
+        "orgOwnerId": (base["org"] or {}).get("ownerId", uid),
+    }
+    if ctx["roleKey"] == "owner":
+        await _stamp_legacy_docs(uid, ctx["orgId"])
+    return ctx
+
+
+def _require_perm(ctx: dict, perm: str):
+    """None if allowed, else a 403 response naming the caller's role."""
+    if ctx["permissions"].get(perm):
+        return None
+    return JSONResponse(
+        status_code=403,
+        content={"error": f"Your role ({ctx['roleKey']}) does not have permission to do this ({perm})."},
+    )
+
+
+async def _auth(request: Request, perm: str | None = None):
+    """Returns (ctx, None) on success or (None, Response) on 401/403."""
+    ctx = await _get_ctx(request)
+    if not ctx:
+        return None, Response(status_code=401)
+    if perm:
+        denied = _require_perm(ctx, perm)
+        if denied:
+            return None, denied
+    return ctx, None
 
 
 @app.post("/api/org/backfill-roles")
@@ -2353,29 +2505,28 @@ async def backfill_org_resources(request: Request):
 
 @app.get("/api/org")
 async def get_my_org(request: Request):
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
-    ctx = await _get_permissions(user["userId"])
-    org = ctx["org"]
+    ctx, err = await _auth(request)
+    if err:
+        return err
+    org = await mongo_db.organizations.find_one({"_id": ctx["orgId"]}) or {}
     return {
-        "org": {"id": str(org["_id"]), "name": org.get("name", ""), "slug": org.get("slug", "")},
-        "role": ctx["membership"]["roleKey"],
+        "org": {"id": str(ctx["orgId"]), "name": org.get("name", ""), "slug": org.get("slug", "")},
+        "userId": ctx["userId"],
+        "role": ctx["roleKey"],
         "permissions": ctx["permissions"],
     }
 
 
 @app.get("/api/org/members")
 async def list_org_members(request: Request):
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
-    ctx = await _get_permissions(user["userId"])
-    org_id = ctx["membership"]["orgId"]
+    ctx, err = await _auth(request, "org.manageMembers")
+    if err:
+        return err
+    org_id = ctx["orgId"]
     cursor = mongo_db.org_members.find({"orgId": org_id})
     docs = await cursor.to_list(length=500)
 
@@ -2403,8 +2554,7 @@ async def list_org_members(request: Request):
     ]
 
 
-@app.post("/api/org/members/invite")
-async def invite_org_member(request: Request, body: dict):
+
     """Adds an existing userId (already resolved from email by the caller's
     auth service — see TeamSettings.tsx) to the caller's org. Requires
     org.manageMembers. Refuses to invite someone who already has an active
@@ -2462,17 +2612,18 @@ async def update_org_member_role(request: Request, target_user_id: str, body: di
         return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
-    if not await _check_permission(user["userId"], "org.manageMembers"):
-        return Response(status_code=403)
+    ctx, err = await _auth(request, "org.manageMembers")
+    if err:
+        return err
 
     new_role = (body.get("roleKey") or "").strip()
     if not new_role:
         return {"error": "roleKey is required"}
-    if new_role == "owner":
-        return {"error": "Ownership transfer isn't supported here."}
-
-    ctx = await _get_permissions(user["userId"])
-    org_id = ctx["membership"]["orgId"]
+    if new_role not in ASSIGNABLE_ROLES:
+        return {"error": "Role must be one of: admin, steward, editor, viewer."}
+    if target_user_id == ctx["userId"]:
+        return {"error": "You cannot change or remove yourself."}
+    org_id = ctx["orgId"]
 
     member = await mongo_db.org_members.find_one({"orgId": org_id, "userId": target_user_id})
     if not member:
@@ -2509,11 +2660,12 @@ async def remove_org_member(request: Request, target_user_id: str):
         return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
-    if not await _check_permission(user["userId"], "org.manageMembers"):
-        return Response(status_code=403)
-
-    ctx = await _get_permissions(user["userId"])
-    org_id = ctx["membership"]["orgId"]
+    ctx, err = await _auth(request, "org.manageMembers")
+    if err:
+        return err
+    if target_user_id == ctx["userId"]:
+        return {"error": "You cannot change or remove yourself."}
+    org_id = ctx["orgId"]
 
     member = await mongo_db.org_members.find_one({"orgId": org_id, "userId": target_user_id})
     if not member:
@@ -2522,6 +2674,7 @@ async def remove_org_member(request: Request, target_user_id: str):
         return {"error": "Cannot remove the organization owner."}
 
     result = await mongo_db.org_members.delete_one({"orgId": org_id, "userId": target_user_id})
+    _org_cache.pop(target_user_id, None)
     await log_audit(user["userId"], "org.member_removed", "organization", str(org_id),
                      metadata={"targetUserId": target_user_id}, severity="warning")
     return {"success": result.deleted_count > 0}
@@ -2534,17 +2687,19 @@ async def create_org_invite(request: Request, background_tasks: BackgroundTasks,
         return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
-    if not await _check_permission(user["userId"], "org.manageMembers"):
-        return Response(status_code=403)
+    ctx, err = await _auth(request, "org.manageMembers")
+    if err:
+        return err
 
     email = (body.get("email") or "").strip().lower()
     role_key = (body.get("roleKey") or "").strip()
     if not email or not role_key:
         return {"error": "email and roleKey are required"}
+    if role_key not in ASSIGNABLE_ROLES:
+        return {"error": "Role must be one of: admin, steward, editor, viewer."}
 
-    ctx = await _get_permissions(user["userId"])
-    org_id = ctx["membership"]["orgId"]
-    org = ctx["org"]
+    org_id = ctx["orgId"]
+    org = await mongo_db.organizations.find_one({"_id": org_id}) or {}
 
     role_def = await mongo_db.role_definitions.find_one({"orgId": org_id, "key": role_key})
     if not role_def:
@@ -2586,7 +2741,7 @@ async def create_org_invite(request: Request, background_tasks: BackgroundTasks,
             "createdAt": now, "expiresAt": expires_at,
         })
 
-    role_label = role_def.get("name", role_key.capitalize())
+    role_label = ROLE_LABELS.get(role_key, role_key.capitalize())
     inviter_label = user.get("email", "A teammate")
     email_ok, email_err = await asyncio.to_thread(
         send_invite_email, email, org.get("name", "your team"), role_label, inviter_label, token
@@ -2607,10 +2762,10 @@ async def list_org_invites(request: Request):
         return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
-    if not await _check_permission(user["userId"], "org.manageMembers"):
-        return Response(status_code=403)
-    ctx = await _get_permissions(user["userId"])
-    org_id = ctx["membership"]["orgId"]
+    ctx, err = await _auth(request, "org.manageMembers")
+    if err:
+        return err
+    org_id = ctx["orgId"]
     cursor = mongo_db.org_invites.find({"orgId": org_id, "status": {"$in": ["pending", "expired"]}})
     docs = await cursor.to_list(length=500)
     now = datetime.now()
@@ -2635,10 +2790,10 @@ async def revoke_org_invite(request: Request, invite_id: str):
         return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
-    if not await _check_permission(user["userId"], "org.manageMembers"):
-        return Response(status_code=403)
-    ctx = await _get_permissions(user["userId"])
-    org_id = ctx["membership"]["orgId"]
+    ctx, err = await _auth(request, "org.manageMembers")
+    if err:
+        return err
+    org_id = ctx["orgId"]
     result = await mongo_db.org_invites.update_one(
         {"_id": ObjectId(invite_id), "orgId": org_id},
         {"$set": {"status": "revoked"}},
@@ -2695,7 +2850,15 @@ async def accept_org_invite(request: Request, token: str):
     if user.get("email", "").strip().lower() != invite["email"]:
         return {"error": "This invite was sent to a different email address."}
 
-    # One active org per user: retire any other active membership (e.g. the
+    # 1) Keep legacy personal data attached to the personal org BEFORE leaving it.
+    personal = await mongo_db.org_members.find_one(
+        {"userId": user["userId"], "status": "active", "roleKey": "owner",
+         "orgId": {"$ne": invite["orgId"]}}
+    )
+    if personal:
+        await _stamp_legacy_docs(user["userId"], personal["orgId"])
+
+    # 2) One active org per user: retire any other active membership (e.g. the
     # auto-created personal org) before joining the invited org.
     await mongo_db.org_members.update_many(
         {"userId": user["userId"], "status": "active", "orgId": {"$ne": invite["orgId"]}},
@@ -2708,6 +2871,7 @@ async def accept_org_invite(request: Request, token: str):
         upsert=True,
     )
     await mongo_db.org_invites.update_one({"_id": invite["_id"]}, {"$set": {"status": "accepted"}})
+    _org_cache.pop(user["userId"], None)
     await log_audit(user["userId"], "org.invite_accepted", "organization", str(invite["orgId"]),
                      metadata={"roleKey": invite["roleKey"]})
 
@@ -2718,7 +2882,7 @@ async def accept_org_invite(request: Request, token: str):
         "orgId": str(invite["orgId"]),
         "orgName": org.get("name", "") if org else "",
         "roleKey": invite["roleKey"],
-        "roleLabel": role_def.get("name", invite["roleKey"]) if role_def else invite["roleKey"],
+        "roleLabel": ROLE_LABELS.get(invite["roleKey"], invite["roleKey"]),
     }
 
 
@@ -2779,6 +2943,7 @@ async def log_audit(user_id: str, action: str, resource_type: str, resource_id: 
     try:
         await mongo_db.audit_logs.insert_one({
             "userId": user_id,
+            "orgId": await _org_id_for_user(user_id),
             "actorId": user_id,
             "actorType": actor_type,
             "action": action,
@@ -2808,12 +2973,12 @@ async def list_audit_logs(
     date_to: str = "",
     limit: int = 200,
 ):
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
-    query: dict = {"userId": user["userId"]}
+    ctx, err = await _auth(request, "audit.view")
+    if err:
+        return err
+    query: dict = {"orgId": ctx["orgId"]}
     if action:
         query["action"] = action
     if category:
@@ -2852,12 +3017,12 @@ async def export_audit_logs(
     date_from: str = "",
     date_to: str = "",
 ):
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
-    query: dict = {"userId": user["userId"]}
+    ctx, err = await _auth(request, "audit.export")
+    if err:
+        return err
+    query: dict = {"orgId": ctx["orgId"]}
     if action:
         query["action"] = action
     if category:
@@ -3085,8 +3250,11 @@ async def _list_tables_via_agent(agent_key: str, timeout: float = 15.0) -> list:
 
 
 @app.post("/api/agent/token")
-async def create_agent_token(body: dict):
+async def create_agent_token(request: Request, body: dict):
     """Generate a new agent token to give to a customer."""
+    ctx, err = await _auth(request, "tunnel.manage")
+    if err:
+        return err
     label = body.get("label", "unnamed")
     token = _secrets.token_urlsafe(32)
     tokens = _load_agent_tokens()
@@ -3096,8 +3264,11 @@ async def create_agent_token(body: dict):
 
 
 @app.get("/api/agent/status")
-async def agent_status():
+async def agent_status(request: Request):
     """See which agents are currently connected."""
+    ctx, err = await _auth(request, "tunnel.use")
+    if err:
+        return err
     return {
         "connected": [
             {
@@ -3112,8 +3283,11 @@ async def agent_status():
 
 
 @app.post("/api/mysql/tables-via-agent")
-async def mysql_tables_via_agent(body: dict):
+async def mysql_tables_via_agent(request: Request, body: dict):
     """List tables through agent tunnel (for private/VPN databases)."""
+    ctx, err = await _auth(request, "tunnel.use")
+    if err:
+        return err
     agent_key = f"{body.get('database','').strip()}@{body.get('host','').strip()}"
     try:
         tables = await _list_tables_via_agent(agent_key)
@@ -3123,8 +3297,11 @@ async def mysql_tables_via_agent(body: dict):
 
 
 @app.post("/api/mysql/query-via-agent")
-async def mysql_query_via_agent(body: dict):
+async def mysql_query_via_agent(request: Request, body: dict):
     """Run a SELECT query through agent tunnel (for private/VPN databases)."""
+    ctx, err = await _auth(request, "tunnel.use")
+    if err:
+        return err
     agent_key = f"{body.get('database','').strip()}@{body.get('host','').strip()}"
     sql = body.get("sql", "").strip()
     try:
@@ -3335,15 +3512,25 @@ async def analyze(
     bq_dataset: str = Form(""),
     bq_table: str = Form(""),
 ):
+    # Anonymous callers keep working as before; a bearer token means the
+    # caller must hold analysis.run.
+    analyze_ctx = None
+    if request.headers.get("Authorization", "").startswith("Bearer "):
+        analyze_ctx = await _get_ctx(request)
+        if not analyze_ctx:
+            return Response(status_code=401)
+        denied = _require_perm(analyze_ctx, "analysis.run")
+        if denied:
+            return denied
+
     # ── If the frontend couldn't find raw credentials in localStorage (e.g.
     # new device, cleared cache), it sends connection_id instead. Resolve the
     # saved, encrypted connection server-side rather than failing. Only fills
     # in fields that are still empty — never overrides an explicit value the
     # frontend already sent.
     if connection_id and not mysql_host:
-        user_for_conn = require_user(request)
-        if user_for_conn:
-            conn = await get_decrypted_connection(connection_id, user_for_conn["userId"])
+        if analyze_ctx:
+            conn = await get_decrypted_connection(connection_id, analyze_ctx["orgId"])
             if conn:
                 creds = conn.get("credentials", {})
                 cfg = conn.get("config", {})
@@ -5333,11 +5520,12 @@ async def save_analysis_result(request: Request, body: dict):
                                           source came from a saved connection
       result:        dict  (required) - trimmed metadata (see toAnalysisMetadata in Analysis.tsx)
     """
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
+    ctx, err = await _auth(request, "analysis.run")
+    if err:
+        return err
+    user = ctx
 
     source_name   = body.get("source_name", "").strip()
     connection_id = body.get("connection_id", "").strip()
@@ -5358,10 +5546,11 @@ async def save_analysis_result(request: Request, body: dict):
     }
 
     await mongo_db.analysis_results.update_one(
-        {"userId": user["userId"], "sourceKey": source_key},
+        {"orgId": ctx["orgId"], "sourceKey": source_key},
         {
             "$set": {
                 "userId":       user["userId"],
+                "orgId":        ctx["orgId"],
                 "sourceKey":    source_key,
                 "sourceName":   source_name,
                 "connectionId": connection_id or None,
@@ -5390,14 +5579,14 @@ async def get_analysis_result(request: Request, source_key: str):
     either a connection_id or a raw source_name (URL-encoded) — same
     resolution rule as save_analysis_result.
     """
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
+    ctx, err = await _auth(request, "analysis.view")
+    if err:
+        return err
 
     doc = await mongo_db.analysis_results.find_one({
-        "userId": user["userId"],
+        "orgId": ctx["orgId"],
         "sourceKey": source_key,
     })
     if not doc:
@@ -5420,14 +5609,14 @@ async def list_analysis_results(request: Request):
     with 'Last Run' in a single call instead of one request per source.
     Returns only the lightweight bits, not the full result payload.
     """
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
+    ctx, err = await _auth(request, "analysis.view")
+    if err:
+        return err
 
     cursor = mongo_db.analysis_results.find(
-        {"userId": user["userId"]},
+        {"orgId": ctx["orgId"]},
         {"sourceKey": 1, "sourceName": 1, "connectionId": 1, "updatedAt": 1,
          "result.quality_score": 1, "result.total_problems": 1, "result.dataset_info": 1}
     )
@@ -5455,11 +5644,33 @@ async def save_catalog_metadata(request: Request, body: dict):
     for one source. Only fields present in body are set — omitted fields
     are left untouched, so the frontend can send partial updates.
     """
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
+    ctx, err = await _auth(request)
+    if err:
+        return err
+    user = ctx
+
+    # Every field present must be allowed, otherwise the whole request is a 403.
+    needed = set()
+    if "description" in body or "tags" in body:
+        needed.add("catalog.editText")
+    if "owner" in body:
+        needed.add("catalog.assignOwner")
+    _co = body.get("column_overrides")
+    if isinstance(_co, dict):
+        for _ov in _co.values():
+            if isinstance(_ov, dict):
+                if "definition" in _ov:
+                    needed.add("catalog.editText")
+                if "sensitivity" in _ov or "pii" in _ov:
+                    needed.add("catalog.editLabels")
+    if not needed:
+        needed.add("catalog.editText")
+    for _perm in sorted(needed):
+        denied = _require_perm(ctx, _perm)
+        if denied:
+            return denied
 
     source_name   = body.get("source_name", "").strip()
     connection_id = body.get("connection_id", "").strip()
@@ -5471,6 +5682,7 @@ async def save_catalog_metadata(request: Request, body: dict):
 
     set_fields: dict = {
         "userId":       user["userId"],
+        "orgId":        ctx["orgId"],
         "sourceKey":    source_key,
         "sourceName":   source_name,
         "connectionId": connection_id or None,
@@ -5505,7 +5717,7 @@ async def save_catalog_metadata(request: Request, body: dict):
                     set_fields[f"columnOverrides.{safe_col}.{field}"] = override[field]
 
     await mongo_db.catalog_metadata.update_one(
-        {"userId": user["userId"], "sourceKey": source_key},
+        {"orgId": ctx["orgId"], "sourceKey": source_key},
         {"$set": set_fields, "$setOnInsert": {"createdAt": now}},
         upsert=True,
     )
@@ -5517,16 +5729,16 @@ async def save_catalog_metadata(request: Request, body: dict):
 @app.get("/api/catalog/{source_key:path}")
 async def get_catalog_metadata(request: Request, source_key: str):
     """Single-source catalog doc, merged with its latest analysis for column info."""
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
+    ctx, err = await _auth(request, "catalog.view")
+    if err:
+        return err
 
     catalog_doc = await mongo_db.catalog_metadata.find_one(
-        {"userId": user["userId"], "sourceKey": source_key})
+        {"orgId": ctx["orgId"], "sourceKey": source_key})
     analysis_doc = await mongo_db.analysis_results.find_one(
-        {"userId": user["userId"], "sourceKey": source_key})
+        {"orgId": ctx["orgId"], "sourceKey": source_key})
 
     return {
         "found":           catalog_doc is not None,
@@ -5549,15 +5761,15 @@ async def list_catalog_metadata(request: Request):
     each source's latest analysis so descriptions/tags/columns come back
     together with quality_score/col_info in a single round trip.
     """
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
+    ctx, err = await _auth(request, "catalog.view")
+    if err:
+        return err
 
-    catalog_docs = await mongo_db.catalog_metadata.find({"userId": user["userId"]}).to_list(length=1000)
+    catalog_docs = await mongo_db.catalog_metadata.find({"orgId": ctx["orgId"]}).to_list(length=1000)
     analysis_docs = await mongo_db.analysis_results.find(
-        {"userId": user["userId"]},
+        {"orgId": ctx["orgId"]},
         {"sourceKey": 1, "sourceName": 1, "result.quality_score": 1, "result.col_info": 1, "result.dataset_info": 1, "result.pii_columns": 1}
     ).to_list(length=1000)
     analysis_by_key = {d.get("sourceKey", ""): d for d in analysis_docs}
@@ -5604,13 +5816,13 @@ async def list_catalog_metadata(request: Request):
 
 @app.delete("/api/catalog/{source_key:path}")
 async def delete_catalog_metadata(request: Request, source_key: str):
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
     if mongo_db is None:
         return {"error": "MongoDB not configured"}
+    ctx, err = await _auth(request, "catalog.delete")
+    if err:
+        return err
     result = await mongo_db.catalog_metadata.delete_one(
-        {"userId": user["userId"], "sourceKey": source_key})
+        {"orgId": ctx["orgId"], "sourceKey": source_key})
     return {"success": True, "deleted": result.deleted_count > 0}
 
 
