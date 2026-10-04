@@ -2245,60 +2245,6 @@ ROLE_LABELS = {
     "editor": "Editor", "viewer": "Viewer",
 }
 ASSIGNABLE_ROLES = ("admin", "steward", "editor", "viewer")
-        "connection.erase": True,
-        "connection.revealCredentials": True,
-        "pipeline.delete": True,
-        "pipeline.approve": True,
-        "pipeline.execute": True,
-        "catalog.assignOwner": True,
-        "org.manageMembers": True,
-        "org.transferOwnership": True,
-    },
-    "admin": {
-        "connection.delete": True,
-        "connection.erase": True,
-        "connection.revealCredentials": True,
-        "pipeline.delete": True,
-        "pipeline.approve": True,
-        "pipeline.execute": True,
-        "catalog.assignOwner": True,
-        "org.manageMembers": True,
-        "org.transferOwnership": False,
-    },
-    "steward": {
-        "connection.delete": False,
-        "connection.erase": False,
-        "connection.revealCredentials": False,
-        "pipeline.delete": False,
-        "pipeline.approve": True,
-        "pipeline.execute": True,
-        "catalog.assignOwner": True,
-        "org.manageMembers": False,
-        "org.transferOwnership": False,
-    },
-    "editor": {
-        "connection.delete": False,
-        "connection.erase": False,
-        "connection.revealCredentials": False,
-        "pipeline.delete": False,
-        "pipeline.approve": False,
-        "pipeline.execute": True,
-        "catalog.assignOwner": False,
-        "org.manageMembers": False,
-        "org.transferOwnership": False,
-    },
-    "viewer": {
-        "connection.delete": False,
-        "connection.erase": False,
-        "connection.revealCredentials": False,
-        "pipeline.delete": False,
-        "pipeline.approve": False,
-        "pipeline.execute": False,
-        "catalog.assignOwner": False,
-        "org.manageMembers": False,
-        "org.transferOwnership": False,
-    },
-}
 
 
 async def _seed_role_definitions(org_id):
@@ -7453,6 +7399,10 @@ async def aws_cost_explorer(body: dict):
         return {"error": f"❌ AWS error ({code}): {msg}"}
     except Exception as e:
         return {"error": f"❌ {str(e)}"}
+
+
+@app.post("/api/aws/health")
+async def aws_health(body: dict):
     service         = body.get("service", "rds-mysql")
     region          = body.get("region", "us-east-1")
     access_key_id   = body.get("accessKeyId", "").strip()
