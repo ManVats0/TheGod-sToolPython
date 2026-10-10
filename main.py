@@ -361,7 +361,7 @@
         except Exception as e:
             print(f"✗ Email error: {e}")
 
-        def send_invite_email(to_email: str, org_name: str, role_label: str, inviter_label: str, token: str, role_key: str = ""):
+    def send_invite_email(to_email: str, org_name: str, role_label: str, inviter_label: str, token: str, role_key: str = ""):
         if not to_email:
             return False, "No recipient email provided."
         if not os.getenv("RESEND_API_KEY", ""):
@@ -811,7 +811,7 @@
         return serialize_doc(doc, drop=["credentialsEncrypted"])
 
 
-        @app.post("/api/connections/upload-csv")
+    @app.post("/api/connections/upload-csv")
     async def upload_csv_connection(request: Request, file: UploadFile = File(...)):
         if mongo_db is None:
             return {"error": "MongoDB not configured"}
