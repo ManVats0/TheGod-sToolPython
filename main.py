@@ -1,5 +1,5 @@
-    import os
-    os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
+import os
+os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
     from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Request, Response
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import FileResponse
@@ -2491,7 +2491,9 @@
 
 
 
-        """Adds an existing userId (already resolved from email by the caller's
+    @app.post("/api/org/members")
+async def add_org_member(request: Request, body: dict):
+    """Adds an existing userId (already resolved from email by the caller's
         auth service — see TeamSettings.tsx) to the caller's org. Requires
         org.manageMembers. Refuses to invite someone who already has an active
         membership anywhere, matching the one-active-org-per-user assumption
