@@ -99,6 +99,7 @@ def verify_jwt_token(authorization_header: str = "") -> dict | None:
         print(f"JWT verification failed: {e}")
         return None
 import asyncio
+import hmac
 import secrets
 import secrets as _secrets
 from fastapi import Request, Response, WebSocket, WebSocketDisconnect
@@ -361,45 +362,31 @@ def send_email_alert(to_email: str, filename: str, alerts: list):
     except Exception as e:
         print(f"✗ Email error: {e}")
 
-def send_invite_email(to_email: str, org_name: str, role_label: str, inviter_label: str, token: str, role_key: str = ""):
+def send_otp_email(to_email: str, code: str):
     if not to_email:
         return False, "No recipient email provided."
     if not os.getenv("RESEND_API_KEY", ""):
         return False, "RESEND_API_KEY is not set on the backend."
     try:
-        import resend, html as _html
+        import resend
         resend.api_key = os.getenv("RESEND_API_KEY", "")
-        accept_url = f"{_frontend_url or 'https://www.thegodstool.com'}/accept-invite?token={token}"
-        org_e, role_e, inv_e = _html.escape(org_name), _html.escape(role_label), _html.escape(inviter_label)
-        desc = _html.escape(ROLE_DESCRIPTIONS.get(role_key, ""))
-        body_html = f"""
-        <html><body style="margin:0;padding:0;background:#0f0a1e;font-family:-apple-system,sans-serif;">
-        <div style="max-width:600px;margin:40px auto;background:#1a1040;border-radius:16px;overflow:hidden;border:1px solid #2d1b69;">
-            <div style="background:linear-gradient(135deg,#6d28d9,#3b82f6);padding:28px 32px;">
-            <h1 style="color:white;margin:0;font-size:22px;font-weight:900;">The God's Tool</h1>
-            <p style="color:rgba(255,255,255,0.8);margin:6px 0 0;font-size:14px;">Team invitation</p>
-            </div>
-            <div style="padding:28px 32px;">
-            <p style="color:#94a3b8;font-size:13px;margin:0 0 6px;">You've been invited to join</p>
-            <p style="color:white;font-size:24px;font-weight:800;margin:0 0 16px;">{org_e}</p>
-            <p style="color:#e2e8f0;font-size:14px;margin:0 0 6px;"><strong>{inv_e}</strong> invited you as <strong style="color:#a78bfa;">{role_e}</strong>.</p>
-            <p style="color:#94a3b8;font-size:13px;margin:0 0 20px;">{desc}</p>
-            <a href="{accept_url}" style="display:inline-block;padding:12px 28px;background:linear-gradient(135deg,#7c3aed,#4f46e5);color:white;border-radius:6px;text-decoration:none;font-weight:700;">Join {org_e}</a>
-            <p style="color:#94a3b8;font-size:12px;margin:24px 0 0;">Sign in or sign up with <strong>{_html.escape(to_email)}</strong> (the address this invite was sent to). Once you join, you'll see {org_e}'s connected data sources and pipelines according to your role.</p>
-            <p style="color:#64748b;font-size:12px;margin:12px 0 0;">This invite expires in 7 days. If you weren't expecting it, you can ignore this email.</p>
-            </div>
-        </div></body></html>"""
-        resp = resend.Emails.send({
+        html_body = f"""
+        <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:24px auto;padding:28px;background:#1a1040;border:1px solid #2d1b69;border-radius:14px;color:#e2e8f0;">
+          <h2 style="margin:0 0 8px;color:white;">The God's Tool</h2>
+          <p style="color:#94a3b8;margin:0 0 18px;">Your email verification code:</p>
+          <p style="font-size:32px;font-weight:800;letter-spacing:8px;margin:0 0 18px;color:#a78bfa;">{code}</p>
+          <p style="color:#64748b;font-size:12px;margin:0;">It expires in 10 minutes. If you didn't request it, ignore this email.</p>
+        </div>"""
+        resend.Emails.send({
             "from": "The Gods Tool <noreply@thegodstool.com>",
             "to": [to_email],
-            "subject": f"{inviter_label} invited you to join {org_name} on The God's Tool",
-            "html": body_html,
-            "text": f"{inviter_label} invited you to join {org_name} as {role_label}. Sign in with {to_email} and accept here: {accept_url}",
+            "subject": f"Your verification code: {code}",
+            "html": html_body,
+            "text": f"Your The God's Tool verification code is {code}. It expires in 10 minutes.",
         })
-        print(f"✓ Invite email accepted by Resend for {to_email}: {resp}")
         return True, ""
     except Exception as e:
-        print(f"✗ Invite email error: {e}")
+        print(f"✗ OTP email error: {e}")
         return False, str(e)
 
 # ── PRIMARY KEY ────────────────────────────────────────────────────────────────
@@ -1728,6 +1715,9 @@ async def _fetch_source_df(conn_type: str, cfg: dict, creds: dict) -> pd.DataFra
         tables = cfg.get("tables") or []
         table = cfg.get("table") or (tables[0] if tables else "")
         result = await aws_fetch_table({
+                "costStartDate": cfg.get("costStartDate", ""), "costEndDate": cfg.get("costEndDate", ""),
+                "costGranularity": cfg.get("costGranularity", "MONTHLY"), "costGroupBy": cfg.get("costGroupBy", "SERVICE"),
+                "ssl": cfg.get("ssl", True),
             "service": cfg.get("service", "rds-mysql"), "region": cfg.get("region", "us-east-1"),
             "accessKeyId": creds.get("accessKeyId", ""), "secretAccessKey": creds.get("secretAccessKey", ""),
             "table": table, "bucket": cfg.get("bucket", ""), "host": cfg.get("host", ""),
@@ -1739,6 +1729,8 @@ async def _fetch_source_df(conn_type: str, cfg: dict, creds: dict) -> pd.DataFra
         return pd.read_csv(os.path.join(UPLOAD_DIR, result["filename"]))
 
     if conn_type == "rest":
+        cfg = {**cfg, "headers": creds.get("headers") or cfg.get("headers", {}),
+               "endpoint": cfg.get("endpoint") or (cfg.get("endpoints") or ["/"])[0]}
         result = await rest_fetch_endpoint({
             "base_url": cfg.get("base_url", ""), "endpoint": cfg.get("endpoint", "/"),
             "headers": cfg.get("headers", {}), "verify_ssl": cfg.get("verify_ssl", True),
@@ -1857,6 +1849,7 @@ async def _write_destination_df(conn_type: str, cfg: dict, creds: dict, df: pd.D
         tables = cfg.get("tables") or []
         table = cfg.get("table") or (tables[0] if tables else "")
         result = await aws_write_table({
+                "bucket": cfg.get("bucket", ""), "ssl": cfg.get("ssl", True),
             "service": cfg.get("service", "rds-mysql"), "region": cfg.get("region", "us-east-1"),
             "accessKeyId": creds.get("accessKeyId", ""), "secretAccessKey": creds.get("secretAccessKey", ""),
             "table": table, "host": cfg.get("host", ""), "port": cfg.get("port", ""),
@@ -1868,6 +1861,8 @@ async def _write_destination_df(conn_type: str, cfg: dict, creds: dict, df: pd.D
         return result
 
     if conn_type == "rest":
+        cfg = {**cfg, "headers": creds.get("headers") or cfg.get("headers", {}),
+               "endpoint": cfg.get("endpoint") or (cfg.get("endpoints") or ["/"])[0]}
         result = await rest_write_endpoint({
             "base_url": cfg.get("base_url", ""), "endpoint": cfg.get("endpoint", "/"),
             "headers": cfg.get("headers", {}), "verify_ssl": cfg.get("verify_ssl", True),
@@ -2446,7 +2441,7 @@ async def get_my_org(request: Request):
         return err
     org = await mongo_db.organizations.find_one({"_id": ctx["orgId"]}) or {}
     return {
-        "org": {"id": str(ctx["orgId"]), "name": org.get("name", ""), "slug": org.get("slug", "")},
+        "org": {"id": str(ctx["orgId"]), "name": await _org_label(org), "slug": org.get("slug", "")},
         "userId": ctx["userId"],
         "role": ctx["roleKey"],
         "permissions": ctx["permissions"],
@@ -2652,86 +2647,50 @@ async def rename_org(request: Request, body: dict):
     return {"success": True, "name": name}
 
 @app.post("/api/org/invites")
-async def create_org_invite(request: Request, background_tasks: BackgroundTasks, body: dict):
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
+async def create_org_invite(request: Request, body: dict):
+    """Owner approves an email + role. Nothing is emailed: the person joins from the Team page
+    after verifying their own email (see /api/team/*)."""
     if mongo_db is None:
-        return {"error": "MongoDB not configured"}
+        return JSONResponse(status_code=503, content={"error": "MongoDB not configured"})
     ctx, err = await _auth(request, "org.manageMembers")
     if err:
         return err
-
     email = (body.get("email") or "").strip().lower()
     role_key = (body.get("roleKey") or "").strip()
-    if not email or not role_key:
-        return {"error": "email and roleKey are required"}
+    if not email or "@" not in email or not role_key:
+        return JSONResponse(status_code=400, content={"error": "A valid email and a role are required."})
     if role_key not in ASSIGNABLE_ROLES:
-        return {"error": "Role must be one of: admin, steward, editor, viewer."}
-
+        return JSONResponse(status_code=400, content={"error": "Role must be one of: admin, steward, editor, viewer."})
     org_id = ctx["orgId"]
-    org = await mongo_db.organizations.find_one({"_id": org_id}) or {}
-
-    role_def = await mongo_db.role_definitions.find_one({"orgId": org_id, "key": role_key})
-    if not role_def:
-        if role_key not in DEFAULT_ROLE_PERMISSIONS:
-            return {"error": f"Unknown role '{role_key}' for this organization"}
-        role_def = {
-            "orgId": org_id, "key": role_key,
-            "name": role_key.capitalize(),
-            "permissions": DEFAULT_ROLE_PERMISSIONS[role_key],
-            "createdAt": datetime.now(),
-        }
-        await mongo_db.role_definitions.insert_one(role_def)
 
     existing_user = await mongo_db.users.find_one({"email": email})
-
     if existing_user:
-        target_user_id = str(existing_user["_id"])
-        already_member = await mongo_db.org_members.find_one({"userId": target_user_id, "status": "active"})
-        if already_member:
-            if already_member["orgId"] == org_id:
-                return {"error": "This person is already a member of your organization."}
-            their_org = await mongo_db.organizations.find_one({"_id": already_member["orgId"]}) or {}
+        m = await mongo_db.org_members.find_one({"userId": str(existing_user["_id"]), "status": "active"})
+        if m:
+            if m["orgId"] == org_id:
+                return JSONResponse(status_code=400, content={"error": "This person is already a member of your organization."})
+            their_org = await mongo_db.organizations.find_one({"_id": m["orgId"]}) or {}
             if not str(their_org.get("slug", "")).startswith("personal-"):
-                return {"error": "This person already belongs to another team and must leave it first."}
-            # Only a personal workspace: fine, accepting moves them into your org.
+                return JSONResponse(status_code=400, content={"error": "This person already belongs to another team and must leave it first."})
 
-    existing_invite = await mongo_db.org_invites.find_one(
-        {"orgId": org_id, "email": email, "status": "pending"}
-    )
     now = datetime.now()
-    expires_at = now + timedelta(days=7)
-    if existing_invite and existing_invite.get("expiresAt") and existing_invite["expiresAt"] > now:
-        token = existing_invite["token"]
-    else:
-        token = secrets.token_urlsafe(32)
-
-    if existing_invite:
+    pending = await mongo_db.org_invites.find_one({"orgId": org_id, "email": email, "status": "pending"})
+    if pending:
         await mongo_db.org_invites.update_one(
-            {"_id": existing_invite["_id"]},
-            {"$set": {"token": token, "roleKey": role_key, "expiresAt": expires_at,
-                    "invitedBy": user["userId"], "updatedAt": now}},
+            {"_id": pending["_id"]},
+            {"$set": {"roleKey": role_key, "invitedBy": ctx["userId"], "updatedAt": now}},
         )
     else:
         await mongo_db.org_invites.insert_one({
-            "orgId": org_id, "email": email, "roleKey": role_key, "token": token,
-            "status": "pending", "invitedBy": user["userId"],
-            "createdAt": now, "expiresAt": expires_at,
+            "orgId": org_id, "email": email, "roleKey": role_key, "status": "pending",
+            "invitedBy": ctx["userId"], "createdAt": now,
+            # Not used anymore, but org_invites has a UNIQUE index on "token";
+            # a unique value avoids duplicate-null errors.
+            "token": secrets.token_urlsafe(16),
         })
-
-    role_label = ROLE_LABELS.get(role_key, role_key.capitalize())
-    inviter_label = user.get("email", "A teammate")
-    email_ok, email_err = await asyncio.to_thread(
-        send_invite_email, email, org.get("name", "your team"), role_label, inviter_label, token
-    )
-
-    await log_audit(user["userId"], "org.invite_sent", "organization", str(org_id),
-                    metadata={"email": email, "roleKey": role_key, "emailSent": email_ok, "emailError": email_err},
-                    status="success" if email_ok else "failure")
-    if not email_ok:
-        return {"error": f"Invite saved, but the email could not be sent: {email_err}"}
-    return {"success": True, "addedImmediately": False, "invited": True}
+    await log_audit(ctx["userId"], "org.email_approved", "organization", str(org_id),
+                    metadata={"email": email, "roleKey": role_key})
+    return {"success": True}
 
 
 @app.get("/api/org/invites")
@@ -2783,93 +2742,167 @@ async def revoke_org_invite(request: Request, invite_id: str):
     return {"success": result.matched_count > 0}
 
 
-@app.get("/api/org/invites/{token}/info")
-async def get_invite_info(token: str):
+# ── Team join: owner approves an email, the person verifies it with an OTP ─────
+
+async def _team_user(request: Request):
+    """Returns (jwt_user, db_user, error_response). The DB email is the only email we trust."""
+    jwt_user = require_user(request)
+    if not jwt_user:
+        return None, None, JSONResponse(status_code=401, content={"error": "Not signed in."})
     if mongo_db is None:
-        return {"valid": False, "error": "MongoDB not configured"}
+        return None, None, JSONResponse(status_code=503, content={"error": "MongoDB not configured"})
     try:
-        invite = await mongo_db.org_invites.find_one({"token": token})
-        if not invite:
-            return {"valid": False, "error": "Invite not found"}
-        if invite.get("status") != "pending":
-            return {"valid": False, "error": f"This invite has been {invite.get('status')}."}
-        if invite.get("expiresAt") and invite["expiresAt"] < datetime.now():
-            return {"valid": False, "error": "This invite has expired."}
-        org = await mongo_db.organizations.find_one({"_id": invite["orgId"]})
-        role_def = await mongo_db.role_definitions.find_one(
-            {"orgId": invite["orgId"], "key": invite["roleKey"]}
-        )
-        return {
-            "valid": True,
-            "orgName": org.get("name", "") if org else "",
-            "roleKey": invite["roleKey"],
-            "roleLabel": role_def.get("name", invite["roleKey"]) if role_def else invite["roleKey"],
-            "email": invite["email"],
-        }
-    except Exception as e:
-        print(f"Invite info error: {e}")
-        return {"valid": False, "error": "Could not load invite. Please try again."}
+        u = await mongo_db.users.find_one({"_id": ObjectId(str(jwt_user.get("userId", "")))})
+    except Exception:
+        u = None
+    if not u or not u.get("email"):
+        return None, None, JSONResponse(status_code=404, content={"error": "Account not found."})
+    return jwt_user, u, None
 
 
-@app.post("/api/org/invites/{token}/accept")
-async def accept_org_invite(request: Request, token: str):
-    user = require_user(request)
-    if not user:
-        return Response(status_code=401)
+def _is_email_verified(u: dict) -> bool:
+    return bool(u.get("emailVerified")) or bool(u.get("googleId"))
+
+
+def _otp_hash(code: str, user_id: str) -> str:
+    return hashlib.sha256(f"{code}{user_id}{JWT_SECRET}".encode()).hexdigest()
+
+
+async def _ensure_otp_indexes():
     if mongo_db is None:
-        return {"error": "MongoDB not configured"}
-    invite = await mongo_db.org_invites.find_one({"token": token})
+        return
+    try:
+        await mongo_db.otp_codes.create_index("expiresAt", expireAfterSeconds=0)
+        await mongo_db.otp_codes.create_index("userId", unique=True)
+    except Exception as e:
+        print(f"Could not ensure otp indexes: {e}")
+
+
+@app.post("/api/team/otp/send")
+async def team_otp_send(request: Request):
+    jwt_user, u, err = await _team_user(request)
+    if err:
+        return err
+    uid = str(jwt_user.get("userId", ""))
+    if _is_email_verified(u):
+        return {"success": True, "alreadyVerified": True}
+    now = datetime.now()
+    prev = await mongo_db.otp_codes.find_one({"userId": uid})
+    if prev and prev.get("sentAt"):
+        elapsed = (now - prev["sentAt"]).total_seconds()
+        if elapsed < 60:
+            return JSONResponse(status_code=429, content={"error": f"Please wait {int(60 - elapsed)}s before requesting another code."})
+    code = f"{secrets.randbelow(1000000):06d}"
+    await mongo_db.otp_codes.update_one(
+        {"userId": uid},
+        {"$set": {"hash": _otp_hash(code, uid), "expiresAt": now + timedelta(minutes=10),
+                  "attempts": 0, "sentAt": now}},
+        upsert=True,
+    )
+    ok, mail_err = await asyncio.to_thread(send_otp_email, u["email"], code)
+    if not ok:
+        return JSONResponse(status_code=502, content={"error": f"Could not send the code: {mail_err}"})
+    return {"success": True}
+
+
+@app.post("/api/team/otp/verify")
+async def team_otp_verify(request: Request, body: dict):
+    jwt_user, u, err = await _team_user(request)
+    if err:
+        return err
+    uid = str(jwt_user.get("userId", ""))
+    code = str(body.get("code", "")).strip()
+    if not (code.isdigit() and len(code) == 6):
+        return JSONResponse(status_code=400, content={"error": "Enter the 6-digit code."})
+    rec = await mongo_db.otp_codes.find_one({"userId": uid})
+    if not rec or rec.get("expiresAt") is None or rec["expiresAt"] < datetime.now():
+        return JSONResponse(status_code=400, content={"error": "Code expired. Request a new one."})
+    if rec.get("attempts", 0) >= 5:
+        return JSONResponse(status_code=429, content={"error": "Too many attempts. Request a new code."})
+    if not hmac.compare_digest(rec.get("hash", ""), _otp_hash(code, uid)):
+        await mongo_db.otp_codes.update_one({"userId": uid}, {"$inc": {"attempts": 1}})
+        return JSONResponse(status_code=400, content={"error": "Incorrect code."})
+    await mongo_db.users.update_one({"_id": u["_id"]}, {"$set": {"emailVerified": True}})
+    await mongo_db.otp_codes.delete_one({"userId": uid})
+    return {"success": True}
+
+
+@app.post("/api/team/join")
+async def team_join(request: Request):
+    jwt_user, u, err = await _team_user(request)
+    if err:
+        return err
+    uid = str(jwt_user.get("userId", ""))
+    if not _is_email_verified(u):
+        return JSONResponse(status_code=403, content={"error": "Verify your email first."})
+    email = u["email"].strip().lower()
+    invite = await mongo_db.org_invites.find_one({"email": email, "status": "pending"}, sort=[("createdAt", -1)])
     if not invite:
-        return {"error": "Invite not found"}
-    if invite.get("status") != "pending":
-        return {"error": f"This invite has been {invite.get('status')}."}
-    if invite.get("expiresAt") and invite["expiresAt"] < datetime.now():
-        await mongo_db.org_invites.update_one({"_id": invite["_id"]}, {"$set": {"status": "expired"}})
-        return {"error": "This invite has expired. Ask for a new one."}
-    if user.get("email", "").strip().lower() != invite["email"]:
-        return {"error": "This invite was sent to a different email address."}
+        return JSONResponse(status_code=404, content={"error": "No team has added this email yet."})
+
+    current = await mongo_db.org_members.find_one({"userId": uid, "status": "active"})
+    if current and current["orgId"] != invite["orgId"]:
+        cur_org = await mongo_db.organizations.find_one({"_id": current["orgId"]}) or {}
+        if not str(cur_org.get("slug", "")).startswith("personal-"):
+            return JSONResponse(status_code=409, content={"error": "You already belong to another team. Leave it before joining a new one."})
 
     claimed = await mongo_db.org_invites.find_one_and_update(
         {"_id": invite["_id"], "status": "pending"},
-        {"$set": {"status": "accepted", "acceptedAt": datetime.now(), "acceptedBy": user["userId"]}},
+        {"$set": {"status": "accepted", "acceptedAt": datetime.now(), "acceptedBy": uid}},
     )
     if not claimed:
-        return {"error": "This invite has already been used."}
+        return JSONResponse(status_code=409, content={"error": "This approval was already used."})
 
-    # 1) Keep legacy personal data attached to the personal org BEFORE leaving it.
+    # Same steps the old accept route did.
     personal = await mongo_db.org_members.find_one(
-        {"userId": user["userId"], "status": "active", "roleKey": "owner",
-        "orgId": {"$ne": invite["orgId"]}}
+        {"userId": uid, "status": "active", "roleKey": "owner", "orgId": {"$ne": invite["orgId"]}}
     )
     if personal:
-        await _stamp_legacy_docs(user["userId"], personal["orgId"])
-
-    # 2) One active org per user: retire any other active membership (e.g. the
-    # auto-created personal org) before joining the invited org.
+        await _stamp_legacy_docs(uid, personal["orgId"])
     await mongo_db.org_members.update_many(
-        {"userId": user["userId"], "status": "active", "orgId": {"$ne": invite["orgId"]}},
+        {"userId": uid, "status": "active", "orgId": {"$ne": invite["orgId"]}},
         {"$set": {"status": "left"}},
     )
     await mongo_db.org_members.update_one(
-        {"orgId": invite["orgId"], "userId": user["userId"]},
-        {"$set": {"orgId": invite["orgId"], "userId": user["userId"], "roleKey": invite["roleKey"],
-                "status": "active", "joinedAt": datetime.now()}},
+        {"orgId": invite["orgId"], "userId": uid},
+        {"$set": {"orgId": invite["orgId"], "userId": uid, "roleKey": invite["roleKey"],
+                  "status": "active", "joinedAt": datetime.now()}},
         upsert=True,
     )
-    await mongo_db.org_invites.update_one({"_id": invite["_id"]}, {"$set": {"status": "accepted"}})
-    _org_cache.pop(user["userId"], None)
-    await log_audit(user["userId"], "org.invite_accepted", "organization", str(invite["orgId"]),
-                    metadata={"roleKey": invite["roleKey"], "email": user.get("email", "")})
-
-    org = await mongo_db.organizations.find_one({"_id": invite["orgId"]})
-    role_def = await mongo_db.role_definitions.find_one({"orgId": invite["orgId"], "key": invite["roleKey"]})
+    _org_cache.pop(uid, None)
+    await log_audit(uid, "org.member_joined", "organization", str(invite["orgId"]),
+                    metadata={"roleKey": invite["roleKey"], "email": email})
+    org = await mongo_db.organizations.find_one({"_id": invite["orgId"]}) or {}
     return {
         "success": True,
-        "orgId": str(invite["orgId"]),
-        "orgName": org.get("name", "") if org else "",
+        "orgName": await _org_label(org),
         "roleKey": invite["roleKey"],
         "roleLabel": ROLE_LABELS.get(invite["roleKey"], invite["roleKey"]),
     }
+
+
+@app.get("/api/team/status")
+async def team_status(request: Request):
+    jwt_user, u, err = await _team_user(request)
+    if err:
+        return err
+    ctx = await _get_ctx(request)
+    if not ctx:
+        return JSONResponse(status_code=401, content={"error": "Not signed in."})
+    org = await mongo_db.organizations.find_one({"_id": ctx["orgId"]}) or {}
+    verified = _is_email_verified(u)
+    out = {
+        "emailVerified": verified,
+        "joined": not str(org.get("slug", "")).startswith("personal-"),
+        "orgName": await _org_label(org),
+        "roleLabel": ROLE_LABELS.get(ctx["roleKey"], ctx["roleKey"]),
+        "canManage": bool(ctx["permissions"].get("org.manageMembers")),
+    }
+    if verified:  # never reveal "a team is waiting for this email" to an unverified account
+        out["pendingTeam"] = await mongo_db.org_invites.count_documents(
+            {"email": u["email"].strip().lower(), "status": "pending"}
+        ) > 0
+    return out
 
 
 @app.on_event("startup")
@@ -2879,6 +2912,7 @@ async def _on_startup_pipeline_engine():
     await _ensure_lock_indexes()
     await _ensure_audit_indexes()
     await _ensure_org_indexes()
+    await _ensure_otp_indexes()
     asyncio.create_task(_scheduler_loop())
 
 
@@ -2906,6 +2940,8 @@ AUDIT_ACTION_CATEGORY = {
     "org.invite_sent": "security",
     "org.invite_accepted": "security",
     "org.invite_revoked": "security",
+        "org.email_approved": "security",
+        "org.member_joined": "security",
 }
 
 def _diff_dict(old: dict, new: dict, ignore: set = frozenset()) -> dict | None:
@@ -5547,7 +5583,8 @@ async def save_analysis_result(request: Request, body: dict):
     if not source_name or not result:
         return {"error": "source_name and result are required"}
 
-    source_key = _analysis_source_key(connection_id, source_name)
+    source_key = (str(body.get("source_key") or "").strip()
+                  or _analysis_source_key(connection_id, source_name))
     now = datetime.now()
 
     history_entry = {
@@ -5690,7 +5727,8 @@ async def save_catalog_metadata(request: Request, body: dict):
     if not source_name:
         return {"error": "source_name is required"}
 
-    source_key = _analysis_source_key(connection_id, source_name)
+    source_key = (str(body.get("source_key") or "").strip()
+                  or _analysis_source_key(connection_id, source_name))
     now = datetime.now()
 
     set_fields: dict = {
