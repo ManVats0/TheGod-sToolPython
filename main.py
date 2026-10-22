@@ -161,7 +161,7 @@ async def _save_session_tokens(session_id: str, tokens: dict):
         try:
             await mongo_db.google_sessions.update_one(
                 {"session_id": session_id},
-                {"$set": {"tokens": tokens, "updatedAt": datetime.now()}},
+                {"$set": {"tokens": tokens, "userId": tokens.get("userId"), "orgId": tokens.get("orgId"), "updatedAt": datetime.now()}},
                 upsert=True,
             )
             return
@@ -832,6 +832,81 @@ async def upload_csv_connection(request: Request, file: UploadFile = File(...)):
     return serialize_doc(doc, drop=["credentialsEncrypted"])
 
 
+@app.post("/api/connections/google-sheets")
+async def create_google_sheets_connection(request: Request, body: dict):
+    """Saves a Google Sheet as an org-owned connection. The caller's Google refresh
+    token is copied from their own google_sessions doc into the connection
+    (encrypted). Credentials are never returned."""
+    if mongo_db is None:
+        return JSONResponse(status_code=503, content={"error": "MongoDB not configured"})
+    ctx, err = await _auth(request, "connection.create")
+    if err:
+        return err
+    sheet_id = str(body.get("sheetId") or "").strip()
+    sheet_name = str(body.get("sheetName") or "").strip()
+    tab = str(body.get("tab") or "").strip()
+    if not sheet_id or not sheet_name:
+        return JSONResponse(status_code=400, content={"error": "sheetId and sheetName are required."})
+    _sid, tokens = await _owned_google_session(request, ctx, str(body.get("sessionId") or "").strip())
+    refresh_token = tokens.get("refresh_token") or ""
+    if not refresh_token:
+        return JSONResponse(status_code=400, content={"error": "Your Google sign-in has expired or did not include long-lived access. Sign in with Google again and accept all permissions."})
+    try:
+        tab = await asyncio.to_thread(_sheets_check_access_sync, {"refresh_token": refresh_token}, sheet_id, tab)
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": f"This Google account cannot use that Sheet: {e}"})
+    now = datetime.now()
+    doc = {
+        "userId": ctx["userId"], "orgId": ctx["orgId"], "createdBy": ctx["userId"],
+        "name": sheet_name, "type": "sheets",
+        "config": {"sheetId": sheet_id, "sheetName": sheet_name, "tab": tab,
+                   "googleEmail": tokens.get("email", "")},
+        "credentialsEncrypted": encrypt_credentials({"refresh_token": refresh_token}),
+        "status": "active", "createdAt": now, "updatedAt": now,
+    }
+    result = await mongo_db.connections.insert_one(doc)
+    await log_audit(ctx["userId"], "connection.created", "connection", str(result.inserted_id),
+                    metadata={"name": sheet_name, "type": "sheets"}, resource_name=sheet_name)
+    return {"_id": str(result.inserted_id), "name": sheet_name, "type": "sheets",
+            "status": "active", "config": doc["config"]}
+
+
+@app.put("/api/connections/{connection_id}/reauth-google")
+async def reauth_google_connection(request: Request, connection_id: str, body: dict):
+    """Replaces the stored Google refresh token on a Sheets connection and
+    sets it back to active. Owner/Admin only (connection.edit)."""
+    if mongo_db is None:
+        return JSONResponse(status_code=503, content={"error": "MongoDB not configured"})
+    ctx, err = await _auth(request, "connection.edit")
+    if err:
+        return err
+    try:
+        oid = ObjectId(connection_id)
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Invalid connection id"})
+    conn = await mongo_db.connections.find_one({"_id": oid, "orgId": ctx["orgId"], "type": "sheets"})
+    if not conn:
+        return JSONResponse(status_code=404, content={"error": "Sheets connection not found"})
+    _sid, tokens = await _owned_google_session(request, ctx, str(body.get("sessionId") or "").strip())
+    refresh_token = tokens.get("refresh_token") or ""
+    if not refresh_token:
+        return JSONResponse(status_code=400, content={"error": "No Google sign-in found. Sign in with Google again and accept all permissions."})
+    cfg = conn.get("config", {})
+    try:
+        await asyncio.to_thread(_sheets_check_access_sync, {"refresh_token": refresh_token},
+                                cfg.get("sheetId", ""), cfg.get("tab", ""))
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": f"This Google account cannot open that Sheet: {e}"})
+    await mongo_db.connections.update_one(
+        {"_id": oid},
+        {"$set": {"credentialsEncrypted": encrypt_credentials({"refresh_token": refresh_token}),
+                  "status": "active", "config.googleEmail": tokens.get("email", ""),
+                  "updatedAt": datetime.now()}},
+    )
+    await log_audit(ctx["userId"], "connection.reauthorized", "connection", connection_id,
+                    resource_name=conn.get("name", ""), severity="warning")
+    return {"success": True}
+
 @app.delete("/api/connections/{connection_id}")
 async def delete_connection(request: Request, connection_id: str):
     if mongo_db is None:
@@ -839,19 +914,22 @@ async def delete_connection(request: Request, connection_id: str):
     ctx, err = await _auth(request)
     if err:
         return err
-    user = ctx
-    prev_conn = await mongo_db.connections.find_one({"_id": ObjectId(connection_id), "orgId": ctx["orgId"]})
-    if not prev_conn:
-        return {"success": False, "error": "Connection not found"}
-    own = prev_conn.get("createdBy") == ctx["userId"]
-    if not (ctx["permissions"].get("connection.delete")
-            or (own and ctx["permissions"].get("connection.deleteOwn"))):
+    try:
+        oid = ObjectId(connection_id)
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Invalid connection id"})
+    doc = await mongo_db.connections.find_one({"_id": oid, "orgId": ctx["orgId"]})
+    if not doc:
+        return {"success": False}
+    can_delete = ctx["permissions"].get("connection.delete") or (
+        ctx["permissions"].get("connection.deleteOwn") and doc.get("createdBy") == ctx["userId"]
+    )
+    if not can_delete:
         return _require_perm(ctx, "connection.delete")
-    result = await mongo_db.connections.delete_one({"_id": ObjectId(connection_id), "orgId": ctx["orgId"]})
-    await log_audit(user["userId"], "connection.deleted", "connection", connection_id,
-                    resource_name=(prev_conn or {}).get("name", ""), severity="warning")
+    result = await mongo_db.connections.delete_one({"_id": oid, "orgId": ctx["orgId"]})
+    await log_audit(ctx["userId"], "connection.deleted", "connection", connection_id,
+                    resource_name=doc.get("name", ""), severity="warning")
     return {"success": result.deleted_count > 0}
-
 
 @app.post("/api/connections/{connection_id}/retention")
 async def set_connection_retention(request: Request, connection_id: str, body: dict):
@@ -996,7 +1074,7 @@ async def get_decrypted_connection(connection_id: str, org_id, legacy_user_id: s
         "id": str(doc["_id"]),
         "name": doc.get("name", ""),
         "type": doc.get("type", ""),
-        "config": doc.get("config", {}),
+        "config": {**doc.get("config", {}), "_connectionId": str(doc["_id"])},
         "credentials": creds,
     }
 
@@ -1622,6 +1700,224 @@ async def _apply_transformations(df: pd.DataFrame, transformations: list) -> tup
 
     return df, steps_log
 
+class SheetsReauthRequired(RuntimeError):
+    """The stored Google refresh token is missing, expired or revoked."""
+
+
+_REAUTH_MSG = ("Google access for this Sheet has expired or was revoked. "
+               "The owner or an Admin must click 'Reconnect Google' on the Data Sources page.")
+
+
+def _a1_tab(tab: str) -> str:
+    return "'" + str(tab).replace("'", "''") + "'"
+
+
+def _col_letter(n: int) -> str:
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def _sheet_cell(v):
+    if v is None:
+        return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    if isinstance(v, (bool, np.bool_)):
+        return bool(v)
+    if isinstance(v, (int, np.integer)):
+        return int(v)
+    if isinstance(v, (float, np.floating)):
+        f = float(v)
+        return f if np.isfinite(f) else ""
+    return str(v)
+
+
+async def _owned_google_session(request: Request, ctx: dict, session_id: str = ""):
+    """Returns (session_id, tokens) only if this Google session belongs to the
+    caller. A session owned by someone else counts as 'not authenticated'.
+    A session with no owner yet is claimed by the caller (migration)."""
+    sid = session_id or _get_session_id(request)
+    if not sid:
+        return "", {}
+    tokens = await _get_session_tokens(sid)
+    if not tokens:
+        return "", {}
+    owner = tokens.get("userId")
+    if owner and owner != ctx["userId"]:
+        return "", {}
+    if not owner:
+        tokens["userId"] = ctx["userId"]
+        tokens["orgId"] = str(ctx["orgId"])
+        await _save_session_tokens(sid, tokens)
+    return sid, tokens
+
+
+async def _mark_sheets_needs_reauth(connection_id):
+    if mongo_db is None or not connection_id:
+        return
+    try:
+        await mongo_db.connections.update_one(
+            {"_id": ObjectId(connection_id)}, {"$set": {"status": "needs_reauth"}})
+    except Exception as e:
+        print(f"Could not mark connection {connection_id} needs_reauth: {e}")
+
+
+def _sheets_service(creds: dict):
+    """Sheets v4 client built from a connection's stored refresh token."""
+    refresh_token = (creds or {}).get("refresh_token", "")
+    if not refresh_token:
+        raise SheetsReauthRequired(_REAUTH_MSG)
+    gcreds = Credentials(
+        token=None,
+        refresh_token=refresh_token,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+    )
+    try:
+        gcreds.refresh(GoogleAuthRequest())
+    except Exception as e:
+        msg = str(e)
+        if "invalid_grant" in msg or "invalid_client" in msg or "unauthorized_client" in msg:
+            raise SheetsReauthRequired(_REAUTH_MSG)
+        raise RuntimeError(f"Google token refresh failed: {msg}")
+    return build("sheets", "v4", credentials=gcreds, cache_discovery=False)
+
+
+def _sheets_check_access_sync(creds: dict, sheet_id: str, tab: str) -> str:
+    """Confirms the account can open the Sheet; returns the tab to use."""
+    service = _sheets_service(creds)
+    meta = service.spreadsheets().get(
+        spreadsheetId=sheet_id, fields="sheets.properties.title").execute()
+    titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
+    if tab and tab not in titles:
+        raise RuntimeError(f"Tab '{tab}' was not found in this Sheet.")
+    return tab or (titles[0] if titles else "Sheet1")
+
+
+async def _sheets_fetch_df(cfg: dict, creds: dict) -> pd.DataFrame:
+    sheet_id = cfg.get("sheetId", "")
+    tab = cfg.get("tab") or "Sheet1"
+    if not sheet_id:
+        raise RuntimeError("Google Sheets source is missing sheetId.")
+    try:
+        service = await asyncio.to_thread(_sheets_service, creds)
+    except SheetsReauthRequired as e:
+        await _mark_sheets_needs_reauth(cfg.get("_connectionId"))
+        raise RuntimeError(str(e))
+
+    def _get():
+        return service.spreadsheets().values().get(
+            spreadsheetId=sheet_id, range=_a1_tab(tab)).execute()
+
+    result = await asyncio.to_thread(_get)
+    values = result.get("values", [])
+    if not values:
+        raise RuntimeError("This Google Sheet tab is empty.")
+    headers = [str(h) for h in values[0]]
+    width = len(headers)
+    rows = [(list(r) + [""] * (width - len(r)))[:width] for r in values[1:]]
+    return pd.DataFrame(rows, columns=headers)
+
+
+def _sheets_write_sync(service, sheet_id: str, tab: str, df: pd.DataFrame, mode: str) -> int:
+    """Order matters so a failure never empties the sheet: (1) grow the grid
+    if needed, (2) overwrite from A1, (3) clear only leftover rows/columns."""
+    a1 = _a1_tab(tab)
+    meta = service.spreadsheets().get(
+        spreadsheetId=sheet_id,
+        fields="sheets.properties(sheetId,title,gridProperties(rowCount,columnCount))",
+    ).execute()
+    props = next((s["properties"] for s in meta.get("sheets", [])
+                  if s["properties"].get("title") == tab), None)
+    if props is None:
+        raise RuntimeError(f"Tab '{tab}' was not found in this Google Sheet.")
+    grid_rows = int(props.get("gridProperties", {}).get("rowCount", 1000))
+    grid_cols = int(props.get("gridProperties", {}).get("columnCount", 26))
+
+    if mode == "append":
+        existing = service.spreadsheets().values().get(
+            spreadsheetId=sheet_id, range=a1).execute().get("values", [])
+        if existing:
+            old_headers = [str(h) for h in existing[0]]
+            width = len(old_headers)
+            old_df = pd.DataFrame(
+                [(list(r) + [""] * (width - len(r)))[:width] for r in existing[1:]],
+                columns=old_headers)
+            new_df = df.rename(columns=str)
+            all_cols = list(dict.fromkeys(list(old_df.columns) + list(new_df.columns)))
+            df = pd.concat([old_df.reindex(columns=all_cols),
+                            new_df.reindex(columns=all_cols)], ignore_index=True)
+
+    header = [str(c) for c in df.columns]
+    if not header:
+        raise RuntimeError("Nothing to write: the result has no columns.")
+    values = [header] + [[_sheet_cell(v) for v in row]
+                         for row in df.itertuples(index=False, name=None)]
+    n_rows, n_cols = len(values), len(header)
+    final_rows, final_cols = max(n_rows, grid_rows), max(n_cols, grid_cols)
+
+    if final_rows > grid_rows or final_cols > grid_cols:
+        service.spreadsheets().batchUpdate(spreadsheetId=sheet_id, body={"requests": [{
+            "updateSheetProperties": {
+                "properties": {"sheetId": props["sheetId"],
+                               "gridProperties": {"rowCount": final_rows, "columnCount": final_cols}},
+                "fields": "gridProperties.rowCount,gridProperties.columnCount",
+            }}]}).execute()
+
+    service.spreadsheets().values().update(
+        spreadsheetId=sheet_id, range=f"{a1}!A1",
+        valueInputOption="RAW", body={"values": values},
+    ).execute()
+
+    if grid_rows > n_rows:
+        service.spreadsheets().values().clear(
+            spreadsheetId=sheet_id,
+            range=f"{a1}!A{n_rows + 1}:{_col_letter(final_cols)}{grid_rows}",
+        ).execute()
+    if grid_cols > n_cols:
+        service.spreadsheets().values().clear(
+            spreadsheetId=sheet_id,
+            range=f"{a1}!{_col_letter(n_cols + 1)}1:{_col_letter(final_cols)}{n_rows}",
+        ).execute()
+    return len(df)
+
+
+async def _sheets_write_df(cfg: dict, creds: dict, df: pd.DataFrame, mode: str) -> dict:
+    sheet_id = cfg.get("sheetId", "")
+    tab = cfg.get("tab") or "Sheet1"
+    if not sheet_id:
+        raise RuntimeError("Google Sheets destination is missing sheetId.")
+    try:
+        service = await asyncio.to_thread(_sheets_service, creds)
+    except SheetsReauthRequired as e:
+        await _mark_sheets_needs_reauth(cfg.get("_connectionId"))
+        raise RuntimeError(str(e))
+
+    rl_key = f"{sheet_id}:{tab}"
+    with _gsheets_write_lock:
+        prev = _gsheets_last_write.get(rl_key, 0)
+        elapsed = time.time() - prev
+        if elapsed < GSHEETS_MIN_INTERVAL_SECONDS:
+            raise RuntimeError(f"Rate-limited: wrote to this sheet {round(elapsed, 1)}s ago. "
+                               f"Min interval {GSHEETS_MIN_INTERVAL_SECONDS}s.")
+        _gsheets_last_write[rl_key] = time.time()
+    try:
+        rows_written = await asyncio.to_thread(_sheets_write_sync, service, sheet_id, tab, df, mode)
+    except Exception as e:
+        with _gsheets_write_lock:
+            _gsheets_last_write[rl_key] = prev
+        err_str = str(e)
+        if "RATE_LIMIT_EXCEEDED" in err_str or "429" in err_str or "quota" in err_str.lower():
+            raise RuntimeError("Google Sheets rate limit hit. Wait 60 seconds and run again.")
+        raise RuntimeError(err_str)
+    return {"success": True, "rows_written": rows_written, "sheet_id": sheet_id}
 
 async def _fetch_source_df(conn_type: str, cfg: dict, creds: dict) -> pd.DataFrame:
     """Returns a DataFrame for any supported source connection type."""
@@ -1749,6 +2045,9 @@ async def _fetch_source_df(conn_type: str, cfg: dict, creds: dict) -> pd.DataFra
             raise RuntimeError(f"GA4 fetch failed: {result['error']}")
         return pd.read_csv(os.path.join(UPLOAD_DIR, result["filename"]))
 
+    if conn_type == "sheets":
+        return await _sheets_fetch_df(cfg, creds)
+
     raise RuntimeError(f"Source type '{conn_type}' is not supported by the server-side executor.")
 
 
@@ -1872,7 +2171,10 @@ async def _write_destination_df(conn_type: str, cfg: dict, creds: dict, df: pd.D
             raise RuntimeError(f"REST API write failed: {result.get('error')}")
         return result
 
-    if conn_type == "google_sheets":
+    if conn_type == "sheets":
+        return await _sheets_write_df(cfg, creds, df, mode)
+
+    if conn_type == "google_sheets_legacy_unused":
         result = await _write_gsheet_df(
             creds.get("sessionId", ""), cfg.get("sheetId", ""), cfg.get("sheetName", ""), df, mode,
         )
@@ -2608,6 +2910,10 @@ async def remove_org_member(request: Request, target_user_id: str):
 
     result = await mongo_db.org_members.delete_one({"orgId": org_id, "userId": target_user_id})
     _org_cache.pop(target_user_id, None)
+    await mongo_db.connections.update_many(
+        {"orgId": org_id, "type": "sheets", "createdBy": target_user_id},
+        {"$set": {"credentialsEncrypted": "", "status": "needs_reauth"}},
+    )
     await log_audit(user["userId"], "org.member_removed", "organization", str(org_id),
                     metadata={"targetUserId": target_user_id}, severity="warning")
     return {"success": result.deleted_count > 0}
@@ -3603,6 +3909,7 @@ async def analyze(
                 _cfg["table"] = mysql_table
                 _cfg["file"] = mysql_table
                 _cfg["endpoint"] = _cfg.get("endpoint") or mysql_table
+                _cfg["tab"] = mysql_table
             try:
                 _df = await _fetch_source_df(_c["type"], _cfg, _c.get("credentials", {}))
             except Exception as e:
@@ -4752,7 +5059,15 @@ async def get_google_auth_url(request: Request, response: Response):
     if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
         return {"error": "Google OAuth not configured"}
 
+    ctx, err = await _auth(request)
+    if err:
+        return err
+
     session_id = request.cookies.get("datapro_session", "")
+    if session_id:
+        _existing = await _get_session_tokens(session_id)
+        if _existing.get("userId") and _existing.get("userId") != ctx["userId"]:
+            session_id = ""  # this browser's cookie belongs to a different user
     if not session_id:
         session_id = secrets.token_urlsafe(32)
 
@@ -4780,6 +5095,8 @@ async def get_google_auth_url(request: Request, response: Response):
 
     tokens = await _get_session_tokens(session_id)
     tokens["state"] = state
+    tokens["userId"] = ctx["userId"]
+    tokens["orgId"] = str(ctx["orgId"])
     tokens["code_verifier"] = getattr(flow, 'code_verifier', "")
     await _save_session_tokens(session_id, tokens)
 
@@ -4879,6 +5196,12 @@ scopes=[
 
 @app.get("/api/auth/google/picker-token")
 async def get_picker_token(request: Request):
+    ctx, err = await _auth(request)
+    if err:
+        return err
+    _own_sid, _own_tokens = await _owned_google_session(request, ctx)
+    if not _own_sid:
+        return {"error": "Not authenticated"}
     session_id = _get_session_id(request)
     if not session_id:
         return {"error": "Not authenticated"}
@@ -4901,6 +5224,12 @@ async def google_auth_status(request: Request):
 
 @app.get("/api/auth/google/sheets")
 async def list_google_sheets(request: Request):
+    ctx, err = await _auth(request)
+    if err:
+        return err
+    _own_sid, _own_tokens = await _owned_google_session(request, ctx)
+    if not _own_sid:
+        return {"error": "Not authenticated", "sheets": []}
     session_id = _get_session_id(request)
     if not session_id:
         return {"error": "Not authenticated", "sheets": []}
@@ -4946,6 +5275,12 @@ async def list_google_sheets(request: Request):
 
 @app.post("/api/sheets/to-csv")
 async def sheet_to_csv(request: Request, body: dict):
+    ctx, err = await _auth(request)
+    if err:
+        return err
+    _own_sid, _own_tokens = await _owned_google_session(request, ctx)
+    if not _own_sid:
+        return {"error": "Not authenticated"}
     sheet_id   = body.get("sheetId", "")
     tab        = body.get("tab", "Sheet1")
     sheet_name = body.get("sheetName", "unnamed")
@@ -5018,6 +5353,12 @@ async def sheet_to_csv(request: Request, body: dict):
 
 @app.get("/api/auth/google/sheets/{sheet_id}/data")
 async def get_sheet_data(request: Request, sheet_id: str, tab: str = "Sheet1"):
+    ctx, err = await _auth(request)
+    if err:
+        return err
+    _own_sid, _own_tokens = await _owned_google_session(request, ctx)
+    if not _own_sid:
+        return {"error": "Not authenticated"}
     """Fetches actual data from a Google Sheet tab and returns it as CSV rows."""
     session_id = _get_session_id(request)
     tokens = await _get_session_tokens(session_id) if session_id else {}
@@ -5066,6 +5407,12 @@ async def get_sheet_data(request: Request, sheet_id: str, tab: str = "Sheet1"):
 
 @app.post("/api/auth/google/sheets/{sheet_id}/import")
 async def import_sheet_as_source(request: Request, sheet_id: str, tab: str = "Sheet1"):
+    ctx, err = await _auth(request)
+    if err:
+        return err
+    _own_sid, _own_tokens = await _owned_google_session(request, ctx)
+    if not _own_sid:
+        return {"error": "Not authenticated"}
     session_id = _get_session_id(request)
     if not session_id:
         return {"error": "Not authenticated"}
@@ -8246,7 +8593,7 @@ async def write_to_source(
     contents = await file.read()
     csv_text = contents.decode("utf-8", errors="replace")
 
-    if connection_id and source_type != "sheets":
+    if connection_id:
         ctx, err = await _auth(request, "connection.edit")
         if err:
             return err
@@ -8261,6 +8608,7 @@ async def write_to_source(
             _cfg["table"] = target
             _cfg["collection"] = target
             _cfg["file"] = target
+            _cfg["tab"] = target
         try:
             _df = pd.read_csv(io.BytesIO(contents))
             _res = await _write_destination_df(_c["type"], _cfg, _c.get("credentials", {}), _df, "replace")
@@ -8272,17 +8620,14 @@ async def write_to_source(
             return {"success": False, "error": str(e)}
 
     if source_type == "sheets":
-        # Resolve session
-        resolved_session = session_id or _get_session_id(request)
-        tokens = await _get_session_tokens(resolved_session) if resolved_session else {}
-        if not tokens.get("access_token"):
-            for sid, tok in _session_store.items():
-                if "access_token" in tok:
-                    tokens = tok
-                    resolved_session = sid
-                    break
-        if not tokens.get("access_token"):
+        ctx, err = await _auth(request, "connection.edit")
+        if err:
+            return err
+        session_id, _own_tokens = await _owned_google_session(request, ctx, session_id)
+        if not _own_tokens.get("access_token"):
             return {"success": False, "error": "Not authenticated with Google"}
+        resolved_session = session_id
+        tokens = _own_tokens
         try:
             creds = Credentials(
                 token=tokens.get("access_token"),
@@ -8365,18 +8710,17 @@ async def write_to_source(
 
 @app.post("/api/update-gsheet")
 async def update_gsheet(request: Request, body: dict):
+    ctx, err = await _auth(request, "connection.edit")
+    if err:
+        return err
+    _sid, _own = await _owned_google_session(request, ctx, body.get("sessionId", ""))
+    if "access_token" not in _own:
+        return {"error": "Not authenticated"}
     sheet_id   = body.get("sheetId", "")
     sheet_name = body.get("sheetName", "")
     csv_data   = body.get("csvData", "")
-    session_id = _get_session_id(request) or body.get("sessionId", "")
+    session_id = _sid
     tokens = await _get_session_tokens(session_id) if session_id else {}
-    if "access_token" not in tokens:
-        # Fallback: find any authenticated session
-        for sid, tok in _session_store.items():
-            if "access_token" in tok:
-                tokens = tok
-                session_id = sid
-                break
     if "access_token" not in tokens:
         return {"error": "Not authenticated"}
 
