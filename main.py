@@ -4860,7 +4860,20 @@ async def sql_clean(
 
 @app.get("/api/download/{filename}")
 def download(filename: str):
-    filepath = os.path.join(UPLOAD_DIR, filename)
+    # Security: only a bare filename that resolves INSIDE UPLOAD_DIR is allowed.
+    # Blocks path traversal such as ../credentials.env or absolute paths.
+    base_dir = os.path.realpath(UPLOAD_DIR)
+    if (
+        not filename
+        or filename != os.path.basename(filename)
+        or filename.startswith(".")
+        or "\\" in filename
+        or "\x00" in filename
+    ):
+        return JSONResponse(status_code=400, content={"error": "Invalid filename"})
+    filepath = os.path.realpath(os.path.join(base_dir, filename))
+    if os.path.commonpath([base_dir, filepath]) != base_dir or not os.path.isfile(filepath):
+        return JSONResponse(status_code=404, content={"error": "File not found"})
     return FileResponse(filepath, media_type="text/csv", filename=filename)
 
 
@@ -6235,9 +6248,14 @@ async def ai_usage_route(request: Request):
 
 @app.post("/api/ai-custom-clean")
 async def ai_custom_clean_route(
+    request: Request,
     file: UploadFile = File(...),
     instruction: str = Form(""),
 ):
+    # Security: this route spends the server's Anthropic API credits,
+    # so it requires a valid logged-in user.
+    if not require_user(request):
+        return JSONResponse(status_code=401, content={"success": False, "error": "Not authenticated"})
     import anthropic
 
     api_key = os.getenv("ANTHROPIC_API_KEY", "")
@@ -6298,7 +6316,11 @@ Reply with ONLY the Python code, nothing else, no markdown, no backticks."""
 
 
 @app.post("/api/ai-clean")
-async def ai_clean_route(body: dict):
+async def ai_clean_route(request: Request, body: dict):
+    # Security: this route spends the server's Anthropic API credits,
+    # so it requires a valid logged-in user.
+    if not require_user(request):
+        return JSONResponse(status_code=401, content={"success": False, "error": "Not authenticated"})
     import anthropic
     csv_preview = body.get("csv_preview", "")[:3000]
     instructions = body.get("instructions", "")
