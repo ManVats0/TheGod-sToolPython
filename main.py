@@ -4860,7 +4860,20 @@ async def sql_clean(
 
 @app.get("/api/download/{filename}")
 def download(filename: str):
-    filepath = os.path.join(UPLOAD_DIR, filename)
+    # Security: only a bare filename that resolves INSIDE UPLOAD_DIR is allowed.
+    # Blocks path traversal such as ../credentials.env or absolute paths.
+    base_dir = os.path.realpath(UPLOAD_DIR)
+    if (
+        not filename
+        or filename != os.path.basename(filename)
+        or filename.startswith(".")
+        or "\\" in filename
+        or "\x00" in filename
+    ):
+        return JSONResponse(status_code=400, content={"error": "Invalid filename"})
+    filepath = os.path.realpath(os.path.join(base_dir, filename))
+    if os.path.commonpath([base_dir, filepath]) != base_dir or not os.path.isfile(filepath):
+        return JSONResponse(status_code=404, content={"error": "File not found"})
     return FileResponse(filepath, media_type="text/csv", filename=filename)
 
 
