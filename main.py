@@ -389,6 +389,33 @@ def send_otp_email(to_email: str, code: str):
         print(f"✗ OTP email error: {e}")
         return False, str(e)
 
+def send_invite_email(to_email: str, org_name: str, role_label: str, inviter_email: str):
+    """Best effort: tells the person a team added their email. Never raises."""
+    if not to_email or not os.getenv("RESEND_API_KEY", ""):
+        return False, "RESEND_API_KEY is not set on the backend."
+    try:
+        import resend
+        resend.api_key = os.getenv("RESEND_API_KEY", "")
+        link = (os.getenv("FRONTEND_URL", "") or "https://thegodstool.com").rstrip("/") + "/team"
+        resend.Emails.send({
+            "from": "The Gods Tool <noreply@thegodstool.com>",
+            "to": [to_email],
+            "subject": f"You were invited to join {org_name} on The God's Tool",
+            "html": f"""
+        <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:24px auto;padding:28px;background:#1a1040;border:1px solid #2d1b69;border-radius:14px;color:#e2e8f0;">
+          <h2 style="margin:0 0 8px;color:white;">You're invited</h2>
+          <p style="color:#94a3b8;margin:0 0 18px;"><b style="color:white">{inviter_email or 'A teammate'}</b> invited you to join
+          <b style="color:white">{org_name}</b> as <b style="color:white">{role_label}</b>.</p>
+          <p style="margin:0 0 18px;"><a href="{link}" style="background:#7c3aed;color:white;padding:10px 20px;border-radius:10px;text-decoration:none;font-weight:700;">Review invitation</a></p>
+          <p style="color:#64748b;font-size:12px;margin:0;">Sign in with this email address, open Team, and accept. Your own workspace stays available.</p>
+        </div>""",
+            "text": f"{inviter_email or 'A teammate'} invited you to join {org_name} as {role_label}. Sign in and open {link} to accept.",
+        })
+        return True, ""
+    except Exception as e:
+        print(f"✗ Invite email error: {e}")
+        return False, str(e)
+
 # ── PRIMARY KEY ────────────────────────────────────────────────────────────────
 def detect_primary_key(df):
     for col in df.columns:
@@ -2478,6 +2505,8 @@ async def _ensure_org_indexes():
         await mongo_db.resource_grants.create_index([("granteeUserId", 1), ("resourceType", 1)])
         await mongo_db.org_invites.create_index("token", unique=True)
         await mongo_db.org_invites.create_index([("orgId", 1), ("email", 1), ("status", 1)])
+        await mongo_db.org_invites.create_index([("email", 1), ("status", 1)])
+        await mongo_db.org_prefs.create_index("userId", unique=True)
     except Exception as e:
         print(f"Could not ensure org indexes: {e}")
 
@@ -2543,19 +2572,40 @@ async def _seed_role_definitions(org_id):
             })
 
 
-async def _ensure_org_for_user(user_id: str) -> dict:
-    """
-    Returns {org, membership} for user_id. If the user has no active
-    membership anywhere yet, auto-provisions a personal organization with
-    them as Owner. This is what lets every existing userId-scoped route
-    keep working unmodified today — organizations exist underneath, but
-    nothing requires them yet unless a route calls _check_permission.
-    """
-    membership = await mongo_db.org_members.find_one({"userId": user_id, "status": "active"})
-    if membership:
-        org = await mongo_db.organizations.find_one({"_id": membership["orgId"]})
-        return {"org": org, "membership": membership}
+def _is_personal_org(org: dict | None, user_id: str) -> bool:
+    """True only for the person's OWN auto-created workspace. The same org is a *team* to everyone invited into it."""
+    return str((org or {}).get("slug", "")).startswith("personal-") and str((org or {}).get("ownerId", "")) == str(user_id)
 
+
+async def _resolve_membership(user_id: str) -> dict | None:
+    """The membership for the user's ACTIVE workspace.
+
+    A person can belong to several workspaces at once: their own personal one plus any teams that
+    invited them. Which one they are currently working in is stored in org_prefs. If nothing is
+    stored (or it is no longer valid) we fall back to their personal workspace."""
+    pref = await mongo_db.org_prefs.find_one({"userId": user_id})
+    if pref and pref.get("activeOrgId") is not None:
+        m = await mongo_db.org_members.find_one(
+            {"userId": user_id, "orgId": pref["activeOrgId"], "status": "active"})
+        if m:
+            return m
+    ms = await mongo_db.org_members.find({"userId": user_id, "status": "active"}).to_list(length=100)
+    if not ms:
+        return None
+    if len(ms) == 1:
+        return ms[0]
+    personal_ids = set()
+    async for o in mongo_db.organizations.find({"_id": {"$in": [m["orgId"] for m in ms]}}):
+        if _is_personal_org(o, user_id):
+            personal_ids.add(o["_id"])
+    for m in ms:
+        if m["orgId"] in personal_ids:
+            return m
+    return ms[0]
+
+
+async def _provision_personal(user_id: str) -> dict:
+    """Creates (or re-activates) the person's personal workspace with them as Owner. Idempotent."""
     org_doc = {
         "name": f"Personal — {user_id}",
         "slug": f"personal-{user_id}",
@@ -2593,6 +2643,34 @@ async def _ensure_org_for_user(user_id: str) -> dict:
     return {"org": org_doc, "membership": membership_doc}
 
 
+
+
+async def _ensure_personal_workspace(user_id: str) -> None:
+    """Every person always keeps a personal workspace, even after joining teams."""
+    org = await mongo_db.organizations.find_one({"slug": f"personal-{user_id}"})
+    if org:
+        m = await mongo_db.org_members.find_one({"orgId": org["_id"], "userId": user_id, "status": "active"})
+        if m:
+            return
+    # Someone who joined a team before multi-workspace existed has no stored preference. Pin their
+    # current team as active BEFORE re-activating the personal workspace, or they would be moved out of it.
+    current = await _resolve_membership(user_id)
+    if current and not await mongo_db.org_prefs.find_one({"userId": user_id}):
+        await mongo_db.org_prefs.update_one(
+            {"userId": user_id}, {"$set": {"userId": user_id, "activeOrgId": current["orgId"]}}, upsert=True)
+    await _provision_personal(user_id)
+
+
+async def _ensure_org_for_user(user_id: str) -> dict:
+    """Returns {org, membership} for the user's ACTIVE workspace. Users with no workspace yet get a
+    personal one auto-provisioned (they are its Owner), so every existing userId-scoped route keeps working."""
+    membership = await _resolve_membership(user_id)
+    if membership:
+        org = await mongo_db.organizations.find_one({"_id": membership["orgId"]})
+        return {"org": org, "membership": membership}
+    return await _provision_personal(user_id)
+
+
 async def _get_permissions(user_id: str) -> dict:
     """Returns {org, membership, permissions} for the given user, auto-
     provisioning a personal org on first use via _ensure_org_for_user."""
@@ -2622,7 +2700,7 @@ async def _org_id_for_user(user_id: str):
     if hit and time.time() - hit[0] < _ORG_CACHE_TTL:
         return hit[1]
     try:
-        m = await mongo_db.org_members.find_one({"userId": user_id, "status": "active"})
+        m = await _resolve_membership(user_id)
     except Exception:
         return None
     if not m:
@@ -2747,6 +2825,7 @@ async def get_my_org(request: Request):
         "userId": ctx["userId"],
         "role": ctx["roleKey"],
         "permissions": ctx["permissions"],
+        **({"seats": await _seat_usage(ctx["orgId"])} if ctx["permissions"].get("org.manageMembers") else {}),
     }
 
 
@@ -2760,7 +2839,7 @@ async def list_org_members(request: Request):
     if not (ctx["permissions"].get("org.manageMembers") or ctx["permissions"].get("catalog.assignOwner")):
         return _require_perm(ctx, "org.manageMembers")
     org_id = ctx["orgId"]
-    cursor = mongo_db.org_members.find({"orgId": org_id})
+    cursor = mongo_db.org_members.find({"orgId": org_id, "status": {"$ne": "left"}})
     docs = await cursor.to_list(length=500)
 
     user_ids = []
@@ -2823,9 +2902,12 @@ async def add_org_member(request: Request, body: dict):
         }
         await mongo_db.role_definitions.insert_one(role_def)
 
-    existing = await mongo_db.org_members.find_one({"userId": target_user_id, "status": "active"})
+    existing = await mongo_db.org_members.find_one({"userId": target_user_id, "orgId": org_id, "status": "active"})
     if existing:
-        return {"error": "This user already belongs to an organization."}
+        return {"error": "This user is already a member of your organization."}
+    seat_err = await _seat_error(org_id)
+    if seat_err:
+        return seat_err
 
     await mongo_db.org_members.update_one(
         {"orgId": org_id, "userId": target_user_id},
@@ -2909,6 +2991,7 @@ async def remove_org_member(request: Request, target_user_id: str):
         return {"error": "Cannot remove the organization owner."}
 
     result = await mongo_db.org_members.delete_one({"orgId": org_id, "userId": target_user_id})
+    await mongo_db.org_prefs.delete_one({"userId": target_user_id, "activeOrgId": org_id})
     _org_cache.pop(target_user_id, None)
     await mongo_db.connections.update_many(
         {"orgId": org_id, "type": "sheets", "createdBy": target_user_id},
@@ -2917,6 +3000,43 @@ async def remove_org_member(request: Request, target_user_id: str):
     await log_audit(user["userId"], "org.member_removed", "organization", str(org_id),
                     metadata={"targetUserId": target_user_id}, severity="warning")
     return {"success": result.deleted_count > 0}
+
+
+# Users included per plan. Mirrors PLAN_SESSION_LIMITS in the Express backend.
+# Enforcement is OFF unless ENFORCE_SEAT_LIMITS=1 is set on this service.
+PLAN_SEAT_LIMITS = {"none": 1, "trial": 1, "lite": 1, "starter": 1, "pro": 5, "team": 15, "enterprise": 100}
+ENFORCE_SEAT_LIMITS = os.getenv("ENFORCE_SEAT_LIMITS", "").strip().lower() in ("1", "true", "yes")
+
+
+async def _seat_usage(org_id) -> dict:
+    org = await mongo_db.organizations.find_one({"_id": org_id}) or {}
+    plan = "none"
+    try:
+        owner = await mongo_db.users.find_one({"_id": ObjectId(str(org.get("ownerId", "")))})
+        plan = (owner or {}).get("plan") or "none"
+    except Exception:
+        pass
+    return {
+        "plan": plan,
+        "limit": PLAN_SEAT_LIMITS.get(plan, 1),
+        "used": await mongo_db.org_members.count_documents({"orgId": org_id, "status": "active"}),
+        "pending": await mongo_db.org_invites.count_documents({"orgId": org_id, "status": "pending"}),
+        "enforced": ENFORCE_SEAT_LIMITS,
+    }
+
+
+async def _seat_error(org_id, extra: int = 1, count_pending: bool = True):
+    """A 403 response if adding `extra` more people would exceed the owner's plan, else None."""
+    if not ENFORCE_SEAT_LIMITS:
+        return None
+    u = await _seat_usage(org_id)
+    taken = u["used"] + (u["pending"] if count_pending else 0)
+    if taken + extra > u["limit"]:
+        return JSONResponse(status_code=403, content={
+            "error": f"Your {u['plan']} plan includes {u['limit']} user{'s' if u['limit'] != 1 else ''} "
+                     f"(you have {u['used']} member{'s' if u['used'] != 1 else ''} and {u['pending']} pending invite"
+                     f"{'s' if u['pending'] != 1 else ''}). Upgrade your plan to add more teammates."})
+    return None
 
 
 ROLE_DESCRIPTIONS = {
@@ -2971,16 +3091,18 @@ async def create_org_invite(request: Request, body: dict):
 
     existing_user = await mongo_db.users.find_one({"email": email})
     if existing_user:
-        m = await mongo_db.org_members.find_one({"userId": str(existing_user["_id"]), "status": "active"})
+        m = await mongo_db.org_members.find_one(
+            {"userId": str(existing_user["_id"]), "orgId": org_id, "status": "active"})
         if m:
-            if m["orgId"] == org_id:
-                return JSONResponse(status_code=400, content={"error": "This person is already a member of your organization."})
-            their_org = await mongo_db.organizations.find_one({"_id": m["orgId"]}) or {}
-            if not str(their_org.get("slug", "")).startswith("personal-"):
-                return JSONResponse(status_code=400, content={"error": "This person already belongs to another team and must leave it first."})
+            return JSONResponse(status_code=400, content={"error": "This person is already a member of your organization."})
+        # A person can belong to several teams, so being in another team is no reason to refuse.
 
     now = datetime.now()
     pending = await mongo_db.org_invites.find_one({"orgId": org_id, "email": email, "status": "pending"})
+    if not pending:
+        seat_err = await _seat_error(org_id)
+        if seat_err:
+            return seat_err
     if pending:
         await mongo_db.org_invites.update_one(
             {"_id": pending["_id"]},
@@ -2996,7 +3118,10 @@ async def create_org_invite(request: Request, body: dict):
         })
     await log_audit(ctx["userId"], "org.email_approved", "organization", str(org_id),
                     metadata={"email": email, "roleKey": role_key})
-    return {"success": True}
+    org_row = await mongo_db.organizations.find_one({"_id": org_id}) or {}
+    emailed, _mail_err = await asyncio.to_thread(
+        send_invite_email, email, await _org_label(org_row), ROLE_LABELS.get(role_key, role_key), ctx.get("email", ""))
+    return {"success": True, "emailed": emailed}
 
 
 @app.get("/api/org/invites")
@@ -3133,58 +3258,217 @@ async def team_otp_verify(request: Request, body: dict):
     return {"success": True}
 
 
-@app.post("/api/team/join")
-async def team_join(request: Request):
-    jwt_user, u, err = await _team_user(request)
-    if err:
-        return err
-    uid = str(jwt_user.get("userId", ""))
-    if not _is_email_verified(u):
-        return JSONResponse(status_code=403, content={"error": "Verify your email first."})
+async def _my_pending_invites(u: dict) -> list:
     email = u["email"].strip().lower()
-    invite = await mongo_db.org_invites.find_one({"email": email, "status": "pending"}, sort=[("createdAt", -1)])
-    if not invite:
-        return JSONResponse(status_code=404, content={"error": "No team has added this email yet."})
+    now = datetime.now()
+    out = []
+    async for inv in mongo_db.org_invites.find({"email": email, "status": "pending"}).sort("createdAt", -1):
+        if inv.get("expiresAt") and inv["expiresAt"] < now:
+            continue
+        org = await mongo_db.organizations.find_one({"_id": inv["orgId"]}) or {}
+        inviter = ""
+        try:
+            iu = await mongo_db.users.find_one({"_id": ObjectId(str(inv.get("invitedBy", "")))})
+            inviter = (iu or {}).get("email", "")
+        except Exception:
+            pass
+        out.append({
+            "id": str(inv["_id"]), "orgId": str(inv["orgId"]), "orgName": await _org_label(org),
+            "roleKey": inv.get("roleKey", ""), "roleLabel": ROLE_LABELS.get(inv.get("roleKey", ""), inv.get("roleKey", "")),
+            "invitedBy": inviter,
+            "invitedAt": inv["createdAt"].isoformat() if inv.get("createdAt") else None,
+        })
+    return out
 
-    current = await mongo_db.org_members.find_one({"userId": uid, "status": "active"})
-    if current and current["orgId"] != invite["orgId"]:
-        cur_org = await mongo_db.organizations.find_one({"_id": current["orgId"]}) or {}
-        if not str(cur_org.get("slug", "")).startswith("personal-"):
-            return JSONResponse(status_code=409, content={"error": "You already belong to another team. Leave it before joining a new one."})
+
+async def _workspace_list(uid: str) -> tuple:
+    """(list of the person's workspaces, active orgId). Personal workspace first."""
+    await _ensure_personal_workspace(uid)
+    active = await _resolve_membership(uid)
+    active_id = active["orgId"] if active else None
+    ms = await mongo_db.org_members.find({"userId": uid, "status": "active"}).to_list(length=100)
+    items = []
+    for m in ms:
+        org = await mongo_db.organizations.find_one({"_id": m["orgId"]}) or {}
+        items.append({
+            "orgId": str(m["orgId"]), "name": await _org_label(org), "personal": _is_personal_org(org, uid),
+            "roleKey": m.get("roleKey", ""), "roleLabel": ROLE_LABELS.get(m.get("roleKey", ""), m.get("roleKey", "")),
+            "active": m["orgId"] == active_id,
+        })
+    items.sort(key=lambda w: (not w["personal"], w["name"].lower()))
+    return items, active_id
+
+
+async def _accept_invite(uid: str, u: dict, invite: dict):
+    """Returns (payload, None) or (None, error_response)."""
+    if not _is_email_verified(u):
+        return None, JSONResponse(status_code=403, content={"error": "Verify your email first."})
+    email = u["email"].strip().lower()
+    if invite.get("email") != email or invite.get("status") != "pending":
+        return None, JSONResponse(status_code=404, content={"error": "This invitation is no longer available."})
+    if invite.get("expiresAt") and invite["expiresAt"] < datetime.now():
+        return None, JSONResponse(status_code=410, content={"error": "This invitation has expired. Ask the owner to send it again."})
+    org_id = invite["orgId"]
+
+    already = await mongo_db.org_members.find_one({"orgId": org_id, "userId": uid, "status": "active"})
+    if not already:
+        seat_err = await _seat_error(org_id, extra=1, count_pending=False)
+        if seat_err:
+            return None, seat_err
 
     claimed = await mongo_db.org_invites.find_one_and_update(
         {"_id": invite["_id"], "status": "pending"},
         {"$set": {"status": "accepted", "acceptedAt": datetime.now(), "acceptedBy": uid}},
     )
     if not claimed:
-        return JSONResponse(status_code=409, content={"error": "This approval was already used."})
+        return None, JSONResponse(status_code=409, content={"error": "This invitation was already used."})
 
-    # Same steps the old accept route did.
-    personal = await mongo_db.org_members.find_one(
-        {"userId": uid, "status": "active", "roleKey": "owner", "orgId": {"$ne": invite["orgId"]}}
-    )
-    if personal:
-        await _stamp_legacy_docs(uid, personal["orgId"])
-    await mongo_db.org_members.update_many(
-        {"userId": uid, "status": "active", "orgId": {"$ne": invite["orgId"]}},
-        {"$set": {"status": "left"}},
-    )
-    await mongo_db.org_members.update_one(
-        {"orgId": invite["orgId"], "userId": uid},
-        {"$set": {"orgId": invite["orgId"], "userId": uid, "roleKey": invite["roleKey"],
-                  "status": "active", "joinedAt": datetime.now()}},
-        upsert=True,
-    )
+    try:
+        # Keep their personal workspace (and move their pre-teams data into it) before they switch teams.
+        await _ensure_personal_workspace(uid)
+        personal = await mongo_db.org_members.find_one(
+            {"userId": uid, "status": "active", "roleKey": "owner", "orgId": {"$ne": org_id}})
+        if personal:
+            await _stamp_legacy_docs(uid, personal["orgId"])
+        await mongo_db.org_members.update_one(
+            {"orgId": org_id, "userId": uid},
+            {"$set": {"orgId": org_id, "userId": uid, "roleKey": invite["roleKey"],
+                      "status": "active", "joinedAt": datetime.now()}},
+            upsert=True,
+        )
+        await mongo_db.org_prefs.update_one(
+            {"userId": uid}, {"$set": {"userId": uid, "activeOrgId": org_id}}, upsert=True)
+    except Exception as e:
+        print(f"Join failed, reopening invite: {e}")
+        await mongo_db.org_invites.update_one(
+            {"_id": invite["_id"]},
+            {"$set": {"status": "pending"}, "$unset": {"acceptedAt": "", "acceptedBy": ""}})
+        return None, JSONResponse(status_code=500, content={"error": "Could not join the team. Please try again."})
+
     _org_cache.pop(uid, None)
-    await log_audit(uid, "org.member_joined", "organization", str(invite["orgId"]),
+    await log_audit(uid, "org.member_joined", "organization", str(org_id),
                     metadata={"roleKey": invite["roleKey"], "email": email})
-    org = await mongo_db.organizations.find_one({"_id": invite["orgId"]}) or {}
+    org = await mongo_db.organizations.find_one({"_id": org_id}) or {}
     return {
         "success": True,
+        "orgId": str(org_id),
         "orgName": await _org_label(org),
         "roleKey": invite["roleKey"],
         "roleLabel": ROLE_LABELS.get(invite["roleKey"], invite["roleKey"]),
-    }
+    }, None
+
+
+@app.post("/api/team/join")
+async def team_join(request: Request):
+    """Compatibility route: accepts the newest pending invitation for the caller's verified email."""
+    jwt_user, u, err = await _team_user(request)
+    if err:
+        return err
+    uid = str(jwt_user.get("userId", ""))
+    if not _is_email_verified(u):
+        return JSONResponse(status_code=403, content={"error": "Verify your email first."})
+    invite = await mongo_db.org_invites.find_one(
+        {"email": u["email"].strip().lower(), "status": "pending"}, sort=[("createdAt", -1)])
+    if not invite:
+        return JSONResponse(status_code=404, content={"error": "No team has added this email yet."})
+    payload, e = await _accept_invite(uid, u, invite)
+    return e if e else payload
+
+
+@app.post("/api/team/invites/{invite_id}/accept")
+async def team_invite_accept(request: Request, invite_id: str):
+    jwt_user, u, err = await _team_user(request)
+    if err:
+        return err
+    try:
+        invite = await mongo_db.org_invites.find_one({"_id": ObjectId(invite_id)})
+    except Exception:
+        invite = None
+    if not invite:
+        return JSONResponse(status_code=404, content={"error": "This invitation is no longer available."})
+    payload, e = await _accept_invite(str(jwt_user.get("userId", "")), u, invite)
+    return e if e else payload
+
+
+@app.post("/api/team/invites/{invite_id}/decline")
+async def team_invite_decline(request: Request, invite_id: str):
+    jwt_user, u, err = await _team_user(request)
+    if err:
+        return err
+    if not _is_email_verified(u):
+        return JSONResponse(status_code=403, content={"error": "Verify your email first."})
+    try:
+        res = await mongo_db.org_invites.update_one(
+            {"_id": ObjectId(invite_id), "email": u["email"].strip().lower(), "status": "pending"},
+            {"$set": {"status": "declined", "declinedAt": datetime.now()}})
+    except Exception:
+        res = None
+    if not res or not res.matched_count:
+        return JSONResponse(status_code=404, content={"error": "This invitation is no longer available."})
+    await log_audit(str(jwt_user.get("userId", "")), "org.invite_declined", "organization", invite_id)
+    return {"success": True}
+
+
+@app.get("/api/workspaces")
+async def list_workspaces(request: Request):
+    jwt_user = require_user(request)
+    if not jwt_user:
+        return JSONResponse(status_code=401, content={"error": "Not signed in."})
+    if mongo_db is None:
+        return JSONResponse(status_code=503, content={"error": "MongoDB not configured"})
+    items, active_id = await _workspace_list(str(jwt_user.get("userId", "")))
+    return {"workspaces": items, "activeOrgId": str(active_id) if active_id else None}
+
+
+@app.post("/api/workspaces/switch")
+async def switch_workspace(request: Request, body: dict):
+    jwt_user = require_user(request)
+    if not jwt_user:
+        return JSONResponse(status_code=401, content={"error": "Not signed in."})
+    if mongo_db is None:
+        return JSONResponse(status_code=503, content={"error": "MongoDB not configured"})
+    uid = str(jwt_user.get("userId", ""))
+    try:
+        org_id = ObjectId(str(body.get("orgId", "")))
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Invalid workspace."})
+    m = await mongo_db.org_members.find_one({"userId": uid, "orgId": org_id, "status": "active"})
+    if not m:
+        return JSONResponse(status_code=403, content={"error": "You are not a member of that workspace."})
+    await mongo_db.org_prefs.update_one({"userId": uid}, {"$set": {"userId": uid, "activeOrgId": org_id}}, upsert=True)
+    _org_cache.pop(uid, None)
+    await log_audit(uid, "org.workspace_switched", "organization", str(org_id), metadata={"roleKey": m.get("roleKey")})
+    return {"success": True, "orgId": str(org_id)}
+
+
+@app.post("/api/workspaces/{org_id}/leave")
+async def leave_workspace(request: Request, org_id: str):
+    jwt_user = require_user(request)
+    if not jwt_user:
+        return JSONResponse(status_code=401, content={"error": "Not signed in."})
+    if mongo_db is None:
+        return JSONResponse(status_code=503, content={"error": "MongoDB not configured"})
+    uid = str(jwt_user.get("userId", ""))
+    try:
+        oid = ObjectId(org_id)
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Invalid workspace."})
+    org = await mongo_db.organizations.find_one({"_id": oid}) or {}
+    if _is_personal_org(org, uid):
+        return JSONResponse(status_code=400, content={"error": "You can't leave your own personal workspace."})
+    m = await mongo_db.org_members.find_one({"userId": uid, "orgId": oid, "status": "active"})
+    if not m:
+        return JSONResponse(status_code=404, content={"error": "You are not a member of that workspace."})
+    if m.get("roleKey") == "owner":
+        return JSONResponse(status_code=400, content={"error": "The owner can't leave. Transfer ownership first."})
+    await mongo_db.org_members.update_one({"_id": m["_id"]}, {"$set": {"status": "left"}})
+    await mongo_db.org_prefs.delete_one({"userId": uid, "activeOrgId": oid})
+    await mongo_db.connections.update_many(
+        {"orgId": oid, "type": "sheets", "createdBy": uid},
+        {"$set": {"credentialsEncrypted": "", "status": "needs_reauth"}})
+    _org_cache.pop(uid, None)
+    await log_audit(uid, "org.member_left", "organization", org_id, severity="warning")
+    return {"success": True}
 
 
 @app.get("/api/team/status")
@@ -3195,19 +3479,25 @@ async def team_status(request: Request):
     ctx = await _get_ctx(request)
     if not ctx:
         return JSONResponse(status_code=401, content={"error": "Not signed in."})
+    uid = str(jwt_user.get("userId", ""))
     org = await mongo_db.organizations.find_one({"_id": ctx["orgId"]}) or {}
     verified = _is_email_verified(u)
+    workspaces, active_id = await _workspace_list(uid)
     out = {
         "emailVerified": verified,
-        "joined": not str(org.get("slug", "")).startswith("personal-"),
+        "joined": any(not w["personal"] for w in workspaces),   # belongs to at least one team
         "orgName": await _org_label(org),
         "roleLabel": ROLE_LABELS.get(ctx["roleKey"], ctx["roleKey"]),
         "canManage": bool(ctx["permissions"].get("org.manageMembers")),
+        "activeOrgId": str(active_id) if active_id else None,
+        "activeIsPersonal": _is_personal_org(org, uid),
+        "workspaces": workspaces,
+        "pendingInvites": [],
+        "pendingTeam": False,
     }
     if verified:  # never reveal "a team is waiting for this email" to an unverified account
-        out["pendingTeam"] = await mongo_db.org_invites.count_documents(
-            {"email": u["email"].strip().lower(), "status": "pending"}
-        ) > 0
+        out["pendingInvites"] = await _my_pending_invites(u)
+        out["pendingTeam"] = len(out["pendingInvites"]) > 0
     return out
 
 
@@ -3248,6 +3538,9 @@ AUDIT_ACTION_CATEGORY = {
     "org.invite_revoked": "security",
         "org.email_approved": "security",
         "org.member_joined": "security",
+        "org.invite_declined": "security",
+        "org.member_left": "security",
+        "org.workspace_switched": "security",
 }
 
 def _diff_dict(old: dict, new: dict, ignore: set = frozenset()) -> dict | None:
