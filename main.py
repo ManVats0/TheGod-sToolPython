@@ -787,6 +787,7 @@ async def list_connections(request: Request):
         return err
     cursor = mongo_db.connections.find({"orgId": ctx["orgId"]}).sort("createdAt", -1)
     docs = await cursor.to_list(length=500)
+    docs = [d for d in docs if _conn_allowed(ctx, d)]
     return [serialize_doc(d, drop=["credentialsEncrypted"]) for d in docs]
 
 
@@ -954,9 +955,47 @@ async def delete_connection(request: Request, connection_id: str):
     if not can_delete:
         return _require_perm(ctx, "connection.delete")
     result = await mongo_db.connections.delete_one({"_id": oid, "orgId": ctx["orgId"]})
+    if result.deleted_count and doc.get("type") == "csv":
+        await _delete_gridfs_file((doc.get("config") or {}).get("fileId"))
     await log_audit(ctx["userId"], "connection.deleted", "connection", connection_id,
                     resource_name=doc.get("name", ""), severity="warning")
     return {"success": result.deleted_count > 0}
+
+
+@app.put("/api/connections/{connection_id}/access")
+async def set_connection_access(request: Request, connection_id: str, body: dict):
+    """Owner/Admin: choose who can use this data source. mode 'workspace' = everyone whose role allows it;
+    'restricted' = only the listed people (plus the creator and Owners/Admins)."""
+    if mongo_db is None:
+        return JSONResponse(status_code=503, content={"error": "MongoDB not configured"})
+    ctx, err = await _auth(request, "connection.edit")
+    if err:
+        return err
+    try:
+        oid = ObjectId(connection_id)
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Invalid connection id"})
+    mode = str(body.get("mode") or "")
+    if mode not in ("workspace", "restricted"):
+        return JSONResponse(status_code=400, content={"error": "mode must be 'workspace' or 'restricted'."})
+    raw_ids = body.get("userIds") or []
+    if not isinstance(raw_ids, list):
+        return JSONResponse(status_code=400, content={"error": "userIds must be a list."})
+    user_ids = sorted({str(u) for u in raw_ids}) if mode == "restricted" else []
+    if user_ids:
+        n = await mongo_db.org_members.count_documents(
+            {"orgId": ctx["orgId"], "status": "active", "userId": {"$in": user_ids}})
+        if n != len(user_ids):
+            return JSONResponse(status_code=400, content={"error": "Everyone you add must be an active member of this workspace."})
+    doc = await mongo_db.connections.find_one({"_id": oid, "orgId": ctx["orgId"]}, {"name": 1})
+    if not doc:
+        return JSONResponse(status_code=404, content={"error": "Data source not found."})
+    access = {"mode": mode, "userIds": user_ids, "updatedBy": ctx["userId"], "updatedAt": datetime.now().isoformat()}
+    await mongo_db.connections.update_one({"_id": oid}, {"$set": {"access": access, "updatedAt": datetime.now()}})
+    await log_audit(ctx["userId"], "connection.access_updated", "connection", connection_id,
+                    metadata={"mode": mode, "people": len(user_ids)}, resource_name=doc.get("name", ""),
+                    severity="warning" if mode == "restricted" else "info")
+    return {"success": True, "access": access}
 
 @app.post("/api/connections/{connection_id}/retention")
 async def set_connection_retention(request: Request, connection_id: str, body: dict):
@@ -1103,7 +1142,49 @@ async def get_decrypted_connection(connection_id: str, org_id, legacy_user_id: s
         "type": doc.get("type", ""),
         "config": {**doc.get("config", {}), "_connectionId": str(doc["_id"])},
         "credentials": creds,
+        "createdBy": doc.get("createdBy"),
+        "access": doc.get("access"),
     }
+
+
+def _conn_allowed(ctx: dict, conn: dict) -> bool:
+    """Per-source access. 'workspace' (default): everyone whose role allows it. 'restricted': only the
+    people named on the source, whoever created it, and Owners/Admins (connection.edit)."""
+    acc = (conn or {}).get("access") or {}
+    if acc.get("mode") != "restricted":
+        return True
+    if ctx["permissions"].get("connection.edit"):
+        return True
+    if (conn or {}).get("createdBy") == ctx["userId"]:
+        return True
+    return ctx["userId"] in (acc.get("userIds") or [])
+
+
+_RESTRICTED_MSG = "This data source is restricted. Ask an Owner or Admin to give you access."
+
+
+async def _assert_conn_allowed(ctx: dict, connection_id):
+    """None if the caller may use this connection, else a 403 response."""
+    try:
+        oid = ObjectId(str(connection_id))
+    except Exception:
+        return None  # downstream code reports the bad id
+    doc = await mongo_db.connections.find_one(
+        {"_id": oid, "orgId": ctx["orgId"]}, {"access": 1, "createdBy": 1})
+    if doc and not _conn_allowed(ctx, doc):
+        return JSONResponse(status_code=403, content={"error": _RESTRICTED_MSG})
+    return None
+
+
+async def _delete_gridfs_file(file_id) -> bool:
+    """Deletes an uploaded CSV's stored bytes. Best effort; never raises."""
+    try:
+        from motor.motor_asyncio import AsyncIOMotorGridFSBucket
+        await AsyncIOMotorGridFSBucket(mongo_db).delete(ObjectId(str(file_id)))
+        return True
+    except Exception as e:
+        print(f"GridFS delete failed for {file_id}: {e}")
+        return False
 
 
 async def _erase_connection_data(conn_type: str, cfg: dict, creds: dict) -> dict:
@@ -1115,6 +1196,9 @@ async def _erase_connection_data(conn_type: str, cfg: dict, creds: dict) -> dict
     and never raises — callers must check "success".
     """
     try:
+        if conn_type == "csv":
+            ok = await _delete_gridfs_file(cfg.get("fileId"))
+            return {"success": ok, "detail": "Deleted the uploaded file." if ok else "Could not delete the uploaded file."}
         if conn_type == "mysql" or (conn_type == "cloudsql" and cfg.get("dbType", "postgres") == "mysql"):
             import aiomysql, ssl as ssl_lib
             host = cfg.get("instanceConnectionName") or cfg.get("host", "")
@@ -1334,13 +1418,25 @@ async def save_pipeline(request: Request, body: dict):
     # Flow.tsx "Save Pipeline" button) so a pipeline someone marked
     # pending_approval doesn't silently flip back to approved just because
     # it was re-saved without explicitly touching status.
-    existing_status = "approved"
+    for _cid in (body.get("sourceConnectionId"), body.get("destinationConnectionId")):
+        if _cid:
+            _denied_conn = await _assert_conn_allowed(ctx, _cid)
+            if _denied_conn:
+                return _denied_conn
+    # Workspace policy: when "require approval" is on, anything built or changed by someone who cannot
+    # approve waits for a Steward / Admin / Owner before it can run or be scheduled.
+    _org_row = await mongo_db.organizations.find_one({"_id": ctx["orgId"]}) or {}
+    needs_review = bool((_org_row.get("settings") or {}).get("requirePipelineApproval")) \
+        and not ctx["permissions"].get("pipeline.approve")
+    existing_status = "pending_approval" if (needs_review and not pipeline_id) else "approved"
     if pipeline_id:
         prev_status_doc = await mongo_db.pipelines.find_one(
             {"_id": ObjectId(pipeline_id), "orgId": ctx["orgId"]}, {"status": 1}
         )
         if prev_status_doc:
             existing_status = prev_status_doc.get("status", "approved")
+        if needs_review and existing_status == "approved":
+            existing_status = "pending_approval"
     payload = {
         "orgId": ctx["orgId"],
         "name": body.get("name", ""),
@@ -2330,6 +2426,11 @@ async def execute_pipeline_route(request: Request, pipeline_id: str):
         return {"error": "Pipeline not found"}
     if pipeline.get("status", "approved") in ("pending_approval", "rejected"):
         return {"status": "failed", "error": "Pipeline is not approved and cannot be run until approved."}
+    for _cid in (pipeline.get("sourceConnectionId"), pipeline.get("destinationConnectionId")):
+        if _cid:
+            _denied_conn = await _assert_conn_allowed(ctx, _cid)
+            if _denied_conn:
+                return _denied_conn
     got_lock = await _try_acquire_pipeline_lock(pipeline_id, ttl_seconds=600)
     if not got_lock:
         return {"status": "failed", "error": "Pipeline is already running (scheduled or manual run in progress)."}
@@ -2825,8 +2926,24 @@ async def get_my_org(request: Request):
         "userId": ctx["userId"],
         "role": ctx["roleKey"],
         "permissions": ctx["permissions"],
+        "settings": {"requirePipelineApproval": bool((org.get("settings") or {}).get("requirePipelineApproval"))},
         **({"seats": await _seat_usage(ctx["orgId"])} if ctx["permissions"].get("org.manageMembers") else {}),
     }
+
+
+@app.put("/api/org/settings")
+async def update_org_settings(request: Request, body: dict):
+    """Owner/Admin: workspace policies."""
+    ctx, err = await _auth(request, "org.manageMembers")
+    if err:
+        return err
+    if "requirePipelineApproval" not in body or not isinstance(body["requirePipelineApproval"], bool):
+        return JSONResponse(status_code=400, content={"error": "requirePipelineApproval must be true or false."})
+    await mongo_db.organizations.update_one(
+        {"_id": ctx["orgId"]}, {"$set": {"settings.requirePipelineApproval": body["requirePipelineApproval"]}})
+    await log_audit(ctx["userId"], "org.settings_updated", "organization", str(ctx["orgId"]),
+                    metadata={"requirePipelineApproval": body["requirePipelineApproval"]}, severity="warning")
+    return {"success": True, "settings": {"requirePipelineApproval": body["requirePipelineApproval"]}}
 
 
 @app.get("/api/org/members")
@@ -3541,6 +3658,8 @@ AUDIT_ACTION_CATEGORY = {
         "org.invite_declined": "security",
         "org.member_left": "security",
         "org.workspace_switched": "security",
+        "org.settings_updated": "security",
+        "connection.access_updated": "connection",
 }
 
 def _diff_dict(old: dict, new: dict, ignore: set = frozenset()) -> dict | None:
@@ -4152,6 +4271,8 @@ async def analyze(
     if connection_id and not mysql_host:
         if analyze_ctx:
             conn = await get_decrypted_connection(connection_id, analyze_ctx["orgId"])
+            if conn and not _conn_allowed(analyze_ctx, conn):
+                return JSONResponse(status_code=403, content={"error": _RESTRICTED_MSG})
             if conn:
                 creds = conn.get("credentials", {})
                 cfg = conn.get("config", {})
@@ -4195,6 +4316,8 @@ async def analyze(
             return JSONResponse(status_code=400, content={"error": "Invalid connection id"})
         if not _c:
             return JSONResponse(status_code=404, content={"error": "Connection not found"})
+        if not _conn_allowed(analyze_ctx, _c):
+            return JSONResponse(status_code=403, content={"error": _RESTRICTED_MSG})
         if _c["type"] not in ("mysql", "postgres", "mongodb"):
             _cfg = dict(_c.get("config", {}))
             # frontend passes the chosen table/file/endpoint in mysql_table (reused field)
@@ -8918,6 +9041,8 @@ async def write_to_source(
             return JSONResponse(status_code=400, content={"success": False, "error": "Invalid connection id"})
         if not _c:
             return JSONResponse(status_code=404, content={"success": False, "error": "Connection not found"})
+        if not _conn_allowed(ctx, _c):
+            return JSONResponse(status_code=403, content={"success": False, "error": _RESTRICTED_MSG})
         _cfg = dict(_c.get("config", {}))
         if target:
             _cfg["table"] = target
