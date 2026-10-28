@@ -72,12 +72,23 @@ def decrypt_credentials(token: str) -> dict:
 def require_user(request: Request) -> dict | None:
     return verify_jwt_token(request.headers.get("Authorization", ""))
 
+def _stringify_ids(value):
+    """MongoDB ObjectIds (orgId, ids inside lists, ...) cannot be encoded by FastAPI: any response that
+    still contains one fails with a 500. Turn every ObjectId, at any depth, into its string form."""
+    if isinstance(value, ObjectId):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _stringify_ids(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_stringify_ids(v) for v in value]
+    return value
+
 def serialize_doc(doc: dict, drop: list | None = None) -> dict:
     doc = dict(doc)
     doc["_id"] = str(doc["_id"])
     for f in (drop or []):
         doc.pop(f, None)
-    return doc
+    return _stringify_ids(doc)
 
 def verify_jwt_token(authorization_header: str = "") -> dict | None:
     """
