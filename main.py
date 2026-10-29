@@ -211,6 +211,167 @@ threading.Thread(target=_warmup_credentials, daemon=True).start()
 
 app = FastAPI()
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Plans, locks and free-tier limits
+# Everything below is decided HERE, on the server, from the database - never from what the browser says
+# (the browser's copy of the plan can be edited in the inspector, so it is only used to decide what to show).
+#   * PLAN_LOCKS=off  (Railway variable) switches every lock off instantly, e.g. if something misbehaves.
+#   * ADMIN_EMAILS    comma-separated founder/admin emails that get full access for free. Lives only in Railway.
+# ══════════════════════════════════════════════════════════════════════════════
+from datetime import timezone
+PAID_PLANS = frozenset({"trial", "lite", "starter", "pro", "team", "enterprise"})
+FREE_SOURCE_TYPES = frozenset({"csv", "sheets"})
+FREE_LIMITS = {
+    "maxSources": 3,                    # saved data sources (CSV files + Google Sheets together)
+    "maxCsvBytes": 5 * 1024 * 1024,     # largest CSV that can be stored
+    "maxCleanRows": 5000,               # rows cleaned / exported per run on the server
+    "maxPipelines": 1,                  # saved pipelines (manual only: no schedule, no server runs)
+    "teamSeats": 1,                     # just you: no invites
+}
+PLAN_LOCKS_ENABLED = os.getenv("PLAN_LOCKS", "on").strip().lower() not in ("off", "0", "false", "no")
+ENFORCE_PLAN_EXPIRY = os.getenv("ENFORCE_PLAN_EXPIRY", "").strip().lower() in ("1", "true", "yes")
+
+# Connector routes that only paying (or trial) workspaces may call. CSV and Google Sheets are not in this list.
+LOCKED_PREFIXES = {
+    "/api/mysql/": "MySQL", "/api/postgres/": "PostgreSQL", "/api/bigquery/": "BigQuery",
+    "/api/cloudsql/": "Cloud SQL", "/api/gcs/": "Google Cloud Storage", "/api/databricks/": "Databricks",
+    "/api/rest/": "REST API", "/api/aws/": "AWS", "/api/mongo/": "MongoDB", "/api/ga4/": "Google Analytics",
+}
+
+
+def _admin_emails() -> set:
+    return {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()}
+
+
+def _as_naive_utc(value):
+    """planExpiresAt may arrive as a naive datetime, an aware datetime or an ISO string."""
+    try:
+        if isinstance(value, str):
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if value is not None and getattr(value, "tzinfo", None) is not None:
+            value = value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
+    except Exception:
+        return None
+
+
+def _plan_from_user_doc(u: dict | None) -> str:
+    """The plan this account is really on right now. An unfinished trial counts, a finished one does not."""
+    if not u:
+        return "none"
+    if (u.get("email") or "").strip().lower() in _admin_emails():
+        return "enterprise"
+    plan = u.get("plan") or "none"
+    exp = _as_naive_utc(u.get("planExpiresAt"))
+    now = datetime.utcnow()
+    if plan == "trial" and exp is not None and exp < now:
+        return "none"
+    if plan in PAID_PLANS and plan != "trial" and ENFORCE_PLAN_EXPIRY and exp is not None \
+            and exp + timedelta(days=3) < now:
+        return "none"
+    return plan if plan in PAID_PLANS else "none"
+
+
+async def _plan_of_org(org_id) -> str:
+    """Teams run on the plan of the workspace OWNER."""
+    org = await mongo_db.organizations.find_one({"_id": org_id}) or {}
+    owner = None
+    try:
+        owner = await mongo_db.users.find_one({"_id": ObjectId(str(org.get("ownerId", "")))})
+    except Exception:
+        owner = None
+    return _plan_from_user_doc(owner)
+
+
+async def _effective_plan(user_id: str) -> str:
+    """Plan that applies to this person in their ACTIVE workspace (founder/admin emails get everything)."""
+    try:
+        me = await mongo_db.users.find_one({"_id": ObjectId(str(user_id))})
+    except Exception:
+        me = None
+    if me and (me.get("email") or "").strip().lower() in _admin_emails():
+        return "enterprise"
+    m = await _resolve_membership(str(user_id))
+    if m:
+        return await _plan_of_org(m["orgId"])
+    return _plan_from_user_doc(me)
+
+
+async def _plan_from_request(request: Request) -> str:
+    """'none' when there is no valid login. If the database itself fails we fail OPEN (treated as paid) so a
+    hiccup never locks a paying customer out."""
+    payload = verify_jwt_token(request.headers.get("Authorization", ""))
+    if not payload or not payload.get("userId"):
+        return "none"
+    if mongo_db is None:
+        return "enterprise"
+    try:
+        return await _effective_plan(str(payload["userId"]))
+    except Exception as e:
+        print(f"⚠ plan lookup failed, allowing request: {e}")
+        return "enterprise"
+
+
+def _is_paid(plan: str) -> bool:
+    return plan in PAID_PLANS or not PLAN_LOCKS_ENABLED
+
+
+def _upgrade_response(feature: str, message: str, status: int = 402):
+    return JSONResponse(status_code=status, content={
+        "error": message, "code": "upgrade_required", "feature": feature, "upgradeUrl": "/pricing"})
+
+
+async def _free_source_gate(ctx: dict, conn_type: str, size_bytes: int | None = None):
+    """None if the workspace may add this source, else a 402 explaining which limit was hit."""
+    plan = await _effective_plan(ctx["userId"])
+    if _is_paid(plan):
+        return None
+    if conn_type not in FREE_SOURCE_TYPES:
+        return _upgrade_response("connectors", "Database and cloud connectors are part of the paid plans. "
+                                 "CSV files and Google Sheets are free - upgrade to connect more.")
+    have = await mongo_db.connections.count_documents({"orgId": ctx["orgId"]})
+    if have >= FREE_LIMITS["maxSources"]:
+        return _upgrade_response("sources", f"The free plan keeps up to {FREE_LIMITS['maxSources']} saved sources. "
+                                 "Delete one, or upgrade for unlimited sources.")
+    if size_bytes is not None and size_bytes > FREE_LIMITS["maxCsvBytes"]:
+        mb = FREE_LIMITS["maxCsvBytes"] // (1024 * 1024)
+        return _upgrade_response("csv_size", f"Free plan CSV files can be up to {mb} MB. Upgrade to upload larger files.")
+    return None
+
+
+def _cap_rows(df, plan: str):
+    """(df, info). Free runs work on the first N rows; the response says so, so the app can offer an upgrade."""
+    limit = FREE_LIMITS["maxCleanRows"]
+    total = len(df)
+    if _is_paid(plan) or total <= limit:
+        return df, None
+    return df.head(limit).copy(), {"truncated": True, "rowLimit": limit, "totalRows": total}
+
+
+from starlette.middleware.base import BaseHTTPMiddleware as _PlanBase
+
+
+class PlanGateMiddleware(_PlanBase):
+    """Blocks the paid connector routes for free workspaces. Registered BEFORE CORS so the 'upgrade' response still
+    carries CORS headers (otherwise the browser would show a vague network error instead of the message)."""
+
+    async def dispatch(self, request, call_next):
+        path = request.url.path
+        if PLAN_LOCKS_ENABLED and request.method != "OPTIONS":
+            for prefix, label in LOCKED_PREFIXES.items():
+                if path.startswith(prefix):
+                    plan = await _plan_from_request(request)
+                    if plan not in PAID_PLANS:
+                        return _upgrade_response(
+                            "connectors",
+                            f"{label} is part of the paid plans. CSV files and Google Sheets are free - "
+                            f"upgrade to unlock {label} and every other connector.")
+                    break
+        return await call_next(request)
+
+
+app.add_middleware(PlanGateMiddleware)
+
 import os as _os
 
 _allowed_origins = [
@@ -788,6 +949,26 @@ async def test_jwt_auth(request: Request):
 
 
 
+# ── What the signed-in person may do (the app uses this only to decide what to SHOW; the server enforces) ──
+@app.get("/api/entitlements")
+async def entitlements(request: Request):
+    ctx, err = await _auth(request)
+    if err:
+        return err
+    plan = await _effective_plan(ctx["userId"])
+    paid = _is_paid(plan)
+    return {
+        "plan": plan,
+        "paid": paid,
+        "freeSourceTypes": sorted(FREE_SOURCE_TYPES),
+        "limits": None if paid else FREE_LIMITS,
+        "usage": {
+            "sources": await mongo_db.connections.count_documents({"orgId": ctx["orgId"]}),
+            "pipelines": await mongo_db.pipelines.count_documents({"orgId": ctx["orgId"]}),
+        },
+    }
+
+
 # ── Connections ───────────────────────────────────────────────────────────
 @app.get("/api/connections")
 async def list_connections(request: Request):
@@ -817,6 +998,9 @@ async def create_connection(request: Request, body: dict):
     credentials = body.get("credentials", {})
     if not name or not conn_type:
         return {"error": "name and type are required"}
+    _blocked = await _free_source_gate(ctx, conn_type)
+    if _blocked:
+        return _blocked
 
     doc = {
         "userId": ctx["userId"],
@@ -847,6 +1031,9 @@ async def upload_csv_connection(request: Request, file: UploadFile = File(...)):
     data = await file.read()
     if len(data) > 50 * 1024 * 1024:
         return JSONResponse(status_code=413, content={"error": "File too large (max 50 MB)."})
+    _blocked = await _free_source_gate(ctx, "csv", len(data))
+    if _blocked:
+        return _blocked
     try:
         pd.read_csv(io.BytesIO(data), nrows=5)
     except Exception as e:
@@ -886,6 +1073,9 @@ async def create_google_sheets_connection(request: Request, body: dict):
     tab = str(body.get("tab") or "").strip()
     if not sheet_id or not sheet_name:
         return JSONResponse(status_code=400, content={"error": "sheetId and sheetName are required."})
+    _blocked = await _free_source_gate(ctx, "sheets")
+    if _blocked:
+        return _blocked
     _sid, tokens = await _owned_google_session(request, ctx, str(body.get("sessionId") or "").strip())
     refresh_token = tokens.get("refresh_token") or ""
     if not refresh_token:
@@ -1425,6 +1615,14 @@ async def save_pipeline(request: Request, body: dict):
     denied = _require_perm(ctx, "pipeline.edit" if pipeline_id else "pipeline.create")
     if denied:
         return denied
+    _plan = await _effective_plan(ctx["userId"])
+    if not _is_paid(_plan):
+        if body.get("isActive"):
+            return _upgrade_response("scheduling", "Scheduled pipelines are part of the paid plans. "
+                                     "You can still build and run this one by hand on the free plan.")
+        if not pipeline_id and await mongo_db.pipelines.count_documents({"orgId": ctx["orgId"]}) >= FREE_LIMITS["maxPipelines"]:
+            return _upgrade_response("pipelines", f"The free plan keeps {FREE_LIMITS['maxPipelines']} saved pipeline. "
+                                     "Delete it, or upgrade to save as many as you like.")
     # Preserve an existing approval status across ordinary edits (e.g. the
     # Flow.tsx "Save Pipeline" button) so a pipeline someone marked
     # pending_approval doesn't silently flip back to approved just because
@@ -2432,6 +2630,8 @@ async def execute_pipeline_route(request: Request, pipeline_id: str):
     ctx, err = await _auth(request, "pipeline.execute")
     if err:
         return err
+    if not _is_paid(await _effective_plan(ctx["userId"])):
+        return _upgrade_response("pipeline_runs", "Running saved pipelines on our servers is part of the paid plans.")
     pipeline = await mongo_db.pipelines.find_one({"_id": ObjectId(pipeline_id), "orgId": ctx["orgId"]})
     if not pipeline:
         return {"error": "Pipeline not found"}
@@ -2556,6 +2756,12 @@ async def _scheduler_loop():
                         except Exception:
                             pass
 
+                    if due and PLAN_LOCKS_ENABLED and pipeline.get("orgId") is not None:
+                        try:
+                            if not _is_paid(await _plan_of_org(pipeline["orgId"])):
+                                due = False   # free workspaces do not get scheduled server runs
+                        except Exception:
+                            pass
                     if due:
                         got_lock = await _try_acquire_pipeline_lock(pid, ttl_seconds=max(300, int(interval_ms / 1000)))
                         if got_lock:
@@ -3155,6 +3361,14 @@ async def _seat_usage(org_id) -> dict:
 
 async def _seat_error(org_id, extra: int = 1, count_pending: bool = True):
     """A 403 response if adding `extra` more people would exceed the owner's plan, else None."""
+    if PLAN_LOCKS_ENABLED:
+        # Free workspaces are just you. This holds even when seat counting (ENFORCE_SEAT_LIMITS) is off.
+        try:
+            if not _is_paid(await _plan_of_org(org_id)):
+                return _upgrade_response("team", "Adding teammates is part of the paid plans. "
+                                         "Upgrade to invite people and give them roles.")
+        except Exception as e:
+            print(f"⚠ team plan check failed, allowing: {e}")
     if not ENFORCE_SEAT_LIMITS:
         return None
     u = await _seat_usage(org_id)
@@ -5044,6 +5258,7 @@ async def preview_transform(
 
 @app.post("/api/clean-data")
 async def clean_data(
+    request: Request,
     file: UploadFile = File(...),
     remove_duplicates: str = Form("false"),
     remove_empty_rows: str = Form("false"),
@@ -5059,6 +5274,8 @@ async def clean_data(
 ):
     contents = await file.read()
     df = pd.read_csv(io.BytesIO(contents))
+    # Free workspaces (and anyone not logged in) clean the first rows only; paid plans are never capped.
+    df, _row_cap = _cap_rows(df, await _plan_from_request(request))
     original_shape = list(df.shape)
 
     if remove_duplicates == "true":
@@ -5210,6 +5427,7 @@ Reply with ONLY the Python code, nothing else, no markdown, no backticks."""
     preview_columns = list(df.columns)
 
     return {
+        "row_limit": _row_cap,
         "original_shape": original_shape,
         "cleaned_shape": list(df.shape),
         "download_url": f"/api/download/{filename}",
@@ -5228,6 +5446,7 @@ Reply with ONLY the Python code, nothing else, no markdown, no backticks."""
 
 @app.post("/api/sql-clean")
 async def sql_clean(
+    request: Request,
     file: UploadFile = File(...),
     sql: str = Form(...),
     preview_only: str = Form("false"),
@@ -5252,6 +5471,7 @@ async def sql_clean(
     contents = await file.read()
     try:
         df = pd.read_csv(io.BytesIO(contents))
+        df, _row_cap = _cap_rows(df, await _plan_from_request(request))
         original_shape = list(df.shape)
     except Exception as e:
         return {"success": False, "error": f"Could not read source CSV: {e}"}
@@ -5267,6 +5487,7 @@ async def sql_clean(
     if preview_only == "true":
         return {
             "success": True,
+            "row_limit": _row_cap,
             "original_shape": original_shape,
             "cleaned_shape": list(result_df.shape),
             "preview_data": result_df.head(100).fillna("").to_dict("records"),
@@ -5277,6 +5498,7 @@ async def sql_clean(
     result_df.to_csv(os.path.join(UPLOAD_DIR, filename), index=False)
     return {
         "success": True,
+        "row_limit": _row_cap,
         "original_shape": original_shape,
         "cleaned_shape": list(result_df.shape),
         "download_url": f"/api/download/{filename}",
@@ -9039,6 +9261,9 @@ async def write_to_source(
     target: str = Form(""),
 ):
     import io as _io
+    if not _is_paid(await _plan_from_request(request)) and (connection_id or source_type != "sheets"):
+        return _upgrade_response("write_back", "Sending cleaned data back to databases and cloud destinations is part "
+                                 "of the paid plans. Downloading it, or writing back to a Google Sheet, stays free.")
     contents = await file.read()
     csv_text = contents.decode("utf-8", errors="replace")
 
