@@ -969,6 +969,94 @@ async def entitlements(request: Request):
     }
 
 
+# ── Dashboard: one call that powers the landing page ─────────────────────────
+def _iso(d):
+    try:
+        return d.isoformat() if d else None
+    except Exception:
+        return None
+
+
+@app.get("/api/dashboard")
+async def dashboard(request: Request):
+    """Everything the landing page shows about THIS workspace. Each section honours the caller's role:
+    a section the person may not see is returned as null, never partially."""
+    if mongo_db is None:
+        return JSONResponse(status_code=503, content={"error": "MongoDB not configured"})
+    ctx, err = await _auth(request)
+    if err:
+        return err
+    perms = ctx["permissions"]
+    org_id = ctx["orgId"]
+    now = datetime.now()
+    out: dict = {"role": ctx["roleKey"], "sources": None, "pipelines": None, "runs": None, "team": None, "activity": None}
+
+    org = await mongo_db.organizations.find_one({"_id": org_id}) or {}
+    out["workspace"] = {"name": org.get("name", ""), "personal": str(org.get("slug", "")).startswith("personal-")}
+
+    if perms.get("connection.view"):
+        docs = await mongo_db.connections.find({"orgId": org_id}).to_list(length=1000)
+        docs = [d for d in docs if _conn_allowed(ctx, d)]
+        by_type: dict = {}
+        for d in docs:
+            by_type[d.get("type", "other")] = by_type.get(d.get("type", "other"), 0) + 1
+        out["sources"] = {"total": len(docs), "byType": by_type}
+
+    pipelines = []
+    if perms.get("pipeline.view"):
+        pipelines = await mongo_db.pipelines.find({"orgId": org_id}).sort("updatedAt", -1).to_list(length=500)
+        out["pipelines"] = {
+            "total": len(pipelines),
+            "active": sum(1 for p in pipelines if p.get("isActive")),
+            "pendingApproval": sum(1 for p in pipelines if p.get("status") == "pending_approval"),
+            "items": [{
+                "id": str(p["_id"]), "name": p.get("name", "Untitled"),
+                "sourceName": p.get("sourceName", ""), "destinationName": p.get("destinationName", ""),
+                "isActive": bool(p.get("isActive")), "status": p.get("status", "approved"),
+                "scheduleLabel": p.get("scheduleLabel"), "lastRun": _iso(p.get("lastRun")),
+                "runCount": int(p.get("runCount") or 0),
+            } for p in pipelines[:6]],
+        }
+        ids = [str(p["_id"]) for p in pipelines]
+        names = {str(p["_id"]): p.get("name", "Untitled") for p in pipelines}
+        runs = []
+        if ids:
+            since = now - timedelta(days=7)
+            runs = await mongo_db.runs.find({"pipelineId": {"$in": ids}, "ts": {"$gte": since}}).sort("ts", -1).to_list(length=500)
+        ok = [r for r in runs if r.get("status") in ("success", "succeeded", "ok", "completed")]
+        out["runs"] = {
+            "last7": {"total": len(runs), "success": len(ok), "failed": sum(1 for r in runs if r.get("status") in ("failed", "error")),
+                      "rowsOut": int(sum(int(r.get("rowsOut") or 0) for r in ok))},
+            "recent": [{
+                "ts": _iso(r.get("ts")), "pipelineName": names.get(r.get("pipelineId"), "Pipeline"),
+                "status": r.get("status", ""), "rowsOut": int(r.get("rowsOut") or 0),
+                "durationMs": int(r.get("durationMs") or 0), "triggeredBy": r.get("triggeredBy", ""),
+            } for r in runs[:6]],
+        }
+
+    if perms.get("org.manageMembers"):
+        out["team"] = {
+            "members": await mongo_db.org_members.count_documents({"orgId": org_id, "status": "active"}),
+            "pending": await mongo_db.org_invites.count_documents({"orgId": org_id, "status": "pending"}),
+        }
+
+    if perms.get("audit.view"):
+        logs = await mongo_db.audit_logs.find({"orgId": org_id}).sort("createdAt", -1).limit(6).to_list(length=6)
+        out["activity"] = [{
+            "action": l.get("action", ""), "resourceName": l.get("resourceName", ""),
+            "severity": l.get("severity", "info"), "at": _iso(l.get("createdAt")),
+        } for l in logs]
+
+    plan = await _effective_plan(ctx["userId"])
+    paid = _is_paid(plan)
+    out["entitlements"] = {
+        "plan": plan, "paid": paid, "limits": None if paid else FREE_LIMITS,
+        "usage": {"sources": await mongo_db.connections.count_documents({"orgId": org_id}),
+                  "pipelines": await mongo_db.pipelines.count_documents({"orgId": org_id})},
+    }
+    return out
+
+
 # ── Connections ───────────────────────────────────────────────────────────
 @app.get("/api/connections")
 async def list_connections(request: Request):
