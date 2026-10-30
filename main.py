@@ -4182,6 +4182,16 @@ async def submit_contact(request: ContactFormRequest = Body(...)):
     if not name or not email or not message:
         return {"success": False, "error": "Name, email, and message are all required."}
 
+    # Quote requests from the homepage form start with this marker.
+    is_quote = message.startswith("QUOTE REQUEST")
+    name = name[:120]
+    message = message[:3000]
+    # Everything below goes into an HTML email, so escape what the visitor typed.
+    from html import escape as _esc
+    safe_name, safe_email = _esc(name), _esc(email[:200])
+    safe_message = _esc(message).replace("\n", "<br>")
+    heading = "New Quote Request" if is_quote else "New Contact Form Submission"
+
     try:
         import resend
         resend.api_key = os.getenv("RESEND_API_KEY", "")
@@ -4189,14 +4199,14 @@ async def submit_contact(request: ContactFormRequest = Body(...)):
             "from": "The Gods Tool <noreply@thegodstool.com>",
             "to": ["contact@thegodstool.com"],
             "reply_to": email,
-            "subject": f"New contact form message from {name}",
+            "subject": (f"Quote request from {name}" if is_quote else f"New contact form message from {name}").replace("\n", " "),
             "html": f"""
             <div style="font-family:sans-serif;max-width:600px;background:#f9f9f9;padding:20px;border-radius:8px;">
-            <h2 style="color:#333;margin-top:0;">New Contact Form Submission</h2>
-            <p style="margin:10px 0;"><strong>Name:</strong> {name}</p>
-            <p style="margin:10px 0;"><strong>Email:</strong> {email}</p>
+            <h2 style="color:#333;margin-top:0;">{heading}</h2>
+            <p style="margin:10px 0;"><strong>Name:</strong> {safe_name}</p>
+            <p style="margin:10px 0;"><strong>Email:</strong> {safe_email}</p>
             <p style="margin:10px 0;"><strong>Message:</strong></p>
-            <p style="background:#fff;padding:16px;border-left:4px solid #7c3aed;border-radius:4px;color:#555;margin:10px 0;">{message}</p>
+            <p style="background:#fff;padding:16px;border-left:4px solid #7c3aed;border-radius:4px;color:#555;margin:10px 0;">{safe_message}</p>
             </div> 
             """
         })
