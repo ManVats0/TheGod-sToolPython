@@ -761,8 +761,10 @@ def _diff_schema(prev_schema: dict, current_schema: dict) -> list:
     return alerts
 
 
-async def check_schema_drift(df, filename):
-    schema_key = hashlib.md5(filename.encode()).hexdigest()
+async def check_schema_drift(df, filename, scope=""):
+    # scope is the workspace id, so two workspaces that both upload "data.csv"
+    # each keep their own snapshot instead of overwriting one another.
+    schema_key = hashlib.md5(f"{scope}:{filename}".encode()).hexdigest()
     current_schema = {col: str(df[col].dtype) for col in df.columns}
 
     if mongo_db is None:
@@ -5004,7 +5006,7 @@ async def analyze(
     if alert_staleness == "true" and date_col:
         notifications.extend(check_staleness(df, date_col, freq_label, freq_days, filename_for_meta))
     if alert_schema == "true":
-        notifications.extend(await check_schema_drift(df, filename_for_meta))
+        notifications.extend(await check_schema_drift(df, filename_for_meta, str(analyze_ctx['orgId']) if analyze_ctx else ''))
     if alert_anomalies == "true":
         notifications.extend(check_anomalies(df))
     if alert_flow == "true":
