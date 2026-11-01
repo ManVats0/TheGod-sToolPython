@@ -2005,6 +2005,73 @@ async def _apply_sql_custom_step(df: pd.DataFrame, sql: str) -> tuple[pd.DataFra
         return df, f"SQL error: {e}"
 
 
+# ── Safe runner for AI-written pandas code ────────────────────────────────────
+# The model writes pandas code from a plain-English instruction. That text (and
+# the sample rows we send along) comes from users, so the code must never be
+# trusted: it is checked first and then run with a small set of builtins.
+import ast as _ast
+import builtins as _builtins
+
+_AI_ALLOWED_BUILTINS = {n: getattr(_builtins, n) for n in (
+    "len", "min", "max", "sum", "range", "round", "abs", "str", "int", "float", "bool",
+    "list", "dict", "set", "tuple", "sorted", "enumerate", "zip", "isinstance", "any", "all",
+    "map", "filter", "reversed", "slice", "divmod", "pow", "True", "False", "None",
+    "ValueError", "TypeError", "KeyError", "Exception", "object",
+)}
+_AI_BLOCKED_NAMES = {
+    "eval", "exec", "compile", "open", "input", "globals", "locals", "vars", "getattr", "setattr",
+    "delattr", "hasattr", "dir", "type", "super", "breakpoint", "help", "memoryview",
+    "os", "sys", "subprocess", "importlib", "shutil", "socket", "pathlib", "builtins", "ctypes",
+}
+_AI_BLOCKED_ATTRS = {"eval", "query", "system", "popen", "load", "loads", "save", "savez", "fromfile",
+                     "tofile", "loadtxt", "genfromtxt", "memmap", "ctypeslib", "testing", "f2py",
+                     "os", "sys", "io", "environ", "environb", "getenv", "modules", "compat", "util", "core", "lib",
+                     "DataSource", "pickle", "pickle_compat", "path", "listdir", "remove", "unlink", "popen",
+                     "spawn", "format", "format_map", "style", "plotting", "errors", "__builtins__"}
+_AI_SAFE_TO = {"to_numeric", "to_datetime", "to_timedelta", "to_list", "to_dict", "to_string",
+               "to_period", "to_timestamp", "to_frame", "to_series", "to_numpy"}
+
+
+def _check_ai_code(code: str) -> None:
+    if len(code) > 6000:
+        raise ValueError("AI code is too long")
+    tree = _ast.parse(code, mode="exec")
+    for node in _ast.walk(tree):
+        if isinstance(node, (_ast.Import, _ast.ImportFrom, _ast.Global, _ast.Nonlocal,
+                             _ast.ClassDef, _ast.AsyncFunctionDef, _ast.Await, _ast.Try, _ast.While)):
+            raise ValueError(f"'{type(node).__name__}' is not allowed in AI code")
+        if isinstance(node, _ast.Name) and (node.id in _AI_BLOCKED_NAMES or node.id.startswith("__")):
+            raise ValueError(f"'{node.id}' is not allowed in AI code")
+        if isinstance(node, _ast.Attribute):
+            a = node.attr
+            if a.startswith("_") or a in _AI_BLOCKED_ATTRS or a.startswith("read_") or (a.startswith("to_") and a not in _AI_SAFE_TO):
+                raise ValueError(f"'.{a}' is not allowed in AI code")
+
+
+def _run_ai_code(code: str, df):
+    """Run checked AI-written pandas code on df and return the resulting frame."""
+    _check_ai_code(code)
+    scope = {"df": df, "pd": pd, "np": np}
+    # Stop runaway code (for example a huge range loop) after 30 seconds where the platform allows it.
+    import signal, threading
+    use_alarm = hasattr(signal, "setitimer") and threading.current_thread() is threading.main_thread()
+    if use_alarm:
+        def _timeout(*_a):
+            raise TimeoutError("AI code took too long")
+        old = signal.signal(signal.SIGALRM, _timeout)
+        signal.setitimer(signal.ITIMER_REAL, 30)
+    try:
+        exec(compile(code, "<ai-clean>", "exec"), {"__builtins__": _AI_ALLOWED_BUILTINS, "pd": pd, "np": np}, scope)
+    finally:
+        if use_alarm:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old)
+    out = scope.get("df", df)
+    if not isinstance(out, pd.DataFrame):
+        raise ValueError("AI code did not leave a table in df")
+    return out
+
+
 async def _apply_ai_custom_rule(df: pd.DataFrame, instruction: str) -> tuple[pd.DataFrame, str | None]:
     """Same prompt/exec pattern as /api/clean-data's ai_custom_instructions
     loop, applied to one instruction at a time."""
@@ -2041,9 +2108,7 @@ Reply with ONLY the Python code, nothing else, no markdown, no backticks."""
         )
         code = message.content[0].text.strip()
         code = code.replace("```python", "").replace("```", "").strip()
-        local_vars = {"df": df, "pd": pd, "np": np}
-        exec(code, {"pd": pd, "np": np}, local_vars)
-        return local_vars.get("df", df), None
+        return _run_ai_code(code, df), None
     except Exception as e:
         return df, f"AI custom rule failed: {e}"
 
@@ -5498,9 +5563,7 @@ Reply with ONLY the Python code, nothing else, no markdown, no backticks."""
                 )
                 code = message.content[0].text.strip()
                 code = code.replace("```python", "").replace("```", "").strip()
-                local_vars = {"df": df, "pd": pd, "np": np}
-                exec(code, {"pd": pd, "np": np}, local_vars)
-                df = local_vars.get("df", df)
+                df = _run_ai_code(code, df)
                 print(f"✅ AI Custom Rule applied: '{instr}' → {code}")
             except Exception as e:
                 print(f"⚠ AI Custom Rule failed ('{instr}'): {e}")
@@ -7043,9 +7106,7 @@ Reply with ONLY the Python code, nothing else, no markdown, no backticks."""
         code = message.content[0].text.strip()
         code = code.replace("```python", "").replace("```", "").strip()
 
-        local_vars = {"df": df.copy(), "pd": pd, "np": np}
-        exec(code, {"pd": pd, "np": np}, local_vars)
-        df_cleaned = local_vars.get("df", df)
+        df_cleaned = _run_ai_code(code, df.copy())
 
         filename = f"ai_custom_{uuid.uuid4().hex[:8]}.csv"
         filepath = os.path.join(UPLOAD_DIR, filename)
