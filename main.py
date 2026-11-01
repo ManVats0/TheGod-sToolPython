@@ -2005,6 +2005,124 @@ async def _apply_sql_custom_step(df: pd.DataFrame, sql: str) -> tuple[pd.DataFra
         return df, f"SQL error: {e}"
 
 
+# ── Private AI mode ───────────────────────────────────────────────────────────
+# By default the model is shown the structure of the data (column names, types,
+# the shape of values such as "999-AAA", counts), never real rows or values.
+# Set AI_PRIVACY_MODE=standard to send sample rows again.
+import re as _re
+
+
+import contextvars as _contextvars
+# True while handling a request or pipeline run for a workspace that chose to share sample rows.
+_ai_share_var: "_contextvars.ContextVar[bool]" = _contextvars.ContextVar("ai_share_samples", default=False)
+
+
+def _ai_private_mode() -> bool:
+    if os.getenv("AI_PRIVACY_MODE", "private").strip().lower() == "standard":
+        return False  # server-wide override
+    if os.getenv("AI_ALLOW_SHARING", "on").strip().lower() != "off" and _ai_share_var.get():
+        return False  # this workspace opted in
+    return True
+
+
+async def _org_shares_samples(org_id) -> bool:
+    try:
+        if mongo_db is None or not org_id:
+            return False
+        org = await mongo_db.organizations.find_one({"_id": org_id}, {"settings": 1}) or {}
+        return bool((org.get("settings") or {}).get("aiShareSamples"))
+    except Exception:
+        return False
+
+
+async def _load_ai_share_for_request(request) -> None:
+    """Set this request's AI privacy choice from the caller's workspace."""
+    try:
+        ctx = await _get_ctx(request)
+        _ai_share_var.set(bool(ctx) and await _org_shares_samples(ctx["orgId"]))
+    except Exception:
+        _ai_share_var.set(False)
+
+
+def _value_shape(v) -> str:
+    s = str(v).strip()[:40]
+    s = _re.sub(r"[A-Z]", "A", s)
+    s = _re.sub(r"[a-z]", "a", s)
+    s = _re.sub(r"\d", "9", s)
+    return _re.sub(r"(.)\1{4,}", lambda m: m.group(1) * 4 + "+", s)
+
+
+_EMAIL_RE = _re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_URL_RE = _re.compile(r"^(https?://|www\.)\S+$", _re.I)
+_PHONE_RE = _re.compile(r"^\+?[\d\s().-]{7,20}$")
+
+
+def _column_kind(series) -> str:
+    s = series.dropna()
+    if s.empty:
+        return "empty"
+    if pd.api.types.is_bool_dtype(s):
+        return "boolean"
+    if pd.api.types.is_numeric_dtype(s):
+        return "integer" if (s % 1 == 0).all() else "decimal"
+    t = s.astype(str).str.strip().head(500)
+    n = len(t)
+    if n == 0:
+        return "text"
+    frac = lambda m: float(m.sum()) / n
+    if frac(t.str.match(_EMAIL_RE)) > 0.8:
+        return "email"
+    if frac(t.str.match(_URL_RE)) > 0.8:
+        return "url"
+    if frac(t.str.match(_PHONE_RE) & (t.str.count(r"\d") >= 7)) > 0.8:
+        return "phone number"
+    if frac(t.str.lower().isin(["true", "false", "yes", "no", "y", "n", "0", "1"])) > 0.9:
+        return "boolean-like"
+    try:
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            if pd.to_datetime(t, errors="coerce").notna().mean() > 0.8 and t.str.contains(r"\d").mean() > 0.9:
+                return "date or time"
+    except Exception:
+        pass
+    if pd.to_numeric(t.str.replace(r"[,\s$€£₹%]", "", regex=True), errors="coerce").notna().mean() > 0.8:
+        return "number stored as text"
+    return "text"
+
+
+def _privacy_profile(df) -> str:
+    """Describe the table to the AI without any real cell values."""
+    sample = df.head(2000)
+    lines = [f"Table: {len(df)} rows, {len(df.columns)} columns."]
+    for col in list(df.columns)[:60]:
+        s = sample[col]
+        nulls = int(s.isna().sum())
+        parts = [f"type {s.dtype}", f"kind {_column_kind(s)}", f"{nulls} of {len(s)} blank"]
+        try:
+            parts.append(f"{int(s.nunique(dropna=True))} distinct")
+        except Exception:
+            pass
+        if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s) and s.notna().any():
+            parts.append("has negatives" if (s < 0).any() else "no negatives")
+        shapes = s.dropna().map(_value_shape).value_counts().head(3)
+        if len(shapes):
+            tot = max(1, int(s.notna().sum()))
+            parts.append("value shapes " + ", ".join(f"'{k}' {round(100 * v / tot)}%" for k, v in shapes.items()))
+        lines.append(f"- {col!r}: " + "; ".join(parts))
+    if len(df.columns) > 60:
+        lines.append(f"(+{len(df.columns) - 60} more columns not shown)")
+    return "\n".join(lines)
+
+
+def _ai_data_block(df) -> str:
+    if _ai_private_mode():
+        return ("Column profiles. You are NOT shown real values, only structure. Write code that copes with messy "
+                "values (use errors='coerce', convert with astype(str) before string methods, handle blanks).\n"
+                + _privacy_profile(df))
+    return f"Columns: {list(df.columns)}\nSample rows: {df.head(5).fillna('').to_dict('records')}"
+
+
 # ── Safe runner for AI-written pandas code ────────────────────────────────────
 # The model writes pandas code from a plain-English instruction. That text (and
 # the sample rows we send along) comes from users, so the code must never be
@@ -2092,8 +2210,7 @@ async def _apply_ai_custom_rule(df: pd.DataFrame, instruction: str) -> tuple[pd.
                 "role": "user",
                 "content": f"""You are a pandas data cleaning expert. Given this DataFrame info and instruction, write ONLY the pandas Python code to apply the transformation.
 
-Columns: {preview_cols}
-Sample rows: {sample}
+{_ai_data_block(df)}
 Instruction: {instruction}
 
 Rules:
@@ -2676,6 +2793,7 @@ async def _write_destination_df(conn_type: str, cfg: dict, creds: dict, df: pd.D
 
 
 async def _run_pipeline(pipeline: dict, triggered_by: str = "manual") -> dict:
+    _ai_share_var.set(await _org_shares_samples(pipeline.get("orgId")))
     start = time.time()
     pipeline_id = str(pipeline["_id"])
     user_id = pipeline.get("userId") or pipeline.get("createdBy", "")
@@ -3298,7 +3416,11 @@ async def get_my_org(request: Request):
         "userId": ctx["userId"],
         "role": ctx["roleKey"],
         "permissions": ctx["permissions"],
-        "settings": {"requirePipelineApproval": bool((org.get("settings") or {}).get("requirePipelineApproval"))},
+        "settings": {
+            "requirePipelineApproval": bool((org.get("settings") or {}).get("requirePipelineApproval")),
+            "aiShareSamples": bool((org.get("settings") or {}).get("aiShareSamples")),
+            "aiSharingAllowed": os.getenv("AI_ALLOW_SHARING", "on").strip().lower() != "off",
+        },
         **({"seats": await _seat_usage(ctx["orgId"])} if ctx["permissions"].get("org.manageMembers") else {}),
     }
 
@@ -3309,13 +3431,21 @@ async def update_org_settings(request: Request, body: dict):
     ctx, err = await _auth(request, "org.manageMembers")
     if err:
         return err
-    if "requirePipelineApproval" not in body or not isinstance(body["requirePipelineApproval"], bool):
-        return JSONResponse(status_code=400, content={"error": "requirePipelineApproval must be true or false."})
+    updates = {}
+    for key in ("requirePipelineApproval", "aiShareSamples"):
+        if key in body:
+            if not isinstance(body[key], bool):
+                return JSONResponse(status_code=400, content={"error": f"{key} must be true or false."})
+            updates[key] = body[key]
+    if not updates:
+        return JSONResponse(status_code=400, content={"error": "Nothing to update."})
+    if updates.get("aiShareSamples") and os.getenv("AI_ALLOW_SHARING", "on").strip().lower() == "off":
+        return JSONResponse(status_code=403, content={"error": "Sharing sample rows with the AI is turned off for this service."})
     await mongo_db.organizations.update_one(
-        {"_id": ctx["orgId"]}, {"$set": {"settings.requirePipelineApproval": body["requirePipelineApproval"]}})
+        {"_id": ctx["orgId"]}, {"$set": {f"settings.{k}": v for k, v in updates.items()}})
     await log_audit(ctx["userId"], "org.settings_updated", "organization", str(ctx["orgId"]),
-                    metadata={"requirePipelineApproval": body["requirePipelineApproval"]}, severity="warning")
-    return {"success": True, "settings": {"requirePipelineApproval": body["requirePipelineApproval"]}}
+                    metadata=updates, severity="warning")
+    return {"success": True, "settings": updates}
 
 
 @app.get("/api/org/members")
@@ -5437,6 +5567,7 @@ async def clean_data(
     ai_clean: str = Form("false"),
     ai_custom_instructions: str = Form("[]"),
 ):
+    await _load_ai_share_for_request(request)
     contents = await file.read()
     df = pd.read_csv(io.BytesIO(contents))
     # Free workspaces (and anyone not logged in) clean the first rows only; paid plans are never capped.
@@ -5547,8 +5678,7 @@ async def clean_data(
                         "role": "user",
                         "content": f"""You are a pandas data cleaning expert. Given this DataFrame info and instruction, write ONLY the pandas Python code to apply the transformation.
 
-Columns: {preview_cols}
-Sample rows: {sample}
+{_ai_data_block(df)}
 Instruction: {instr}
 
 Rules:
@@ -7068,6 +7198,7 @@ async def ai_custom_clean_route(
     # so it requires a valid logged-in user.
     if not require_user(request):
         return JSONResponse(status_code=401, content={"success": False, "error": "Not authenticated"})
+    await _load_ai_share_for_request(request)
     import anthropic
 
     api_key = os.getenv("ANTHROPIC_API_KEY", "")
@@ -7089,8 +7220,7 @@ async def ai_custom_clean_route(
                 "role": "user",
                 "content": f"""You are a pandas data cleaning expert. Given this DataFrame info and instruction, write ONLY the pandas Python code to apply the transformation.
 
-Columns: {preview_cols}
-Sample rows: {sample}
+{_ai_data_block(df)}
 Instruction: {instruction}
 
 Rules:
@@ -7131,8 +7261,12 @@ async def ai_clean_route(request: Request, body: dict):
     # so it requires a valid logged-in user.
     if not require_user(request):
         return JSONResponse(status_code=401, content={"success": False, "error": "Not authenticated"})
+    await _load_ai_share_for_request(request)
     import anthropic
     csv_preview = body.get("csv_preview", "")[:3000]
+    # Private mode: only a structure summary (starts with PROFILE:) may reach the AI, never raw rows.
+    if _ai_private_mode() and not csv_preview.startswith("PROFILE:"):
+        csv_preview = "(row values withheld for privacy)"
     instructions = body.get("instructions", "")
 
     api_key = os.getenv("ANTHROPIC_API_KEY", "")
