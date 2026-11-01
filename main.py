@@ -4546,10 +4546,19 @@ async def agent_websocket(websocket: WebSocket, token: str = ""):
         "host":          host,
         "registered_at": datetime.now().isoformat(),
         "tokenId":       str(doc["_id"]),
+        "db_type":       str(reg.get("db_type", ""))[:20],
         "label":         doc.get("label", ""),
         "allowWrites":   allow_writes,
     }
     old = _agent_connections._d.get((org_id, agent_key))
+    if old and old.get("tokenId") != entry["tokenId"]:
+        # A different computer already serves this exact database. Replacing it would make the two
+        # kick each other off forever, so say so and let the owner decide which one stays.
+        await websocket.send_text(json.dumps({"type": "error", "error": (
+            f"Another connected computer (\"{old.get('label') or 'unnamed'}\") already serves {agent_key}. "
+            "Disconnect it in the app first, or use a different host name for this one.")}))
+        await websocket.close(code=4005)
+        return
     _agent_connections.put(org_id, agent_key, entry)
     if old:
         try:
@@ -6732,7 +6741,7 @@ async def mongo_health(body: dict):
     database = body.get("database", "").strip()
 
     for key in _agent_connections:
-        if key.startswith(f"{database}@"):
+        if key.startswith(f"{database}@") and _agent_connections[key].get("db_type", "") in ("mongodb", ""):
             try:
                 await _list_tables_via_agent(key)
                 return {"healthy": True, "message": "✅ Connection healthy (via tunnel agent)."}
@@ -6774,7 +6783,7 @@ async def mongo_collections(body: dict):
     database = body.get("database", "").strip()
 
     for key in _agent_connections:
-        if key.startswith(f"{database}@"):
+        if key.startswith(f"{database}@") and _agent_connections[key].get("db_type", "") in ("mongodb", ""):
             try:
                 tables = await _list_tables_via_agent(key)
                 return {"collections": tables}
@@ -6803,7 +6812,7 @@ async def mongo_fetch_collection(body: dict):
     collection = body.get("collection", "").strip()
 
     for key in _agent_connections:
-        if key.startswith(f"{database}@") and collection:
+        if key.startswith(f"{database}@") and collection and _agent_connections[key].get("db_type", "") in ("mongodb", ""):
             try:
                 request_id = _secrets.token_hex(16)
                 future = asyncio.get_event_loop().create_future()
