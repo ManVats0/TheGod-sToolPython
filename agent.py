@@ -17,11 +17,23 @@ You will be prompted for:
   - Your MySQL host, port, user, password, database
 """
 
+import argparse
 import asyncio
 import json
+import os
+import re
+import socket
 import ssl
 import sys
 import getpass
+import secrets
+import threading
+import urllib.error
+import urllib.request
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import quote_plus
 import aiomysql
 import websockets
 try:
@@ -66,7 +78,67 @@ except ImportError:
     aiohttp = None  # type: ignore
     HAS_AIOHTTP = False
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
+DEFAULT_SERVER = "https://api.thegodstool.com"
+
+
+# ── Read-only guard ───────────────────────────────────────────────────────────
+# Runs on YOUR machine. Even if the server (or anyone who got into it) asked for a
+# DROP or DELETE, this refuses unless you allowed writes when you paired.
+_READ_ONLY_START = ("select", "show", "describe", "desc", "explain", "with", "values")
+_WRITE_WORDS = re.compile(
+    r"\b(insert|update|delete|drop|alter|truncate|create|grant|revoke|replace|merge|call|exec|execute|"
+    r"load|copy|attach|detach|vacuum|reindex|lock|set|into)\b", re.I)
+
+
+def is_read_only_sql(sql) -> bool:
+    if not isinstance(sql, str) or not sql.strip():
+        return False
+    t = re.sub(r"/\*.*?\*/", " ", sql, flags=re.S)
+    t = re.sub(r"--[^\n]*", " ", t)
+    t = re.sub(r"#[^\n]*", " ", t)
+    t = re.sub(r"'(?:[^'\\]|\\.|'')*'", "''", t)
+    t = re.sub(r'"(?:[^"\\]|\\.)*"', '""', t)
+    t = re.sub(r"`[^`]*`", "``", t)
+    t = t.strip().rstrip(";").strip()
+    if ";" in t:
+        return False
+    first = t.split(None, 1)[0].lower() if t else ""
+    if first not in _READ_ONLY_START:
+        return False
+    return not _WRITE_WORDS.search(t)
+
+
+class GuardedWS:
+    """Wraps the websocket so every incoming SQL request passes the read-only check first."""
+
+    def __init__(self, ws, allow_writes: bool):
+        self._ws = ws
+        self._allow = allow_writes
+
+    async def send(self, data):
+        return await self._ws.send(data)
+
+    async def recv(self):
+        return await self._ws.recv()
+
+    def __aiter__(self):
+        return self._iter()
+
+    async def _iter(self):
+        async for raw in self._ws:
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                yield raw
+                continue
+            if msg.get("type") == "query" and "sql" in msg and not self._allow and not is_read_only_sql(msg.get("sql")):
+                print("  ✗ Blocked a non read-only query (this connector is read-only).")
+                await self._ws.send(json.dumps({
+                    "type": "query_result", "request_id": msg.get("request_id", ""),
+                    "error": "Blocked: this connector is read-only on the customer's computer."}))
+                continue
+            yield raw
 
 
 def prompt(label: str, default: str = "", secret: bool = False) -> str:
@@ -80,8 +152,8 @@ def prompt(label: str, default: str = "", secret: bool = False) -> str:
 
 def print_banner():
     print("\n" + "=" * 58)
-    print("  DataPro Secure Agent  v" + VERSION)
-    print("  Connects your private MySQL to the DataPro server")
+    print("  The God's Tool Agent  v" + VERSION)
+    print("  Connects your private database to your workspace")
     print("=" * 58 + "\n")
 
 
@@ -195,6 +267,7 @@ async def handle_messages(ws, mysql_conf: dict):
                         db=mysql_conf["database"],
                         ssl=mysql_conf.get("ssl_ctx"),
                         connect_timeout=10,
+                        autocommit=True,
                     )
                     async with conn.cursor(aiomysql.DictCursor) as cur:
                         await cur.execute(sql, params or None)
@@ -673,7 +746,7 @@ async def handle_messages_redshift(ws, conf: dict):
             break
 
 
-async def run_tunnel(server_url: str, token: str, mysql_conf: dict):
+async def run_tunnel(server_url: str, token: str, mysql_conf: dict, allow_writes: bool = False, on_ready=None):
     ws_url = server_url.replace("https://", "wss://").replace("http://", "ws://")
     ws_url = ws_url.rstrip("/") + f"/ws/agent?token={token}"
     ssl_ctx = ssl.create_default_context() if ws_url.startswith("wss://") else None
@@ -706,6 +779,10 @@ async def run_tunnel(server_url: str, token: str, mysql_conf: dict):
                 print(f"  ✓ Connected to DataPro server")
                 print(f"  ✓ Database: {mysql_conf['database']}@{mysql_conf['host']}")
                 retry_delay = 3
+                allow_writes = bool(ack.get("allowWrites", allow_writes)) and allow_writes
+                ws = GuardedWS(ws, allow_writes)
+                if on_ready:
+                    on_ready()
 
                 db_type = mysql_conf.get("db_type", "mysql")
                 if db_type == "postgres":
@@ -736,7 +813,7 @@ async def run_tunnel(server_url: str, token: str, mysql_conf: dict):
         retry_delay = min(retry_delay * 2, 60)
 
 
-def main():
+def main_manual(allow_writes: bool = False):
     print_banner()
 
     server_url = "https://api.thegodstool.com"   
@@ -882,9 +959,276 @@ def main():
     print("\n  Starting tunnel... Press Ctrl+C to stop.\n")
 
     try:
-        asyncio.run(run_tunnel(server_url, token, db_conf))
+        asyncio.run(run_tunnel(server_url, token, db_conf, allow_writes))
     except KeyboardInterrupt:
         print("\n\n  Agent stopped.")
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  One-click mode
+#    python agent.py --pair ABCD-EFGH
+#  Pairs this computer with your workspace, opens a small page on THIS computer
+#  where you type your database details (they never leave it), then keeps the
+#  tunnel running and reconnects by itself.
+# ══════════════════════════════════════════════════════════════════════════════
+
+CONFIG_DIR = Path(os.environ.get("THEGODSTOOL_HOME") or (Path.home() / ".thegodstool"))
+CONFIG_FILE = CONFIG_DIR / "agent.json"
+
+DB_CHOICES = {
+    "mysql":    {"label": "MySQL / MariaDB", "port": "3306", "user": "root"},
+    "postgres": {"label": "PostgreSQL",      "port": "5432", "user": "postgres"},
+    "mongodb":  {"label": "MongoDB",         "port": "27017", "user": ""},
+    "redshift": {"label": "AWS Redshift",    "port": "5439", "user": "awsuser"},
+}
+
+
+def save_config(cfg: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(CONFIG_DIR, 0o700)
+    except OSError:
+        pass
+    tmp = CONFIG_FILE.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, CONFIG_FILE)
+    try:
+        os.chmod(CONFIG_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def load_config() -> dict:
+    try:
+        return json.loads(CONFIG_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def claim_pair_code(server: str, code: str) -> dict:
+    body = json.dumps({"code": code, "device": socket.gethostname()}).encode()
+    req = urllib.request.Request(server.rstrip("/") + "/api/agent/claim", data=body,
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read()).get("error", "")
+        except Exception:
+            msg = ""
+        raise SystemExit(f"\n  ✗ {msg or 'The server refused that code (HTTP %s).' % e.code}")
+    except Exception as e:
+        raise SystemExit(f"\n  ✗ Could not reach {server}: {e}")
+
+
+def build_db_conf(saved: dict) -> dict:
+    """Turn the saved (JSON-safe) database settings into what the handlers expect."""
+    t = saved["db_type"]
+    use_ssl = bool(saved.get("ssl"))
+    conf = {"db_type": t, "host": saved["host"], "port": int(saved["port"] or 0),
+            "user": saved.get("user", ""), "password": saved.get("password", ""),
+            "database": saved["database"], "ssl_ctx": ssl.create_default_context() if use_ssl else None}
+    if t == "mongodb":
+        cred = f"{quote_plus(conf['user'])}:{quote_plus(conf['password'])}@" if conf["user"] else ""
+        conf["uri"] = f"mongodb://{cred}{conf['host']}:{conf['port']}/?authSource=admin" + ("&tls=true" if use_ssl else "")
+    return conf
+
+
+async def test_db(conf: dict) -> None:
+    """Raises with a readable message if this computer cannot reach the database."""
+    t = conf["db_type"]
+    if t == "mysql":
+        conn = await aiomysql.connect(host=conf["host"], port=conf["port"], user=conf["user"], password=conf["password"],
+                                      db=conf["database"], ssl=conf["ssl_ctx"], connect_timeout=10)
+        conn.close()
+    elif t == "postgres":
+        if not HAS_ASYNCPG:
+            raise RuntimeError("PostgreSQL support is missing. Run: pip install asyncpg")
+        conn = await asyncpg.connect(host=conf["host"], port=conf["port"], user=conf["user"], password=conf["password"],
+                                     database=conf["database"], ssl=conf["ssl_ctx"], timeout=10)
+        await conn.close()
+    elif t == "mongodb":
+        if not HAS_MOTOR:
+            raise RuntimeError("MongoDB support is missing. Run: pip install motor")
+        client = motor_asyncio.AsyncIOMotorClient(conf["uri"], serverSelectionTimeoutMS=8000)
+        try:
+            await client[conf["database"]].list_collection_names()
+        finally:
+            client.close()
+    elif t == "redshift":
+        if not HAS_AIOPG:
+            raise RuntimeError("Redshift support is missing. Run: pip install aiopg")
+        dsn = f"host={conf['host']} port={conf['port']} dbname={conf['database']} user={conf['user']} password={conf['password']} connect_timeout=10"
+        async with aiopg.connect(dsn):
+            pass
+
+
+SETUP_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Connect your database | The God's Tool</title>
+<style>
+body{margin:0;background:#07050f;color:#e9e7f5;font:16px/1.5 -apple-system,Segoe UI,Inter,sans-serif;display:flex;justify-content:center;padding:32px 16px}
+main{width:100%;max-width:480px}h1{font-size:1.4rem;margin:0 0 6px}p{color:#a9a5c4;margin:0 0 20px;font-size:.95rem}
+label{display:block;font-size:.82rem;color:#c9c5e3;margin:14px 0 4px}
+input,select{width:100%;box-sizing:border-box;padding:11px 12px;border-radius:10px;border:1px solid #3a3358;background:#120e22;color:#fff;font:inherit}
+.row{display:grid;grid-template-columns:2fr 1fr;gap:10px}.chk{display:flex;gap:8px;align-items:center;margin-top:16px}.chk input{width:auto}
+button{margin-top:22px;width:100%;padding:13px;border:0;border-radius:10px;background:#7c5cff;color:#fff;font:inherit;font-weight:600;cursor:pointer}
+button:disabled{opacity:.6;cursor:wait}#msg{margin-top:16px;padding:12px;border-radius:10px;display:none;font-size:.92rem}
+.err{background:#3a1220;color:#ffb4c2}.ok{background:#0f3524;color:#9bf0c4}.note{font-size:.8rem;color:#8f8aae;margin-top:18px}
+</style></head><body><main>
+<h1>Connect your database</h1>
+<p>These details stay on this computer. They are saved in a private file here and are never sent to The God's Tool.</p>
+<form id="f">
+<label>Database type</label><select name="db_type" id="t">__OPTIONS__</select>
+<div class="row"><div><label>Host</label><input name="host" value="localhost" required></div><div><label>Port</label><input name="port" id="port" required></div></div>
+<label>Username</label><input name="user" id="user" autocomplete="off">
+<label>Password</label><input name="password" type="password" autocomplete="new-password">
+<label>Database name</label><input name="database" required>
+<div class="chk"><input type="checkbox" name="ssl" id="ssl"><label for="ssl" style="margin:0">Use SSL / TLS</label></div>
+<button id="b" type="submit">Test and connect</button><div id="msg"></div>
+</form>
+<p class="note">Access mode: <b>__MODE__</b>. You set this when you created the pairing code in the app.</p>
+</main><script>
+const D=__DEFAULTS__;const t=document.getElementById('t');
+function fill(){const d=D[t.value];document.getElementById('port').value=d.port;document.getElementById('user').value=d.user}
+t.onchange=fill;fill();
+const m=document.getElementById('msg');
+document.getElementById('f').onsubmit=async e=>{e.preventDefault();const b=document.getElementById('b');b.disabled=true;b.textContent='Testing connection...';m.style.display='none';
+const o=Object.fromEntries(new FormData(e.target));o.ssl=!!o.ssl;o.secret='__SECRET__';
+try{const r=await fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)});const j=await r.json();
+m.style.display='block';if(j.ok){m.className='ok';m.textContent='Connected. You can close this tab. Keep the agent window open, or run it again later to reconnect.';b.textContent='Done'}
+else{m.className='err';m.textContent=j.error||'Something went wrong.';b.disabled=false;b.textContent='Test and connect'}}
+catch(x){m.style.display='block';m.className='err';m.textContent='Lost contact with the agent on this computer. Is it still running?';b.disabled=false;b.textContent='Test and connect'}};
+</script></body></html>"""
+
+
+def run_setup_page(cfg: dict) -> dict:
+    """Serve the form on 127.0.0.1, block until the user saves a database that tests OK."""
+    secret = secrets.token_urlsafe(24)
+    done = threading.Event()
+    result: dict = {}
+    options = "".join(f'<option value="{k}">{v["label"]}</option>' for k, v in DB_CHOICES.items())
+    mode = "read and write" if cfg.get("allowWrites") else "read-only"
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _host_ok(self) -> bool:
+            host = (self.headers.get("Host") or "").split(":")[0]
+            return host in ("127.0.0.1", "localhost")
+
+        def _send(self, code, body, ctype="application/json"):
+            data = body.encode() if isinstance(body, str) else body
+            self.send_response(code)
+            self.send_header("Content-Type", ctype + "; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            if not self._host_ok() or self.path.split("?")[0] != "/":
+                return self._send(404, "{}")
+            page = (SETUP_PAGE.replace("__OPTIONS__", options).replace("__SECRET__", secret)
+                    .replace("__MODE__", mode).replace("__DEFAULTS__", json.dumps(DB_CHOICES)))
+            self._send(200, page, "text/html")
+
+        def do_POST(self):
+            if not self._host_ok() or self.path != "/save":
+                return self._send(404, "{}")
+            try:
+                n = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(min(n, 20000)))
+            except Exception:
+                return self._send(400, json.dumps({"ok": False, "error": "Bad request."}))
+            if not secrets.compare_digest(str(body.get("secret", "")), secret):
+                return self._send(403, json.dumps({"ok": False, "error": "This page expired. Restart the agent."}))
+            t = body.get("db_type")
+            host = str(body.get("host", "")).strip()
+            port = str(body.get("port", "")).strip()
+            database = str(body.get("database", "")).strip()
+            if t not in DB_CHOICES or not host or not database or not port.isdigit():
+                return self._send(200, json.dumps({"ok": False, "error": "Please fill in host, a numeric port and the database name."}))
+            saved = {"db_type": t, "host": host, "port": port, "user": str(body.get("user", "")),
+                     "password": str(body.get("password", "")), "database": database, "ssl": bool(body.get("ssl"))}
+            try:
+                asyncio.run(asyncio.wait_for(test_db(build_db_conf(saved)), timeout=25))
+            except Exception as e:
+                return self._send(200, json.dumps({"ok": False, "error": f"Could not connect from this computer: {e or type(e).__name__}"}))
+            cfg["db"] = saved
+            save_config(cfg)
+            result.update(saved)
+            self._send(200, json.dumps({"ok": True}))
+            done.set()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{port}/"
+    print(f"\n  Opening a page on this computer to enter your database details:\n  {url}\n")
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+    try:
+        done.wait()
+    finally:
+        server.shutdown()
+    return result
+
+
+def main_oneclick(args) -> None:
+    print_banner()
+    cfg = load_config()
+    server = (args.server or cfg.get("server") or DEFAULT_SERVER).rstrip("/")
+
+    if args.pair:
+        print("  Pairing this computer with your workspace...")
+        got = claim_pair_code(server, args.pair)
+        cfg = {"server": server, "token": got["token"], "allowWrites": bool(got.get("allowWrites")), "label": got.get("label", "")}
+        save_config(cfg)
+        print(f"  ✓ Paired as \"{cfg['label']}\"")
+    elif not cfg.get("token"):
+        raise SystemExit("  ✗ This computer is not paired yet. Create a code in the app (Tunneling > One click) and run:\n    python agent.py --pair ABCD-EFGH")
+
+    if args.reset:
+        cfg.pop("db", None)
+        save_config(cfg)
+
+    if not cfg.get("db"):
+        run_setup_page(cfg)
+        cfg = load_config()
+
+    conf = build_db_conf(cfg["db"])
+    print("\n  " + "-" * 54)
+    print(f"  Database : {conf['database']}@{conf['host']}:{conf['port']}   ({DB_CHOICES[conf['db_type']]['label']})")
+    print(f"  Access   : {'read and write' if cfg.get('allowWrites') else 'read-only'}")
+    print("  " + "-" * 54)
+    print("  Running. Leave this window open. Press Ctrl+C to stop.\n")
+    try:
+        asyncio.run(run_tunnel(cfg["server"], cfg["token"], conf, bool(cfg.get("allowWrites"))))
+    except KeyboardInterrupt:
+        print("\n\n  Agent stopped.")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="The God's Tool agent: use your own computer as the connector to your database.")
+    ap.add_argument("--pair", metavar="CODE", help="one-click setup: the pairing code shown in the app")
+    ap.add_argument("--server", help="server URL (defaults to the hosted service)")
+    ap.add_argument("--reset", action="store_true", help="forget the saved database and enter it again")
+    ap.add_argument("--manual", action="store_true", help="old step-by-step prompts in this terminal")
+    ap.add_argument("--allow-writes", action="store_true", help="manual mode only: allow non read-only SQL")
+    args = ap.parse_args()
+    if args.manual:
+        main_manual(args.allow_writes)
+    elif args.pair or CONFIG_FILE.exists():
+        main_oneclick(args)
+    else:
+        main_manual(args.allow_writes)
 
 
 if __name__ == "__main__":

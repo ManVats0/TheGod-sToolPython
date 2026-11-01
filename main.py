@@ -122,21 +122,53 @@ TOKEN_DIR.mkdir(exist_ok=True)
 _session_store: dict = {}
 
 # ── Agent tunnel store ────────────────────────────────────────────────────────
-AGENT_TOKENS_FILE = Path(__file__).parent / "agent_tokens.json"
+# Connectors (agents) are owned by one organisation. A connection is only visible to
+# requests that belong to the same organisation, so two customers who both have a
+# database called "sales@localhost" can never reach each other's agent.
+import contextvars as _cv
+_agent_org_var: "_cv.ContextVar[str]" = _cv.ContextVar("agent_org", default="")
 
-def _load_agent_tokens() -> dict:
-    if AGENT_TOKENS_FILE.exists():
-        try:
-            return json.loads(AGENT_TOKENS_FILE.read_text())
-        except Exception:
-            return {}
-    return {}
 
-def _save_agent_tokens(tokens: dict):
-    AGENT_TOKENS_FILE.write_text(json.dumps(tokens, indent=2))
+class _OrgScopedAgents:
+    """dict-like view over live agents: every read is filtered to the current organisation."""
 
-# agent_key = "database@host" -> {websocket, database, host, registered_at}
-_agent_connections: dict = {}
+    def __init__(self):
+        self._d: dict = {}
+
+    def __contains__(self, key):
+        org = _agent_org_var.get()
+        return bool(org) and (org, key) in self._d
+
+    def __getitem__(self, key):
+        return self._d[(_agent_org_var.get(), key)]
+
+    def get(self, key, default=None):
+        org = _agent_org_var.get()
+        return self._d.get((org, key), default) if org else default
+
+    def __iter__(self):
+        org = _agent_org_var.get()
+        return iter([k for (o, k) in list(self._d) if org and o == org])
+
+    def keys(self):
+        return list(iter(self))
+
+    def items(self):
+        return [(k, self._d[(_agent_org_var.get(), k)]) for k in self.keys()]
+
+    def put(self, org: str, key: str, entry: dict):
+        self._d[(org, key)] = entry
+
+    def drop(self, org: str, key: str, entry: dict):
+        if self._d.get((org, key)) is entry:
+            self._d.pop((org, key), None)
+
+    def all_entries(self):
+        return list(self._d.items())
+
+
+# (orgId, "database@host") -> {websocket, database, host, registered_at, tokenId, allowWrites}
+_agent_connections = _OrgScopedAgents()
 # request_id -> asyncio.Future (for matching query responses)
 _pending_queries: dict = {} 
 
@@ -2794,6 +2826,7 @@ async def _write_destination_df(conn_type: str, cfg: dict, creds: dict, df: pd.D
 
 async def _run_pipeline(pipeline: dict, triggered_by: str = "manual") -> dict:
     _ai_share_var.set(await _org_shares_samples(pipeline.get("orgId")))
+    _agent_org_var.set(str(pipeline.get("orgId") or ""))
     start = time.time()
     pipeline_id = str(pipeline["_id"])
     user_id = pipeline.get("userId") or pipeline.get("createdBy", "")
@@ -4416,12 +4449,75 @@ async def submit_contact(request: ContactFormRequest = Body(...)):
 
 # ── Agent WebSocket tunnel ────────────────────────────────────────────────────
 
+_agent_hits: dict = {}
+
+
+def _agent_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+async def _ensure_agent_indexes():
+    if mongo_db is None or getattr(_ensure_agent_indexes, "done", False):
+        return
+    try:
+        await mongo_db.agent_tokens.create_index("tokenHash", unique=True)
+        await mongo_db.agent_tokens.create_index("orgId")
+        await mongo_db.agent_pair_codes.create_index("codeHash", unique=True)
+        await mongo_db.agent_pair_codes.create_index("expiresAt", expireAfterSeconds=0)
+        _ensure_agent_indexes.done = True
+    except Exception as e:
+        print(f"Could not ensure agent indexes: {e}")
+
+
+async def _org_for_request(request: Request) -> str:
+    user = require_user(request)
+    if not user:
+        return ""
+    org = await _org_id_for_user(str(user.get("userId", "")))
+    return str(org) if org else ""
+
+
+@app.middleware("http")
+async def _agent_org_middleware(request: Request, call_next):
+    if request.url.path.startswith("/api/") and request.headers.get("Authorization"):
+        _agent_org_var.set(await _org_for_request(request))
+    return await call_next(request)
+
+
+_READ_ONLY_START = ("select", "show", "describe", "desc", "explain", "with", "values")
+_WRITE_WORDS = _re.compile(
+    r"\b(insert|update|delete|drop|alter|truncate|create|grant|revoke|replace|merge|call|exec|execute|"
+    r"load|copy|attach|detach|vacuum|reindex|lock|set|into)\b", _re.I)
+
+
+def _is_read_only_sql(sql: str) -> bool:
+    """True only for a single plain read statement. Strings and comments are ignored when looking for write words."""
+    if not isinstance(sql, str) or not sql.strip():
+        return False
+    t = _re.sub(r"/\*.*?\*/", " ", sql, flags=_re.S)
+    t = _re.sub(r"--[^\n]*", " ", t)
+    t = _re.sub(r"#[^\n]*", " ", t)
+    t = _re.sub(r"'(?:[^'\\]|\\.|'')*'", "''", t)
+    t = _re.sub(r'"(?:[^"\\]|\\.)*"', '""', t)
+    t = _re.sub(r"`[^`]*`", "``", t)
+    t = t.strip().rstrip(";").strip()
+    if ";" in t:
+        return False
+    first = t.split(None, 1)[0].lower() if t else ""
+    if first not in _READ_ONLY_START:
+        return False
+    return not _WRITE_WORDS.search(t)
+
+
 @app.websocket("/ws/agent")
 async def agent_websocket(websocket: WebSocket, token: str = ""):
     await websocket.accept()
+    await _ensure_agent_indexes()
 
-    known_tokens = _load_agent_tokens()
-    if token not in known_tokens:
+    doc = None
+    if token and mongo_db is not None:
+        doc = await mongo_db.agent_tokens.find_one({"tokenHash": _agent_hash(token), "revokedAt": None})
+    if not doc:
         await websocket.send_text(json.dumps({"type": "error", "error": "Invalid token"}))
         await websocket.close(code=4001)
         return
@@ -4438,18 +4534,31 @@ async def agent_websocket(websocket: WebSocket, token: str = ""):
         await websocket.close(code=4003)
         return
 
-    database  = reg.get("database", "")
-    host      = reg.get("host", "")
+    org_id    = str(doc["orgId"])
+    database  = str(reg.get("database", ""))[:200]
+    host      = str(reg.get("host", ""))[:300]
     agent_key = f"{database}@{host}"
+    allow_writes = bool(doc.get("allowWrites"))
 
-    _agent_connections[agent_key] = {
+    entry = {
         "websocket":     websocket,
         "database":      database,
         "host":          host,
         "registered_at": datetime.now().isoformat(),
+        "tokenId":       str(doc["_id"]),
+        "label":         doc.get("label", ""),
+        "allowWrites":   allow_writes,
     }
-    await websocket.send_text(json.dumps({"type": "registered"}))
-    print(f"✓ Agent connected: {agent_key}")
+    old = _agent_connections._d.get((org_id, agent_key))
+    _agent_connections.put(org_id, agent_key, entry)
+    if old:
+        try:
+            await old["websocket"].close(code=4000)
+        except Exception:
+            pass
+    await mongo_db.agent_tokens.update_one({"_id": doc["_id"]}, {"$set": {"lastSeenAt": datetime.utcnow(), "lastTarget": agent_key}})
+    await websocket.send_text(json.dumps({"type": "registered", "allowWrites": allow_writes}))
+    print(f"✓ Agent connected: {agent_key} (org {org_id})")
 
     try:
         async for raw in websocket.iter_text():
@@ -4461,10 +4570,14 @@ async def agent_websocket(websocket: WebSocket, token: str = ""):
                 future = _pending_queries.pop(request_id, None)
                 if future and not future.done():
                     future.set_result(msg)
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, json.JSONDecodeError):
         pass
     finally:
-        _agent_connections.pop(agent_key, None)
+        _agent_connections.drop(org_id, agent_key, entry)
+        try:
+            await mongo_db.agent_tokens.update_one({"_id": doc["_id"]}, {"$set": {"lastSeenAt": datetime.utcnow()}})
+        except Exception:
+            pass
         print(f"✗ Agent disconnected: {agent_key}")
 
 
@@ -4472,6 +4585,8 @@ async def _query_via_agent(agent_key: str, sql: str, params: list = None, timeou
     agent = _agent_connections.get(agent_key)
     if not agent:
         raise RuntimeError(f"No agent connected for {agent_key}. Run agent.py first.")
+    if not agent.get("allowWrites") and not _is_read_only_sql(sql):
+        raise RuntimeError("This connector is read-only. Only SELECT-style queries are allowed.")
     request_id = _secrets.token_hex(16)
     future = asyncio.get_event_loop().create_future()
     _pending_queries[request_id] = future
@@ -4509,18 +4624,134 @@ async def _list_tables_via_agent(agent_key: str, timeout: float = 15.0) -> list:
         raise RuntimeError("Agent timed out listing tables")
 
 
+async def _new_agent_token(ctx: dict, label: str, allow_writes: bool, device: str = "") -> str:
+    await _ensure_agent_indexes()
+    token = _secrets.token_urlsafe(32)
+    await mongo_db.agent_tokens.insert_one({
+        "tokenHash": _agent_hash(token),
+        "orgId": str(ctx["orgId"]),
+        "label": (label or "my computer")[:80],
+        "allowWrites": bool(allow_writes),
+        "createdBy": ctx["userId"],
+        "createdAt": datetime.utcnow(),
+        "lastSeenAt": None,
+        "revokedAt": None,
+        "device": device[:120],
+    })
+    return token
+
+
 @app.post("/api/agent/token")
 async def create_agent_token(request: Request, body: dict):
-    """Generate a new agent token to give to a customer."""
+    """Manual flow: create a connector token for your organisation."""
     ctx, err = await _auth(request, "tunnel.manage")
     if err:
         return err
-    label = body.get("label", "unnamed")
-    token = _secrets.token_urlsafe(32)
-    tokens = _load_agent_tokens()
-    tokens[token] = {"label": label, "created_at": datetime.now().isoformat()}
-    _save_agent_tokens(tokens)
+    label = str(body.get("label", "my computer"))
+    token = await _new_agent_token(ctx, label, bool(body.get("allowWrites")))
     return {"token": token, "label": label}
+
+
+_PAIR_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def _norm_code(code: str) -> str:
+    return "".join(ch for ch in str(code).upper() if ch.isalnum())
+
+
+@app.post("/api/agent/pair-code")
+async def create_pair_code(request: Request, body: dict):
+    """One-click flow, step 1: a short code that is valid for 10 minutes and works once."""
+    ctx, err = await _auth(request, "tunnel.manage")
+    if err:
+        return err
+    await _ensure_agent_indexes()
+    raw = "".join(_secrets.choice(_PAIR_ALPHABET) for _ in range(8))
+    code = f"{raw[:4]}-{raw[4:]}"
+    expires = datetime.utcnow() + timedelta(minutes=10)
+    await mongo_db.agent_pair_codes.insert_one({
+        "codeHash": _agent_hash(raw),
+        "orgId": str(ctx["orgId"]),
+        "userId": ctx["userId"],
+        "label": str(body.get("label", "my computer"))[:80],
+        "allowWrites": bool(body.get("allowWrites")),
+        "used": False,
+        "expiresAt": expires,
+    })
+    return {"code": code, "expiresInSeconds": 600}
+
+
+@app.post("/api/agent/claim")
+async def claim_pair_code(request: Request, body: dict):
+    """One-click flow, step 2: the agent swaps the code for its own long-lived token. No login needed."""
+    if mongo_db is None:
+        return JSONResponse({"error": "Server not ready"}, status_code=503)
+    ip = request.client.host if request.client else "?"
+    now = time.time()
+    hits = [t for t in _agent_hits.get(ip, []) if now - t < 600]
+    if len(hits) >= 10:
+        return JSONResponse({"error": "Too many attempts. Wait a few minutes and generate a new code."}, status_code=429)
+    hits.append(now)
+    _agent_hits[ip] = hits
+    await _ensure_agent_indexes()
+    raw = _norm_code(body.get("code", ""))
+    if len(raw) != 8:
+        return JSONResponse({"error": "That code is not valid."}, status_code=400)
+    doc = await mongo_db.agent_pair_codes.find_one_and_update(
+        {"codeHash": _agent_hash(raw), "used": False, "expiresAt": {"$gt": datetime.utcnow()}},
+        {"$set": {"used": True, "usedAt": datetime.utcnow()}},
+    )
+    if not doc:
+        return JSONResponse({"error": "That code is wrong, already used, or expired. Generate a new one in the app."}, status_code=400)
+    ctx = {"orgId": doc["orgId"], "userId": doc["userId"]}
+    token = await _new_agent_token(ctx, doc.get("label", "my computer"), bool(doc.get("allowWrites")), str(body.get("device", "")))
+    return {"token": token, "label": doc.get("label", ""), "allowWrites": bool(doc.get("allowWrites"))}
+
+
+@app.get("/api/agent/connectors")
+async def list_connectors(request: Request):
+    ctx, err = await _auth(request, "tunnel.use")
+    if err:
+        return err
+    org = str(ctx["orgId"])
+    live = {e["tokenId"]: e for (o, _k), e in _agent_connections.all_entries() if o == org}
+    out = []
+    async for d in mongo_db.agent_tokens.find({"orgId": org, "revokedAt": None}).sort("createdAt", -1):
+        e = live.get(str(d["_id"]))
+        out.append({
+            "id": str(d["_id"]),
+            "label": d.get("label", ""),
+            "device": d.get("device", ""),
+            "allowWrites": bool(d.get("allowWrites")),
+            "createdAt": d["createdAt"].isoformat() if d.get("createdAt") else None,
+            "lastSeenAt": d["lastSeenAt"].isoformat() if d.get("lastSeenAt") else None,
+            "online": bool(e),
+            "database": e["database"] if e else None,
+            "host": e["host"] if e else None,
+        })
+    return {"connectors": out}
+
+
+@app.delete("/api/agent/connectors/{connector_id}")
+async def revoke_connector(connector_id: str, request: Request):
+    ctx, err = await _auth(request, "tunnel.manage")
+    if err:
+        return err
+    try:
+        oid = ObjectId(connector_id)
+    except Exception:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    res = await mongo_db.agent_tokens.update_one(
+        {"_id": oid, "orgId": str(ctx["orgId"]), "revokedAt": None}, {"$set": {"revokedAt": datetime.utcnow()}})
+    if not res.matched_count:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    for (o, k), e in _agent_connections.all_entries():
+        if e.get("tokenId") == connector_id:
+            try:
+                await e["websocket"].close(code=4001)
+            except Exception:
+                pass
+    return {"success": True}
 
 
 @app.get("/api/agent/status")
@@ -5829,6 +6060,16 @@ def download_agent_script():
         media_type="text/x-python",
         filename="agent.py",
     )
+
+
+@app.get("/download/install.sh")
+def download_install_sh():
+    return FileResponse(Path(__file__).parent / "install.sh", media_type="text/x-shellscript")
+
+
+@app.get("/download/install.ps1")
+def download_install_ps1():
+    return FileResponse(Path(__file__).parent / "install.ps1", media_type="text/plain")
 
 
 # ── ADAPTIVE PIPELINE ROUTES ───────────────────────────────────────────────────
