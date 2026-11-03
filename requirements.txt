@@ -51,3 +51,4 @@ duckdb
 PyJWT
 motor
 cryptography
+pdfplumber
