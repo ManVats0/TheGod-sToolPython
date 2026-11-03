@@ -268,6 +268,7 @@ LOCKED_PREFIXES = {
     "/api/mysql/": "MySQL", "/api/postgres/": "PostgreSQL", "/api/bigquery/": "BigQuery",
     "/api/cloudsql/": "Cloud SQL", "/api/gcs/": "Google Cloud Storage", "/api/databricks/": "Databricks",
     "/api/rest/": "REST API", "/api/aws/": "AWS", "/api/mongo/": "MongoDB", "/api/ga4/": "Google Analytics",
+    "/api/pdf/": "PDF to table",
 }
 
 
@@ -397,7 +398,7 @@ class PlanGateMiddleware(_PlanBase):
                         return _upgrade_response(
                             "connectors",
                             f"{label} is part of the paid plans. CSV files and Google Sheets are free - "
-                            f"upgrade to unlock {label} and every other connector.")
+                            f"upgrade to unlock {label} and everything else on the paid plans.")
                     break
         return await call_next(request)
 
@@ -1142,6 +1143,29 @@ async def create_connection(request: Request, body: dict):
                     metadata={"name": name, "type": conn_type}, resource_name=name)
     return serialize_doc(doc, drop=["credentialsEncrypted"])
 
+
+
+# ── PDF bank statement -> checked table (paid plans; no AI is used, so nothing leaves this server) ─────────
+@app.post("/api/pdf/extract")
+async def pdf_extract(request: Request, file: UploadFile = File(...), date_order: str = Form("")):
+    ctx, err = await _auth(request)
+    if err:
+        return err
+    data = await file.read()
+    if len(data) > 15 * 1024 * 1024:
+        return JSONResponse(status_code=413, content={"error": "PDF too large (max 15 MB)."})
+    if not data.startswith(b"%PDF"):
+        return JSONResponse(status_code=400, content={"error": "That file is not a PDF."})
+    order = date_order.strip().upper()
+    if order not in ("", "DMY", "MDY"):
+        return JSONResponse(status_code=400, content={"error": "date_order must be DMY or MDY."})
+    from starlette.concurrency import run_in_threadpool
+    import pdf_statement
+    try:
+        return await run_in_threadpool(pdf_statement.extract_statement, data, order or None)
+    except Exception as e:  # never leak a stack trace; the file itself is not stored anywhere
+        print(f"⚠ pdf_extract failed: {type(e).__name__}: {e}")
+        return JSONResponse(status_code=500, content={"error": "This PDF could not be read. Try the original PDF from your bank."})
 
 @app.post("/api/connections/upload-csv")
 async def upload_csv_connection(request: Request, file: UploadFile = File(...)):
