@@ -410,6 +410,7 @@ import os as _os
 _allowed_origins = [
     "https://www.thegodstool.com",
     "https://thegodstool.com",
+    "https://app.thegodstool.com",
     "https://www.thegodstool.com/",
     "http://www.thegodstool.com",
 ]
