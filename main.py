@@ -405,6 +405,65 @@ class PlanGateMiddleware(_PlanBase):
 
 app.add_middleware(PlanGateMiddleware)
 
+
+# ── Session check ────────────────────────────────────────────────────────────
+# The sign-in server hands out a login token that is valid for 7 days and records the session in the user's
+# document. Logging out, or being pushed off by the login limit, removes that session. This check makes the main
+# server honour it, so a token from a logged-out or evicted session stops working at once instead of at expiry.
+#   * SESSION_CHECK=off                  (Railway variable) switches it off instantly if something misbehaves.
+#   * SESSION_CHECK_TTL_SECONDS          how long an answer is remembered (default 30), so the database is not
+#                                        asked on every request.
+#   * Tokens with no session id (very old ones) are accepted, as on the sign-in server.
+#   * If the database cannot be reached the request is allowed, so a hiccup never locks paying customers out.
+SESSION_CHECK_ENABLED = os.getenv("SESSION_CHECK", "on").strip().lower() not in ("off", "0", "false", "no")
+try:
+    SESSION_CHECK_TTL = float(os.getenv("SESSION_CHECK_TTL_SECONDS", "30"))
+except ValueError:
+    SESSION_CHECK_TTL = 30.0
+_session_cache: dict = {}
+
+
+async def _session_is_alive(payload: dict) -> bool:
+    sid, uid = payload.get("sessionId"), payload.get("userId")
+    if not sid or not uid or mongo_db is None:
+        return True
+    key = (str(uid), str(sid))
+    now = time.monotonic()
+    hit = _session_cache.get(key)
+    if hit and now - hit[1] < SESSION_CHECK_TTL:
+        return hit[0]
+    try:
+        found = await mongo_db.users.count_documents({"_id": ObjectId(str(uid)), "sessions.sessionId": str(sid)}, limit=1)
+        alive = found > 0
+    except Exception as e:
+        print(f"⚠ session check failed, allowing request: {e}")
+        return True
+    if len(_session_cache) > 5000:
+        _session_cache.clear()
+    _session_cache[key] = (alive, now)
+    return alive
+
+
+class SessionGateMiddleware(_PlanBase):
+    """Registered BEFORE CORS (like the plan gate) so the 'session ended' answer still carries CORS headers."""
+
+    async def dispatch(self, request, call_next):
+        if SESSION_CHECK_ENABLED and request.method != "OPTIONS" and request.url.path.startswith("/api/"):
+            auth = request.headers.get("Authorization", "")
+            if auth.startswith("Bearer ") and JWT_SECRET:
+                try:
+                    import jwt as _pyjwt
+                    payload = _pyjwt.decode(auth[7:], JWT_SECRET, algorithms=["HS256"])
+                except Exception:
+                    payload = None   # not one of our login tokens: the route decides what to do with it
+                if payload and not await _session_is_alive(payload):
+                    return JSONResponse(status_code=401, content={
+                        "error": "You were signed out. Please sign in again.", "code": "session_ended"})
+        return await call_next(request)
+
+
+app.add_middleware(SessionGateMiddleware)
+
 import os as _os
 
 _allowed_origins = [
