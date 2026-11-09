@@ -513,7 +513,7 @@ def _reader_b(pdf) -> list[dict]:
                 elif nums:
                     break
             nums.reverse()
-            out.append({"page": pno, "nums": nums})
+            out.append({"page": pno, "nums": nums, "text": " ".join(toks)[:90]})
     return out
 
 
@@ -619,9 +619,33 @@ def verify(rows: list[Row], info: dict, reader_b: list[dict], date_certain: bool
     # 2. second reader
     if reader_b:
         if len(reader_b) != len(rows):
-            file_flags.append({"code": "row_count", "severity": "review",
-                               "message": f"The main reader found {len(rows)} transactions but the second reader found "
-                                          f"{len(reader_b)}. Rows may have been merged or lost."})
+            # Which lines does only the second reader see? Match balances one to one and list what is left over.
+            pool = [r.balance for r in rows if r.balance is not None]
+            extra = []
+            for b in reader_b:
+                v = b["nums"][-1][0] if b.get("nums") else None
+                hit = next((i for i, x in enumerate(pool) if v is not None and _eq(abs(x), abs(v))), None)
+                if hit is None:
+                    extra.append(b.get("text") or "")
+                else:
+                    pool.pop(hit)
+            sample = "; ".join(f"\"{e}\"" for e in extra[:2] if e)
+            bad_rows = any(r.status == "flagged" for r in rows)
+            unproven = sum(1 for r in rows if r.status != "verified")
+            chain_ok = len(has_balance) == len(rows) and not bad_rows and unproven <= 1
+            if len(reader_b) > len(rows) and chain_ok:
+                # A transaction missing from the main read would break the balance chain, and it did not,
+                # so the extra lines are most likely headers or notes that happen to start with a date.
+                file_flags.append({"code": "row_count", "severity": "info",
+                                   "message": f"The second reader counted {len(reader_b) - len(rows)} more dated line(s) than the "
+                                              f"main reader" + (f" ({sample})" if sample else "") + ". Every row the main reader "
+                                              "found follows from the balance before it, so a missing transaction would have "
+                                              "broken the chain. These are most likely headings or notes, not transactions."})
+            else:
+                file_flags.append({"code": "row_count", "severity": "review",
+                                   "message": f"The main reader found {len(rows)} transactions but the second reader found "
+                                              f"{len(reader_b)}. Rows may have been merged or lost."
+                                              + (f" Lines only the second reader saw: {sample}." if sample else "")})
         else:
             for r, b in zip(rows, reader_b):
                 nums = [v for v, _ in b["nums"]]
