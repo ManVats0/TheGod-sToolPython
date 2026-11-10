@@ -1227,6 +1227,25 @@ async def pdf_extract(request: Request, file: UploadFile = File(...), date_order
         print(f"⚠ pdf_extract failed: {type(e).__name__}: {e}")
         return JSONResponse(status_code=500, content={"error": "This PDF could not be read. Try the original PDF from your bank."})
 
+@app.post("/api/pdf/tables")
+async def pdf_tables(request: Request, file: UploadFile = File(...)):
+    """Any text-based PDF -> the tables in it, as plain rows. Same plan gate as the other /api/pdf routes."""
+    ctx, err = await _auth(request)
+    if err:
+        return err
+    data = await file.read()
+    if len(data) > 15 * 1024 * 1024:
+        return JSONResponse(status_code=413, content={"error": "PDF too large (max 15 MB)."})
+    if not data.startswith(b"%PDF"):
+        return JSONResponse(status_code=400, content={"error": "That file is not a PDF."})
+    from starlette.concurrency import run_in_threadpool
+    import pdf_tables
+    try:
+        return await run_in_threadpool(pdf_tables.extract_tables, data)
+    except Exception as e:
+        print(f"⚠ pdf_tables failed: {type(e).__name__}: {e}")
+        return JSONResponse(status_code=500, content={"error": "This PDF could not be read. Try the original PDF, not a scan."})
+
 @app.post("/api/connections/upload-csv")
 async def upload_csv_connection(request: Request, file: UploadFile = File(...)):
     if mongo_db is None:
