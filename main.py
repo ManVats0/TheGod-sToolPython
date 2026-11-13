@@ -1246,6 +1246,39 @@ async def pdf_tables(request: Request, file: UploadFile = File(...)):
         print(f"⚠ pdf_tables failed: {type(e).__name__}: {e}")
         return JSONResponse(status_code=500, content={"error": "This PDF could not be read. Try the original PDF, not a scan."})
 
+# ── Free try: one small PDF or CSV, no account. Limits live in free_try.py ──────────────────────────────────
+_free_try_slots = asyncio.Semaphore(2)
+
+def _client_ip(request: Request) -> str:
+    for h in ("cf-connecting-ip", "x-real-ip"):
+        v = request.headers.get(h)
+        if v:
+            return v.strip()
+    xff = request.headers.get("x-forwarded-for", "")
+    return (xff.split(",")[0].strip() if xff else (request.client.host if request.client else "unknown"))
+
+@app.post("/api/public/try")
+async def public_free_try(request: Request, file: UploadFile = File(...)):
+    import free_try
+    from starlette.concurrency import run_in_threadpool
+    data = await file.read(free_try.MAX_BYTES + 1)
+    if len(data) > free_try.MAX_BYTES:
+        return JSONResponse(status_code=413, content={"ok": False, "code": "too_big", "error": "The free try takes files up to 5 MB. Create a free account to use larger files."})
+    ok, left = free_try.allow_try(_client_ip(request))
+    if not ok:
+        return JSONResponse(status_code=429, content={"ok": False, "code": "limit", "error": f"That is {free_try.TRIES_PER_HOUR} free tries in the last hour. Create a free account to keep going, or try again later."})
+    if _free_try_slots.locked():
+        return JSONResponse(status_code=503, content={"ok": False, "code": "busy", "error": "Many people are trying it right now. Please try again in a minute."})
+    async with _free_try_slots:
+        try:
+            res = await run_in_threadpool(free_try.preview, file.filename or "", data)
+        except Exception as e:
+            print(f"⚠ free try failed: {type(e).__name__}: {e}")
+            return JSONResponse(status_code=500, content={"ok": False, "code": "error", "error": "This file could not be read. Try the original PDF or CSV."})
+    if res.get("ok"):
+        res["triesLeft"] = left
+    return res
+
 @app.post("/api/connections/upload-csv")
 async def upload_csv_connection(request: Request, file: UploadFile = File(...)):
     if mongo_db is None:

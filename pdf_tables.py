@@ -120,7 +120,7 @@ def _page_tables(page) -> list[list[list[str]]]:
     return [rows] if _good(rows) else []
 
 
-def extract_tables(data: bytes) -> dict:
+def extract_tables(data: bytes, max_pages: int = MAX_PAGES) -> dict:
     try:
         pdf = pdfplumber.open(io.BytesIO(data))
     except Exception as e:
@@ -136,7 +136,7 @@ def extract_tables(data: bytes) -> dict:
                     "error": "This looks like a scanned or photographed PDF: it has no text to read. Scanned files "
                              "are not supported yet. Use the original PDF (exported from the program that made it)."}
         tables: list[dict] = []      # {pages:set, rows, head}
-        for pno, page in enumerate(pdf.pages[:MAX_PAGES], start=1):
+        for pno, page in enumerate(pdf.pages[:max_pages], start=1):
             for rows in _page_tables(page):
                 head = tuple(c.lower() for c in rows[0])
                 last = tables[-1] if tables else None
@@ -148,7 +148,7 @@ def extract_tables(data: bytes) -> dict:
                     last["pages"].append(pno)
                 else:
                     tables.append({"pages": [pno], "rows": rows, "head": head})
-        truncated_pages = n_pages > MAX_PAGES
+        truncated_pages = n_pages > max_pages
     if not tables:
         return {"ok": False, "code": "no_table",
                 "error": "No table was found in this PDF. It may be plain text rather than a table, or a layout this "
