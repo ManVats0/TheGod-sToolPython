@@ -1279,6 +1279,17 @@ async def public_free_try(request: Request, file: UploadFile = File(...)):
         res["triesLeft"] = left
     return res
 
+@app.post("/api/public/chat")
+async def public_site_chat(request: Request):
+    import site_chat
+    from starlette.concurrency import run_in_threadpool
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    status, payload = await run_in_threadpool(site_chat.handle, body, _client_ip(request))
+    return JSONResponse(status_code=status, content=payload)
+
 @app.post("/api/connections/upload-csv")
 async def upload_csv_connection(request: Request, file: UploadFile = File(...)):
     if mongo_db is None:
