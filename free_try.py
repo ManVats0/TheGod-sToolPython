@@ -2,6 +2,7 @@
 
 Nothing is stored. The limits (size, pages, tries per hour, rows shown) live here so they can be changed in one place.
 """
+
 from __future__ import annotations
 
 import csv
@@ -16,7 +17,7 @@ MAX_PDF_PAGES = 10
 MAX_ROWS_COUNTED = 20000
 PREVIEW_ROWS = 20
 TRIES_PER_HOUR = 5
-GLOBAL_TRIES_PER_HOUR = 400   # a ceiling for everyone together, in case the address header is faked
+GLOBAL_TRIES_PER_HOUR = 400  # a ceiling for everyone together, in case the address header is faked
 
 _tries: dict[str, list[float]] = {}
 _all: list[float] = []
@@ -80,7 +81,13 @@ def problems(rows: list[list[str]]) -> dict:
     items = []
 
     empty_rows = sum(1 for r in body if all(not c.strip() for c in r))
-    blanks = sum(1 for r in body if not all(not c.strip() for c in r) for c in (r + [""] * (width - len(r)))[:width] if not c.strip())
+    blanks = sum(
+        1
+        for r in body
+        if not all(not c.strip() for c in r)
+        for c in (r + [""] * (width - len(r)))[:width]
+        if not c.strip()
+    )
     seen, dups = set(), 0
     for r in body:
         k = tuple(c.strip().lower() for c in r)
@@ -106,8 +113,14 @@ def problems(rows: list[list[str]]) -> dict:
             if len(counts) > 1:
                 mixed += len(dated) - max(counts.values())
 
-    for label, n in (("Blank cells", blanks), ("Duplicate rows", dups), ("Empty rows", empty_rows),
-                     ("Extra spaces", spaces), ("Numbers stored as text", numtext), ("Dates in mixed formats", mixed)):
+    for label, n in (
+        ("Blank cells", blanks),
+        ("Duplicate rows", dups),
+        ("Empty rows", empty_rows),
+        ("Extra spaces", spaces),
+        ("Numbers stored as text", numtext),
+        ("Dates in mixed formats", mixed),
+    ):
         if n:
             items.append({"label": label, "count": n})
     return {"total": sum(i["count"] for i in items), "items": items}
@@ -116,24 +129,41 @@ def problems(rows: list[list[str]]) -> dict:
 def preview(filename: str, data: bytes) -> dict:
     name = (filename or "").lower()
     if len(data) > MAX_BYTES:
-        return {"ok": False, "code": "too_big", "error": "The free try takes files up to 5 MB. Create a free account to use larger files."}
+        return {
+            "ok": False,
+            "code": "too_big",
+            "error": "The free try takes files up to 5 MB. Create a free account to use larger files.",
+        }
     if data.startswith(b"%PDF"):
         res = pdf_tables.extract_tables(data, max_pages=MAX_PDF_PAGES)
         if not res.get("ok"):
             return res
         t = res["tables"][0]
         rows, kind = t["rows"], "pdf"
-        extra = {"pages": res["pages"], "pagesRead": min(res["pages"], MAX_PDF_PAGES), "otherTables": len(res["tables"]) - 1}
+        extra = {
+            "pages": res["pages"],
+            "pagesRead": min(res["pages"], MAX_PDF_PAGES),
+            "otherTables": len(res["tables"]) - 1,
+        }
     elif name.endswith((".csv", ".tsv", ".txt")) or b"," in data[:2000] or b";" in data[:2000] or b"\t" in data[:2000]:
         rows, kind, extra = _csv_rows(data), "csv", {}
         if len(rows) < 2:
-            return {"ok": False, "code": "no_table", "error": "No table was found in this file. A CSV needs a header row and at least one row of data."}
+            return {
+                "ok": False,
+                "code": "no_table",
+                "error": "No table was found in this file. A CSV needs a header row and at least one row of data.",
+            }
     else:
         return {"ok": False, "code": "type", "error": "The free try reads PDF and CSV files."}
     width = max(len(r) for r in rows)
     rows = [r + [""] * (width - len(r)) for r in rows]
     return {
-        "ok": True, "kind": kind, "totalRows": len(rows) - 1, "cols": width,
-        "rows": rows[: PREVIEW_ROWS + 1], "shown": min(PREVIEW_ROWS, len(rows) - 1),
-        "problems": problems(rows), **extra,
+        "ok": True,
+        "kind": kind,
+        "totalRows": len(rows) - 1,
+        "cols": width,
+        "rows": rows[: PREVIEW_ROWS + 1],
+        "shown": min(PREVIEW_ROWS, len(rows) - 1),
+        "problems": problems(rows),
+        **extra,
     }

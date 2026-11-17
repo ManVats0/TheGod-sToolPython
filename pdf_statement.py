@@ -16,6 +16,7 @@ How it works (no AI is used, so the file never leaves this server):
 A statement can only be proven if it prints balances. Without them every row is "unchecked" and the file
 is labelled UNVERIFIED. Scanned files (no text layer) are refused, not guessed.
 """
+
 from __future__ import annotations
 
 import base64
@@ -32,6 +33,7 @@ MAX_PAGES = 60
 CENT = Decimal("0.005")
 
 # ── header vocabulary ─────────────────────────────────────────────────────────────────────────────────────────────
+
 
 def _role_of(label: str) -> str | None:
     t = re.sub(r"[^a-z/ ]+", " ", label.lower())
@@ -62,7 +64,9 @@ def _role_of(label: str) -> str | None:
 
 # ── tokens: dates and amounts ─────────────────────────────────────────────────────────────────────────────────────
 
-_MONTHS = {m: i + 1 for i, m in enumerate(["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"])}
+_MONTHS = {
+    m: i + 1 for i, m in enumerate(["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"])
+}
 _RE_DATE_NUM = re.compile(r"^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})$")
 _RE_DATE_ISO = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 _RE_DATE_MON = re.compile(r"^(\d{1,2})[ \-]([A-Za-z]{3,9})[ \-,]*(\d{2,4})$")
@@ -141,6 +145,7 @@ def looks_like_amount(text: str) -> bool:
 
 # ── layout helpers ────────────────────────────────────────────────────────────────────────────────────────────────
 
+
 @dataclass
 class W:
     text: str
@@ -176,14 +181,15 @@ class Col:
     role: str
     x0: float
     x1: float
-    lo: float = 0.0     # zone by x-centre
+    lo: float = 0.0  # zone by x-centre
     hi: float = 0.0
-    rlo: float = 0.0    # zone by right edge (for right-aligned numbers)
+    rlo: float = 0.0  # zone by right edge (for right-aligned numbers)
     rhi: float = 0.0
 
 
 def _find_header(lines: list[list[W]]) -> tuple[list[Col], int, int] | None:
     """Returns (columns, first_line_index, last_line_index) of the header band, or None."""
+
     def plain(ln):  # a header line carries no date / amount tokens
         return not any(looks_like_date(w.text) or looks_like_amount(w.text) for w in ln)
 
@@ -192,8 +198,11 @@ def _find_header(lines: list[list[W]]) -> tuple[list[Col], int, int] | None:
             continue
         band = [i]
         for j in (i - 1, i + 1):
-            if 0 <= j < len(lines) and plain(lines[j]) and abs(
-                    statistics.mean(w.top for w in lines[j]) - statistics.mean(w.top for w in lines[i])) <= 14:
+            if (
+                0 <= j < len(lines)
+                and plain(lines[j])
+                and abs(statistics.mean(w.top for w in lines[j]) - statistics.mean(w.top for w in lines[i])) <= 14
+            ):
                 band.append(j)
         band.sort()
         words = sorted((w for j in band for w in lines[j]), key=lambda w: w.x0)
@@ -261,9 +270,14 @@ def _assign_line(cols: list[Col], ln: list[W]) -> dict[str, list[W]]:
         c = _assign(cols, w)
         role = c.role if c else None
         # words that run on from the narration with an ordinary word space belong to the narration
-        if (role in ("ref", "value_date", None) and prev_role == "desc" and prev_w is not None
-                and w.x0 - prev_w.x1 < 6 and not looks_like_date(w.text)
-                and "desc" in {x.role for x in cols}):
+        if (
+            role in ("ref", "value_date", None)
+            and prev_role == "desc"
+            and prev_w is not None
+            and w.x0 - prev_w.x1 < 6
+            and not looks_like_date(w.text)
+            and "desc" in {x.role for x in cols}
+        ):
             role = "desc"
         if role:
             by_col.setdefault(role, []).append(w)
@@ -282,6 +296,7 @@ def _assign(cols: list[Col], w: W) -> Col | None:
 
 # ── row model ─────────────────────────────────────────────────────────────────────────────────────────────────────
 
+
 @dataclass
 class Row:
     id: int
@@ -290,13 +305,17 @@ class Row:
     bottom: float
     x0: float
     x1: float
-    cells: dict = field(default_factory=lambda: {r: [] for r in ("date", "value_date", "desc", "ref", "debit", "credit", "amount", "balance", "drcr")})
+    cells: dict = field(
+        default_factory=lambda: {
+            r: [] for r in ("date", "value_date", "desc", "ref", "debit", "credit", "amount", "balance", "drcr")
+        }
+    )
     date_text: str = ""
     # parsed
     date: date | None = None
     debit: Decimal | None = None
     credit: Decimal | None = None
-    amount: Decimal | None = None      # signed: +in, -out
+    amount: Decimal | None = None  # signed: +in, -out
     balance: Decimal | None = None
     direction_inferred: bool = False
     status: str = "unchecked"
@@ -307,8 +326,11 @@ class Row:
             self.flags.append({"code": code, "message": message, "severity": severity})
 
 
-_FOOTER = re.compile(r"(page\s+\d+|computer generated|registered office|customer care|toll free|statement of account|"
-                     r"this is a system|end of statement|\bgstin\b|continued on|\bwww\.)", re.I)
+_FOOTER = re.compile(
+    r"(page\s+\d+|computer generated|registered office|customer care|toll free|statement of account|"
+    r"this is a system|end of statement|\bgstin\b|continued on|\bwww\.)",
+    re.I,
+)
 _OPENING = re.compile(r"(opening\s+balance|balance\s+b/?f|brought\s+forward|balance\s+forward)", re.I)
 _CLOSING = re.compile(r"(closing\s+balance|balance\s+c/?f|carried\s+forward)", re.I)
 _TOTAL = re.compile(r"\btotal(s)?\b", re.I)
@@ -319,6 +341,7 @@ def _cell_text(ws: list[W]) -> str:
 
 
 # ── Reader A ──────────────────────────────────────────────────────────────────────────────────────────────────────
+
 
 def _read_pages(pdf) -> tuple[list[tuple[int, float, float, list[list[W]]]], int]:
     pages = []
@@ -403,6 +426,7 @@ def _reader_a(pages) -> tuple[list[Row], dict]:
 
 # ── parse cells into numbers ──────────────────────────────────────────────────────────────────────────────────────
 
+
 def _infer_date_order(rows: list[Row], forced: str | None) -> tuple[str, bool]:
     """(order, certain)."""
     if forced in ("DMY", "MDY"):
@@ -411,7 +435,7 @@ def _infer_date_order(rows: list[Row], forced: str | None) -> tuple[str, bool]:
     nums = [_RE_DATE_NUM.match(t) for t in texts]
     nums = [m for m in nums if m]
     if not nums:
-        return "DMY", True   # month names / ISO: no ambiguity
+        return "DMY", True  # month names / ISO: no ambiguity
     first_big = any(int(m.group(1)) > 12 for m in nums)
     second_big = any(int(m.group(2)) > 12 for m in nums)
     if first_big and not second_big:
@@ -483,11 +507,12 @@ def _parse_rows(rows: list[Row], order: str) -> None:
             elif marked:
                 r.amount = a
             else:
-                r.amount = a   # unsigned; direction settled against the balance below
+                r.amount = a  # unsigned; direction settled against the balance below
                 r.direction_inferred = True
 
 
 # ── Reader B: independent plain-text read ─────────────────────────────────────────────────────────────────────────
+
 
 def _reader_b(pdf) -> list[dict]:
     """Per-line read with no column logic: date at the start, then the numbers at the end of the line."""
@@ -500,7 +525,7 @@ def _reader_b(pdf) -> list[dict]:
                 continue
             head = toks[0]
             if len(toks) >= 3 and re.match(r"^\d{1,2}$", toks[0]) and re.match(r"^[A-Za-z]{3,9}[,]?$", toks[1]):
-                head = f"{toks[0]} {toks[1].rstrip(',')} {toks[2]}"   # "01 Apr 2024"
+                head = f"{toks[0]} {toks[1].rstrip(',')} {toks[2]}"  # "01 Apr 2024"
             if not looks_like_date(head):
                 continue
             nums = []
@@ -519,6 +544,7 @@ def _reader_b(pdf) -> list[dict]:
 
 # ── checks ────────────────────────────────────────────────────────────────────────────────────────────────────────
 
+
 def _eq(a: Decimal, b: Decimal) -> bool:
     return abs(a - b) <= CENT
 
@@ -536,8 +562,10 @@ def _chain_score(rows: list[Row], reverse: bool) -> int:
 
 def _diagnose(prev: Row, cur: Row, diff: Decimal, next_ok: bool | None) -> None:
     """diff = printed balance - (previous balance + amount)."""
-    msg = f"Balance does not follow: previous balance {prev.balance:,.2f} and this amount {cur.amount:,.2f} give " \
-          f"{prev.balance + cur.amount:,.2f}, but the statement prints {cur.balance:,.2f}."
+    msg = (
+        f"Balance does not follow: previous balance {prev.balance:,.2f} and this amount {cur.amount:,.2f} give "
+        f"{prev.balance + cur.amount:,.2f}, but the statement prints {cur.balance:,.2f}."
+    )
     code = "balance_break"
     hints = []
     if cur.amount is not None and _eq(prev.balance - cur.amount, cur.balance):
@@ -548,7 +576,12 @@ def _diagnose(prev: Row, cur: Row, diff: Decimal, next_ok: bool | None) -> None:
         code = "digits"
     if prev.page != cur.page:
         hints.append("This is the first row after a page break, so a row may have been lost there.")
-    if cur.amount is not None and prev.date_text == cur.date_text and prev.amount == cur.amount and prev.balance == cur.balance:
+    if (
+        cur.amount is not None
+        and prev.date_text == cur.date_text
+        and prev.amount == cur.amount
+        and prev.balance == cur.balance
+    ):
         hints.append("This row is identical to the one above it; it may be a duplicate.")
         code = "duplicate"
     if next_ok is True:
@@ -577,8 +610,12 @@ def verify(rows: list[Row], info: dict, reader_b: list[dict], date_certain: bool
                     pass
                 elif _eq(p.balance - c.amount, c.balance):
                     c.amount = -c.amount
-                c.flag("inferred", "The statement does not mark this amount as debit or credit; the direction was "
-                                   "worked out from the change in balance.", "info")
+                c.flag(
+                    "inferred",
+                    "The statement does not mark this amount as debit or credit; the direction was "
+                    "worked out from the change in balance.",
+                    "info",
+                )
         passes: dict[int, bool | None] = {}
         for i in range(1, len(seq)):
             p, c = seq[i - 1], seq[i]
@@ -604,24 +641,41 @@ def verify(rows: list[Row], info: dict, reader_b: list[dict], date_certain: bool
                 if _eq(info["opening"], exp):
                     first.status = "verified"
                 else:
-                    first.flag("opening", f"Opening balance {info['opening']:,.2f} plus this amount does not give the "
-                                          f"printed balance {first.balance:,.2f}.")
+                    first.flag(
+                        "opening",
+                        f"Opening balance {info['opening']:,.2f} plus this amount does not give the "
+                        f"printed balance {first.balance:,.2f}.",
+                    )
                     first.status = "flagged"
             else:
                 first.status = "unchecked"
-                first.flag("first_row", "This is the first row and there is no opening balance printed, so it cannot be "
-                                        "checked against a row before it.", "info")
+                first.flag(
+                    "first_row",
+                    "This is the first row and there is no opening balance printed, so it cannot be "
+                    "checked against a row before it.",
+                    "info",
+                )
     else:
-        file_flags.append({"code": "no_balances", "severity": "review",
-                           "message": "This statement does not print a running balance, so rows cannot be proven. "
-                                      "Check the totals against the PDF yourself."})
+        file_flags.append(
+            {
+                "code": "no_balances",
+                "severity": "review",
+                "message": "This statement does not print a running balance, so rows cannot be proven. "
+                "Check the totals against the PDF yourself.",
+            }
+        )
 
     # 2. second reader
     if reader_b:
         if len(reader_b) != len(rows):
-            file_flags.append({"code": "row_count", "severity": "review",
-                               "message": f"The main reader found {len(rows)} transactions but the second reader found "
-                                          f"{len(reader_b)}. Rows may have been merged or lost."})
+            file_flags.append(
+                {
+                    "code": "row_count",
+                    "severity": "review",
+                    "message": f"The main reader found {len(rows)} transactions but the second reader found "
+                    f"{len(reader_b)}. Rows may have been merged or lost.",
+                }
+            )
         else:
             for r, b in zip(rows, reader_b):
                 nums = [v for v, _ in b["nums"]]
@@ -645,36 +699,66 @@ def verify(rows: list[Row], info: dict, reader_b: list[dict], date_certain: bool
         seq0 = rows[::-1] if (len(has_balance) >= 2 and _chain_score(rows, True) > _chain_score(rows, False)) else rows
         first, last = seq0[0], seq0[-1]
         if info.get("closing") is not None and last.balance is not None and not _eq(info["closing"], last.balance):
-            file_flags.append({"code": "closing", "severity": "review",
-                               "message": f"The closing balance printed on the statement is {info['closing']:,.2f}, "
-                                          f"but the last row ends at {last.balance:,.2f}. A row may be missing."})
+            file_flags.append(
+                {
+                    "code": "closing",
+                    "severity": "review",
+                    "message": f"The closing balance printed on the statement is {info['closing']:,.2f}, "
+                    f"but the last row ends at {last.balance:,.2f}. A row may be missing.",
+                }
+            )
         if first.balance is not None and first.amount is not None and last.balance is not None:
             start = info["opening"] if info.get("opening") is not None else first.balance - first.amount
             if not _eq(start + sum(amts), last.balance):
-                file_flags.append({"code": "total", "severity": "review",
-                                   "message": f"Opening {start:,.2f} plus all rows is {start + sum(amts):,.2f}, "
-                                              f"but the final balance is {last.balance:,.2f}."})
+                file_flags.append(
+                    {
+                        "code": "total",
+                        "severity": "review",
+                        "message": f"Opening {start:,.2f} plus all rows is {start + sum(amts):,.2f}, "
+                        f"but the final balance is {last.balance:,.2f}.",
+                    }
+                )
     totals = info.get("printed_totals") or []
     if len(totals) == 1:
         pd_, pc_ = totals[0]
         sd = sum((r.debit or Decimal(0)) for r in rows) if any(r.debit is not None for r in rows) else None
         sc = sum((r.credit or Decimal(0)) for r in rows) if any(r.credit is not None for r in rows) else None
         if pd_ is not None and sd is not None and not _eq(pd_, sd):
-            file_flags.append({"code": "total_debit", "severity": "review",
-                               "message": f"Printed total debits are {pd_:,.2f}; the rows add up to {sd:,.2f}."})
+            file_flags.append(
+                {
+                    "code": "total_debit",
+                    "severity": "review",
+                    "message": f"Printed total debits are {pd_:,.2f}; the rows add up to {sd:,.2f}.",
+                }
+            )
         if pc_ is not None and sc is not None and not _eq(pc_, sc):
-            file_flags.append({"code": "total_credit", "severity": "review",
-                               "message": f"Printed total credits are {pc_:,.2f}; the rows add up to {sc:,.2f}."})
+            file_flags.append(
+                {
+                    "code": "total_credit",
+                    "severity": "review",
+                    "message": f"Printed total credits are {pc_:,.2f}; the rows add up to {sc:,.2f}.",
+                }
+            )
 
     # 4. dates
     if not date_certain:
-        file_flags.append({"code": "date_order", "severity": "review",
-                           "message": "Dates like 03/04/2024 could be 3 April or 4 March and the data does not settle "
-                                      "it. Pick the right order and run it again."})
+        file_flags.append(
+            {
+                "code": "date_order",
+                "severity": "review",
+                "message": "Dates like 03/04/2024 could be 3 April or 4 March and the data does not settle "
+                "it. Pick the right order and run it again.",
+            }
+        )
     ds = [r.date for r in rows if r.date]
     if len(ds) >= 3 and not (all(a <= b for a, b in zip(ds, ds[1:])) or all(a >= b for a, b in zip(ds, ds[1:]))):
-        file_flags.append({"code": "date_sequence", "severity": "review",
-                           "message": "Dates are not in order from top to bottom. A date may have been misread."})
+        file_flags.append(
+            {
+                "code": "date_sequence",
+                "severity": "review",
+                "message": "Dates are not in order from top to bottom. A date may have been misread.",
+            }
+        )
 
     # 5. duplicates without balances
     # (rows with identical date, description, amount and balance can be real; only flagged when a balance proves it)
@@ -700,11 +784,18 @@ def verify(rows: list[Row], info: dict, reader_b: list[dict], date_certain: bool
         label = "unverified"
     else:
         label = "partly_verified"
-    return {"label": label, "rows": len(rows), "verified": n_ver, "flagged": n_flag, "unchecked": n_unc,
-            "fileFlags": file_flags}
+    return {
+        "label": label,
+        "rows": len(rows),
+        "verified": n_ver,
+        "flagged": n_flag,
+        "unchecked": n_unc,
+        "fileFlags": file_flags,
+    }
 
 
 # ── public entry point ────────────────────────────────────────────────────────────────────────────────────────────
+
 
 def _fmt(d: Decimal | None) -> str | None:
     return None if d is None else f"{d:.2f}"
@@ -714,22 +805,32 @@ def extract_statement(data: bytes, date_order: str | None = None, with_images: b
     try:
         pdf = pdfplumber.open(io.BytesIO(data))
     except Exception as e:  # corrupt / encrypted
-        return {"ok": False, "code": "unreadable", "error": f"This PDF could not be opened ({type(e).__name__}). "
-                                                              "If it is password-protected, remove the password first."}
+        return {
+            "ok": False,
+            "code": "unreadable",
+            "error": f"This PDF could not be opened ({type(e).__name__}). "
+            "If it is password-protected, remove the password first.",
+        }
     with pdf:
         if len(pdf.pages) == 0:
             return {"ok": False, "code": "unreadable", "error": "This PDF has no pages."}
         pages, chars = _read_pages(pdf)
         if chars < 40:
-            return {"ok": False, "code": "scanned",
-                    "error": "This looks like a scanned or photographed statement: it has no text to read. Scanned files "
-                             "cannot be checked reliably yet, so they are not guessed. Download the PDF from your bank's "
-                             "website or app instead of scanning it."}
+            return {
+                "ok": False,
+                "code": "scanned",
+                "error": "This looks like a scanned or photographed statement: it has no text to read. Scanned files "
+                "cannot be checked reliably yet, so they are not guessed. Download the PDF from your bank's "
+                "website or app instead of scanning it.",
+            }
         rows, info = _reader_a(pages)
         if not info["header_found"]:
-            return {"ok": False, "code": "no_table",
-                    "error": "No transaction table was found. Statements need a header row with a date column, a balance "
-                             "column and a debit/credit or amount column."}
+            return {
+                "ok": False,
+                "code": "no_table",
+                "error": "No transaction table was found. Statements need a header row with a date column, a balance "
+                "column and a debit/credit or amount column.",
+            }
         order, certain = _infer_date_order(rows, date_order)
         _parse_rows(rows, order)
         rb = _reader_b(pdf)
@@ -749,20 +850,28 @@ def extract_statement(data: bytes, date_order: str | None = None, with_images: b
 
     out_rows = []
     for r in rows:
-        out_rows.append({
-            "id": r.id, "page": r.page,
-            "bbox": [round(r.x0, 1), round(r.top, 1), round(r.x1, 1), round(r.bottom, 1)],
-            "date": r.date.isoformat() if r.date else r.date_text,
-            "description": _cell_text(r.cells["desc"]),
-            "ref": _cell_text(r.cells["ref"]),
-            "debit": _fmt(-r.amount if r.amount is not None and r.amount < 0 else None),
-            "credit": _fmt(r.amount if r.amount is not None and r.amount > 0 else None),
-            "balance": _fmt(r.balance),
-            "status": r.status, "flags": r.flags,
-        })
+        out_rows.append(
+            {
+                "id": r.id,
+                "page": r.page,
+                "bbox": [round(r.x0, 1), round(r.top, 1), round(r.x1, 1), round(r.bottom, 1)],
+                "date": r.date.isoformat() if r.date else r.date_text,
+                "description": _cell_text(r.cells["desc"]),
+                "ref": _cell_text(r.cells["ref"]),
+                "debit": _fmt(-r.amount if r.amount is not None and r.amount < 0 else None),
+                "credit": _fmt(r.amount if r.amount is not None and r.amount > 0 else None),
+                "balance": _fmt(r.balance),
+                "status": r.status,
+                "flags": r.flags,
+            }
+        )
     return {
-        "ok": True, "summary": result, "dateOrder": order, "dateOrderCertain": certain,
+        "ok": True,
+        "summary": result,
+        "dateOrder": order,
+        "dateOrderCertain": certain,
         "pages": [{"page": p, "width": w, "height": h, "image": images.get(p)} for p, w, h, _ in pages],
-        "rows": out_rows, "truncated": truncated,
+        "rows": out_rows,
+        "truncated": truncated,
         "readers": "Two independent reads of the PDF's text, plus the statement's own balances.",
     }

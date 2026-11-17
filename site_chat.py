@@ -4,6 +4,7 @@ No database and nothing is saved: the conversation lives in the visitor's browse
 in-memory counters for rate limits. The knowledge is the website's own text, published by the frontend build at
 KNOWLEDGE_URL, so the answers stay in step with the pages without copying files between repos.
 """
+
 from __future__ import annotations
 
 import os
@@ -16,11 +17,11 @@ MODEL = os.getenv("SITE_CHAT_MODEL", "claude-haiku-4-5")
 SUPPORT_EMAIL = "contact@thegodstool.com"
 
 MAX_MESSAGE_CHARS = 600
-MAX_TURNS = 8            # messages kept from the conversation, newest last
+MAX_TURNS = 8  # messages kept from the conversation, newest last
 MAX_OUTPUT_TOKENS = 450
 PER_IP_PER_HOUR = 20
 PER_IP_PER_DAY = 60
-GLOBAL_PER_DAY = int(os.getenv("SITE_CHAT_DAILY_LIMIT", "400"))   # the cost ceiling for everyone together
+GLOBAL_PER_DAY = int(os.getenv("SITE_CHAT_DAILY_LIMIT", "400"))  # the cost ceiling for everyone together
 CHAT_ENABLED = os.getenv("SITE_CHAT", "on").strip().lower() not in ("off", "0", "false", "no")
 
 _hits: dict[str, list[float]] = {}
@@ -44,7 +45,7 @@ Rules:
 
 def _fetch(url: str) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": "TheGodsToolChat/1.0"})
-    with urllib.request.urlopen(req, timeout=8) as r:   # nosec - fixed URL from our own settings
+    with urllib.request.urlopen(req, timeout=8) as r:  # nosec - fixed URL from our own settings
         return r.read(400_000).decode("utf-8", "replace")
 
 
@@ -60,7 +61,7 @@ def knowledge(now: float | None = None) -> str:
     except Exception as e:
         print(f"⚠ site chat knowledge refresh failed: {type(e).__name__}")
         if _kb["text"]:
-            _kb["at"] = now - KNOWLEDGE_TTL + 300   # try again in 5 minutes, keep serving the old copy
+            _kb["at"] = now - KNOWLEDGE_TTL + 300  # try again in 5 minutes, keep serving the old copy
     return _kb["text"]
 
 
@@ -112,6 +113,7 @@ def clean_messages(raw) -> list[dict] | None:
 
 def _client():
     import anthropic
+
     key = os.getenv("ANTHROPIC_API_KEY", "")
     if not key:
         return None
@@ -137,23 +139,47 @@ def reply(messages: list[dict], kb: str, client=None) -> str:
 def handle(body, ip: str, client=None) -> tuple[int, dict]:
     """The whole request. Returns (http status, json body). Never raises."""
     if not CHAT_ENABLED:
-        return 503, {"ok": False, "code": "off", "error": f"The chat is switched off right now. Please email {SUPPORT_EMAIL}."}
+        return 503, {
+            "ok": False,
+            "code": "off",
+            "error": f"The chat is switched off right now. Please email {SUPPORT_EMAIL}.",
+        }
     msgs = clean_messages((body or {}).get("messages") if isinstance(body, dict) else None)
     if msgs is None:
         return 400, {"ok": False, "code": "bad", "error": "Please type a question."}
     kb = knowledge()
     if not kb:
-        return 503, {"ok": False, "code": "no_knowledge", "error": f"The assistant is not available right now. Please email {SUPPORT_EMAIL}."}
+        return 503, {
+            "ok": False,
+            "code": "no_knowledge",
+            "error": f"The assistant is not available right now. Please email {SUPPORT_EMAIL}.",
+        }
     why = allow(ip)
     if why == "ip":
-        return 429, {"ok": False, "code": "limit", "error": f"You have reached the chat limit for now. Please try again later or email {SUPPORT_EMAIL}."}
+        return 429, {
+            "ok": False,
+            "code": "limit",
+            "error": f"You have reached the chat limit for now. Please try again later or email {SUPPORT_EMAIL}.",
+        }
     if why == "busy":
-        return 503, {"ok": False, "code": "busy", "error": f"The assistant is resting for today. Please email {SUPPORT_EMAIL} and we will reply."}
+        return 503, {
+            "ok": False,
+            "code": "busy",
+            "error": f"The assistant is resting for today. Please email {SUPPORT_EMAIL} and we will reply.",
+        }
     try:
         text = reply(msgs, kb, client)
     except Exception as e:
         print(f"⚠ site chat failed: {type(e).__name__}")
-        return 502, {"ok": False, "code": "error", "error": f"I could not answer that just now. Please try again, or email {SUPPORT_EMAIL}."}
+        return 502, {
+            "ok": False,
+            "code": "error",
+            "error": f"I could not answer that just now. Please try again, or email {SUPPORT_EMAIL}.",
+        }
     if not text:
-        return 502, {"ok": False, "code": "empty", "error": f"I could not answer that just now. Please email {SUPPORT_EMAIL}."}
+        return 502, {
+            "ok": False,
+            "code": "empty",
+            "error": f"I could not answer that just now. Please email {SUPPORT_EMAIL}.",
+        }
     return 200, {"ok": True, "reply": text}
