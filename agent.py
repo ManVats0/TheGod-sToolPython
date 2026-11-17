@@ -36,8 +36,10 @@ from pathlib import Path
 from urllib.parse import quote_plus
 import aiomysql
 import websockets
+
 try:
     import asyncpg  # type: ignore
+
     HAS_ASYNCPG = True
 except ImportError:
     asyncpg = None  # type: ignore
@@ -45,6 +47,7 @@ except ImportError:
 
 try:
     import motor.motor_asyncio as motor_asyncio  # type: ignore
+
     HAS_MOTOR = True
 except ImportError:
     motor_asyncio = None  # type: ignore
@@ -52,6 +55,7 @@ except ImportError:
 
 try:
     from google.cloud import bigquery as bq_client  # type: ignore
+
     HAS_BIGQUERY = True
 except ImportError:
     bq_client = None  # type: ignore
@@ -59,6 +63,7 @@ except ImportError:
 
 try:
     import aiopg  # type: ignore
+
     HAS_AIOPG = True
 except ImportError:
     aiopg = None  # type: ignore
@@ -66,6 +71,7 @@ except ImportError:
 
 try:
     from databricks import sql as databricks_sql  # type: ignore
+
     HAS_DATABRICKS = True
 except ImportError:
     databricks_sql = None  # type: ignore
@@ -73,6 +79,7 @@ except ImportError:
 
 try:
     import aiohttp  # type: ignore
+
     HAS_AIOHTTP = True
 except ImportError:
     aiohttp = None  # type: ignore
@@ -88,7 +95,9 @@ DEFAULT_SERVER = "https://api.thegodstool.com"
 _READ_ONLY_START = ("select", "show", "describe", "desc", "explain", "with", "values")
 _WRITE_WORDS = re.compile(
     r"\b(insert|update|delete|drop|alter|truncate|create|grant|revoke|replace|merge|call|exec|execute|"
-    r"load|copy|attach|detach|vacuum|reindex|lock|set|into)\b", re.I)
+    r"load|copy|attach|detach|vacuum|reindex|lock|set|into)\b",
+    re.I,
+)
 
 
 def is_read_only_sql(sql) -> bool:
@@ -132,18 +141,34 @@ class GuardedWS:
             except Exception:
                 yield raw
                 continue
-            if (msg.get("type") == "query" and "method" in msg and not self._allow
-                    and str(msg.get("method", "GET")).upper() not in ("GET", "HEAD")):
+            if (
+                msg.get("type") == "query"
+                and "method" in msg
+                and not self._allow
+                and str(msg.get("method", "GET")).upper() not in ("GET", "HEAD")
+            ):
                 print("  ✗ Blocked a non-GET API call (this connector is read-only).")
-                await self._ws.send(json.dumps({
-                    "type": "query_result", "request_id": msg.get("request_id", ""),
-                    "error": "Blocked: this connector is read-only on the customer's computer."}))
+                await self._ws.send(
+                    json.dumps(
+                        {
+                            "type": "query_result",
+                            "request_id": msg.get("request_id", ""),
+                            "error": "Blocked: this connector is read-only on the customer's computer.",
+                        }
+                    )
+                )
                 continue
             if msg.get("type") == "query" and "sql" in msg and not self._allow and not is_read_only_sql(msg.get("sql")):
                 print("  ✗ Blocked a non read-only query (this connector is read-only).")
-                await self._ws.send(json.dumps({
-                    "type": "query_result", "request_id": msg.get("request_id", ""),
-                    "error": "Blocked: this connector is read-only on the customer's computer."}))
+                await self._ws.send(
+                    json.dumps(
+                        {
+                            "type": "query_result",
+                            "request_id": msg.get("request_id", ""),
+                            "error": "Blocked: this connector is read-only on the customer's computer.",
+                        }
+                    )
+                )
                 continue
             yield raw
 
@@ -189,9 +214,13 @@ async def handle_messages_postgres(ws, pg_conf: dict):
                 try:
                     ssl_ctx = pg_conf.get("ssl_ctx")
                     conn = await asyncpg.connect(
-                        host=pg_conf["host"], port=int(pg_conf["port"]),
-                        user=pg_conf["user"], password=pg_conf["password"],
-                        database=pg_conf["database"], ssl=ssl_ctx, timeout=10,
+                        host=pg_conf["host"],
+                        port=int(pg_conf["port"]),
+                        user=pg_conf["user"],
+                        password=pg_conf["password"],
+                        database=pg_conf["database"],
+                        ssl=ssl_ctx,
+                        timeout=10,
                     )
                     rows = await conn.fetch(sql)
                     await conn.close()
@@ -206,7 +235,16 @@ async def handle_messages_postgres(ws, pg_conf: dict):
                             else:
                                 safe[k] = v
                         safe_rows.append(safe)
-                    await ws.send(json.dumps({"type": "query_result", "request_id": request_id, "rows": safe_rows, "row_count": len(safe_rows)}))
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "query_result",
+                                "request_id": request_id,
+                                "rows": safe_rows,
+                                "row_count": len(safe_rows),
+                            }
+                        )
+                    )
                     print(f"  → PG Query OK [{len(safe_rows)} rows]")
                 except Exception as db_err:
                     await ws.send(json.dumps({"type": "query_result", "request_id": request_id, "error": str(db_err)}))
@@ -217,9 +255,13 @@ async def handle_messages_postgres(ws, pg_conf: dict):
                 try:
                     ssl_ctx = pg_conf.get("ssl_ctx")
                     conn = await asyncpg.connect(
-                        host=pg_conf["host"], port=int(pg_conf["port"]),
-                        user=pg_conf["user"], password=pg_conf["password"],
-                        database=pg_conf["database"], ssl=ssl_ctx, timeout=10,
+                        host=pg_conf["host"],
+                        port=int(pg_conf["port"]),
+                        user=pg_conf["user"],
+                        password=pg_conf["password"],
+                        database=pg_conf["database"],
+                        ssl=ssl_ctx,
+                        timeout=10,
                     )
                     rows = await conn.fetch(
                         "SELECT table_name FROM information_schema.tables "
@@ -258,11 +300,7 @@ async def handle_messages(ws, mysql_conf: dict):
                 params = msg.get("params", [])
 
                 if not sql:
-                    await ws.send(json.dumps({
-                        "type": "query_result",
-                        "request_id": request_id,
-                        "error": "Empty SQL"
-                    }))
+                    await ws.send(json.dumps({"type": "query_result", "request_id": request_id, "error": "Empty SQL"}))
                     continue
 
                 try:
@@ -294,20 +332,28 @@ async def handle_messages(ws, mysql_conf: dict):
                                 safe[k] = v
                         safe_rows.append(safe)
 
-                    await ws.send(json.dumps({
-                        "type": "query_result",
-                        "request_id": request_id,
-                        "rows": safe_rows,
-                        "row_count": len(safe_rows),
-                    }))
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "query_result",
+                                "request_id": request_id,
+                                "rows": safe_rows,
+                                "row_count": len(safe_rows),
+                            }
+                        )
+                    )
                     print(f"  → Query OK [{len(safe_rows)} rows]")
 
                 except Exception as db_err:
-                    await ws.send(json.dumps({
-                        "type": "query_result",
-                        "request_id": request_id,
-                        "error": str(db_err),
-                    }))
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "query_result",
+                                "request_id": request_id,
+                                "error": str(db_err),
+                            }
+                        )
+                    )
                     print(f"  ✗ DB error: {db_err}")
 
             elif msg_type == "list_tables":
@@ -326,18 +372,26 @@ async def handle_messages(ws, mysql_conf: dict):
                         await cur.execute("SHOW TABLES")
                         tables = [row[0] for row in await cur.fetchall()]
                     conn.close()
-                    await ws.send(json.dumps({
-                        "type": "table_list",
-                        "request_id": request_id,
-                        "tables": tables,
-                    }))
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "table_list",
+                                "request_id": request_id,
+                                "tables": tables,
+                            }
+                        )
+                    )
                     print(f"  → Tables: {tables}")
                 except Exception as e:
-                    await ws.send(json.dumps({
-                        "type": "table_list",
-                        "request_id": request_id,
-                        "error": str(e),
-                    }))
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "table_list",
+                                "request_id": request_id,
+                                "error": str(e),
+                            }
+                        )
+                    )
 
         except json.JSONDecodeError:
             print(f"  ✗ Bad message: {raw[:80]}")
@@ -368,10 +422,16 @@ async def handle_messages_mongodb(ws, conf: dict):
                 filter_doc = msg.get("filter", {})
                 limit = int(msg.get("limit", 100))
                 if not collection:
-                    await ws.send(json.dumps({"type": "query_result", "request_id": request_id, "error": "No collection specified"}))
+                    await ws.send(
+                        json.dumps(
+                            {"type": "query_result", "request_id": request_id, "error": "No collection specified"}
+                        )
+                    )
                     continue
                 try:
-                    uri = conf.get("uri") or f"mongodb://{conf['user']}:{conf['password']}@{conf['host']}:{conf['port']}"
+                    uri = (
+                        conf.get("uri") or f"mongodb://{conf['user']}:{conf['password']}@{conf['host']}:{conf['port']}"
+                    )
                     client = motor_asyncio.AsyncIOMotorClient(uri, serverSelectionTimeoutMS=10000)
                     db_handle = client[conf["database"]]
                     cursor = db_handle[collection].find(filter_doc).limit(limit)
@@ -390,7 +450,16 @@ async def handle_messages_mongodb(ws, conf: dict):
                             else:
                                 safe[k] = v
                         safe_docs.append(safe)
-                    await ws.send(json.dumps({"type": "query_result", "request_id": request_id, "rows": safe_docs, "row_count": len(safe_docs)}))
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "query_result",
+                                "request_id": request_id,
+                                "rows": safe_docs,
+                                "row_count": len(safe_docs),
+                            }
+                        )
+                    )
                     print(f"  → MongoDB Query OK [{len(safe_docs)} docs]")
                 except Exception as db_err:
                     await ws.send(json.dumps({"type": "query_result", "request_id": request_id, "error": str(db_err)}))
@@ -399,7 +468,9 @@ async def handle_messages_mongodb(ws, conf: dict):
             elif msg_type == "list_tables":
                 request_id = msg.get("request_id", "")
                 try:
-                    uri = conf.get("uri") or f"mongodb://{conf['user']}:{conf['password']}@{conf['host']}:{conf['port']}"
+                    uri = (
+                        conf.get("uri") or f"mongodb://{conf['user']}:{conf['password']}@{conf['host']}:{conf['port']}"
+                    )
                     client = motor_asyncio.AsyncIOMotorClient(uri, serverSelectionTimeoutMS=10000)
                     db_handle = client[conf["database"]]
                     collections = await db_handle.list_collection_names()
@@ -424,6 +495,7 @@ async def handle_messages_bigquery(ws, conf: dict):
     print("  ✓ BigQuery tunnel active — waiting for queries...\n")
 
     import os
+
     if conf.get("service_account_json"):
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = conf["service_account_json"]
 
@@ -444,12 +516,14 @@ async def handle_messages_bigquery(ws, conf: dict):
                     continue
                 try:
                     loop = asyncio.get_event_loop()
+
                     def _run_bq():
                         client = bq_client.Client(project=conf["project"])
                         query_job = client.query(sql)
                         rows = list(query_job.result())
                         client.close()
                         return rows
+
                     rows = await loop.run_in_executor(None, _run_bq)
                     safe_rows = []
                     for row in rows:
@@ -462,7 +536,16 @@ async def handle_messages_bigquery(ws, conf: dict):
                             else:
                                 safe[k] = v
                         safe_rows.append(safe)
-                    await ws.send(json.dumps({"type": "query_result", "request_id": request_id, "rows": safe_rows, "row_count": len(safe_rows)}))
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "query_result",
+                                "request_id": request_id,
+                                "rows": safe_rows,
+                                "row_count": len(safe_rows),
+                            }
+                        )
+                    )
                     print(f"  → BigQuery OK [{len(safe_rows)} rows]")
                 except Exception as db_err:
                     await ws.send(json.dumps({"type": "query_result", "request_id": request_id, "error": str(db_err)}))
@@ -472,12 +555,14 @@ async def handle_messages_bigquery(ws, conf: dict):
                 request_id = msg.get("request_id", "")
                 try:
                     loop = asyncio.get_event_loop()
+
                     def _list_bq():
                         client = bq_client.Client(project=conf["project"])
                         dataset = conf.get("dataset", "")
                         tables = [t.table_id for t in client.list_tables(dataset)] if dataset else []
                         client.close()
                         return tables
+
                     tables = await loop.run_in_executor(None, _list_bq)
                     await ws.send(json.dumps({"type": "table_list", "request_id": request_id, "tables": tables}))
                     print(f"  → BigQuery Tables: {tables}")
@@ -515,6 +600,7 @@ async def handle_messages_databricks(ws, conf: dict):
                     continue
                 try:
                     loop = asyncio.get_event_loop()
+
                     def _run_databricks():
                         conn = databricks_sql.connect(
                             server_hostname=conf["host"],
@@ -528,6 +614,7 @@ async def handle_messages_databricks(ws, conf: dict):
                         cursor.close()
                         conn.close()
                         return rows
+
                     rows = await loop.run_in_executor(None, _run_databricks)
                     safe_rows = []
                     for row in rows:
@@ -540,7 +627,16 @@ async def handle_messages_databricks(ws, conf: dict):
                             else:
                                 safe[k] = v
                         safe_rows.append(safe)
-                    await ws.send(json.dumps({"type": "query_result", "request_id": request_id, "rows": safe_rows, "row_count": len(safe_rows)}))
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "query_result",
+                                "request_id": request_id,
+                                "rows": safe_rows,
+                                "row_count": len(safe_rows),
+                            }
+                        )
+                    )
                     print(f"  → Databricks OK [{len(safe_rows)} rows]")
                 except Exception as db_err:
                     await ws.send(json.dumps({"type": "query_result", "request_id": request_id, "error": str(db_err)}))
@@ -550,6 +646,7 @@ async def handle_messages_databricks(ws, conf: dict):
                 request_id = msg.get("request_id", "")
                 try:
                     loop = asyncio.get_event_loop()
+
                     def _list_databricks():
                         conn = databricks_sql.connect(
                             server_hostname=conf["host"],
@@ -562,6 +659,7 @@ async def handle_messages_databricks(ws, conf: dict):
                         cursor.close()
                         conn.close()
                         return tables
+
                     tables = await loop.run_in_executor(None, _list_databricks)
                     await ws.send(json.dumps({"type": "table_list", "request_id": request_id, "tables": tables}))
                     print(f"  → Databricks Tables: {tables}")
@@ -573,6 +671,7 @@ async def handle_messages_databricks(ws, conf: dict):
         except websockets.exceptions.ConnectionClosed:
             print("\n  Server closed connection.")
             break
+
 
 async def handle_messages_rest(ws, conf: dict):
     """Listen for requests from The God's Tool server, execute REST API calls."""
@@ -600,15 +699,29 @@ async def handle_messages_rest(ws, conf: dict):
                 timeout_val = msg.get("timeout", 30)
 
                 if not endpoint:
-                    await ws.send(json.dumps({"type": "query_result", "request_id": request_id, "error": "No endpoint provided"}))
+                    await ws.send(
+                        json.dumps({"type": "query_result", "request_id": request_id, "error": "No endpoint provided"})
+                    )
                     continue
 
                 # Only talk to the API you configured. Stops the server from using this computer to reach other machines on your network.
                 from urllib.parse import urlparse
-                allowed_hosts = {urlparse(u).netloc.lower() for u in [conf.get("base_url", "")] + list(conf.get("endpoints", [])) if u}
+
+                allowed_hosts = {
+                    urlparse(u).netloc.lower()
+                    for u in [conf.get("base_url", "")] + list(conf.get("endpoints", []))
+                    if u
+                }
                 if urlparse(endpoint).netloc.lower() not in allowed_hosts:
-                    await ws.send(json.dumps({"type": "query_result", "request_id": request_id,
-                                              "error": "Blocked: that address is not the API this connector was set up for."}))
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "query_result",
+                                "request_id": request_id,
+                                "error": "Blocked: that address is not the API this connector was set up for.",
+                            }
+                        )
+                    )
                     print(f"  ✗ Blocked request to {endpoint}")
                     continue
 
@@ -666,13 +779,17 @@ async def handle_messages_rest(ws, conf: dict):
                         else:
                             safe_rows.append({"value": str(row)})
 
-                    await ws.send(json.dumps({
-                        "type": "query_result",
-                        "request_id": request_id,
-                        "rows": safe_rows,
-                        "row_count": len(safe_rows),
-                        "status_code": status,
-                    }))
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "query_result",
+                                "request_id": request_id,
+                                "rows": safe_rows,
+                                "row_count": len(safe_rows),
+                                "status_code": status,
+                            }
+                        )
+                    )
                     print(f"  → REST {method} {endpoint} → {status} [{len(safe_rows)} rows]")
                 except Exception as api_err:
                     await ws.send(json.dumps({"type": "query_result", "request_id": request_id, "error": str(api_err)}))
@@ -693,6 +810,7 @@ async def handle_messages_rest(ws, conf: dict):
         except websockets.exceptions.ConnectionClosed:
             print("\n  Server closed connection.")
             break
+
 
 async def handle_messages_redshift(ws, conf: dict):
     """Listen for requests from The God's Tool server, execute on AWS Redshift (PostgreSQL wire protocol via aiopg)."""
@@ -735,7 +853,16 @@ async def handle_messages_redshift(ws, conf: dict):
                             else:
                                 safe[k] = v
                         safe_rows.append(safe)
-                    await ws.send(json.dumps({"type": "query_result", "request_id": request_id, "rows": safe_rows, "row_count": len(safe_rows)}))
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "query_result",
+                                "request_id": request_id,
+                                "rows": safe_rows,
+                                "row_count": len(safe_rows),
+                            }
+                        )
+                    )
                     print(f"  → Redshift OK [{len(safe_rows)} rows]")
                 except Exception as db_err:
                     await ws.send(json.dumps({"type": "query_result", "request_id": request_id, "error": str(db_err)}))
@@ -779,14 +906,18 @@ async def run_tunnel(server_url: str, token: str, mysql_conf: dict, allow_writes
                 ping_timeout=10,
             ) as ws:
                 # Register with server
-                await ws.send(json.dumps({
-                    "type": "register",
-                    "token": token,
-                    "database": mysql_conf["database"],
-                    "host": mysql_conf["host"],
-                    "db_type": mysql_conf.get("db_type", "mysql"),
-                    "version": VERSION,
-                }))
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "register",
+                            "token": token,
+                            "database": mysql_conf["database"],
+                            "host": mysql_conf["host"],
+                            "db_type": mysql_conf.get("db_type", "mysql"),
+                            "version": VERSION,
+                        }
+                    )
+                )
 
                 ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
                 if ack.get("type") != "registered":
@@ -849,7 +980,15 @@ def main_manual(allow_writes: bool = False, server: str = ""):
         print(f"  Please enter one of: {', '.join(VALID_DB_TYPES)}")
         db_type = prompt("Database type", "mysql").lower().strip()
 
-    default_port_map = {"mysql": "3306", "postgres": "5432", "mongodb": "27017", "redshift": "5439", "bigquery": "", "databricks": "443", "rest": "443"}
+    default_port_map = {
+        "mysql": "3306",
+        "postgres": "5432",
+        "mongodb": "27017",
+        "redshift": "5439",
+        "bigquery": "",
+        "databricks": "443",
+        "rest": "443",
+    }
     default_port = default_port_map.get(db_type, "")
     default_user_map = {"mysql": "root", "postgres": "postgres", "mongodb": "admin", "redshift": "awsuser"}
     print(f"\nStep 4 — Your {db_type.upper()} Credentials:")
@@ -857,30 +996,30 @@ def main_manual(allow_writes: bool = False, server: str = ""):
     db_conf: dict = {"db_type": db_type}
 
     if db_type == "bigquery":
-        db_conf["project"]              = prompt("GCP Project ID")
-        db_conf["dataset"]              = prompt("Dataset name (optional)", "")
+        db_conf["project"] = prompt("GCP Project ID")
+        db_conf["dataset"] = prompt("Dataset name (optional)", "")
         db_conf["service_account_json"] = prompt("Path to service account JSON file", "")
-        db_conf["database"]             = db_conf["project"]  # used in register message
-        db_conf["host"]                 = "bigquery.googleapis.com"
+        db_conf["database"] = db_conf["project"]  # used in register message
+        db_conf["host"] = "bigquery.googleapis.com"
         if not db_conf["project"]:
             print("  ✗ GCP Project ID required. Exiting.")
             sys.exit(1)
 
     elif db_type == "databricks":
-        db_conf["host"]      = prompt("Databricks workspace hostname", "")
+        db_conf["host"] = prompt("Databricks workspace hostname", "")
         db_conf["http_path"] = prompt("HTTP Path (SQL Warehouse)", "/sql/1.0/warehouses/...")
-        db_conf["password"]  = prompt("Personal Access Token", secret=True)
-        db_conf["database"]  = prompt("Catalog/Schema name (optional)", "default")
-        db_conf["port"]      = 443
-        db_conf["user"]      = "token"
-        db_conf["ssl_ctx"]   = ssl.create_default_context()
+        db_conf["password"] = prompt("Personal Access Token", secret=True)
+        db_conf["database"] = prompt("Catalog/Schema name (optional)", "default")
+        db_conf["port"] = 443
+        db_conf["user"] = "token"
+        db_conf["ssl_ctx"] = ssl.create_default_context()
         if not db_conf["host"] or not db_conf["password"]:
             print("  ✗ Hostname and token required. Exiting.")
             sys.exit(1)
 
     elif db_type == "rest":
         base_url = prompt("Base URL (e.g. https://api.example.com/v1)")
-        api_key  = prompt("API Key or Bearer Token (leave blank if none)", secret=True)
+        api_key = prompt("API Key or Bearer Token (leave blank if none)", secret=True)
         auth_header = prompt("Auth header name", "Authorization")
         auth_prefix = prompt("Auth prefix (e.g. Bearer, Token, ApiKey)", "Bearer")
         endpoints_raw = prompt("Endpoints to expose as tables (comma-separated, e.g. /users,/orders)", "")
@@ -906,55 +1045,59 @@ def main_manual(allow_writes: bool = False, server: str = ""):
             else:
                 full_endpoints.append(base_url.rstrip("/") + "/" + ep.lstrip("/"))
 
-        db_conf["base_url"]    = base_url.rstrip("/")
-        db_conf["headers"]     = headers
-        db_conf["endpoints"]   = full_endpoints
-        db_conf["verify_ssl"]  = verify_ssl_str in ("y", "yes")
-        db_conf["database"]    = base_url.rstrip("/").replace("https://", "").replace("http://", "").split("/")[0]
-        db_conf["host"]        = db_conf["database"]
-        db_conf["port"]        = 443
-        db_conf["user"]        = "api"
-        db_conf["password"]    = api_key
+        db_conf["base_url"] = base_url.rstrip("/")
+        db_conf["headers"] = headers
+        db_conf["endpoints"] = full_endpoints
+        db_conf["verify_ssl"] = verify_ssl_str in ("y", "yes")
+        db_conf["database"] = base_url.rstrip("/").replace("https://", "").replace("http://", "").split("/")[0]
+        db_conf["host"] = db_conf["database"]
+        db_conf["port"] = 443
+        db_conf["user"] = "api"
+        db_conf["password"] = api_key
 
     elif db_type == "mongodb":
-        db_uri      = prompt("Connection URI", "mongodb://localhost:27017")
+        db_uri = prompt("Connection URI", "mongodb://localhost:27017")
         db_database = prompt("Database name")
-        use_ssl     = prompt("Use SSL? (y/n)", "n").lower() in ("y", "yes")
+        use_ssl = prompt("Use SSL? (y/n)", "n").lower() in ("y", "yes")
 
         if not db_database:
             print("  ✗ Database name required. Exiting.")
             sys.exit(1)
 
-        db_conf.update({
-            "uri":      db_uri,
-            "host":     db_uri,
-            "port":     27017,
-            "user":     "",
-            "password": "",
-            "database": db_database,
-            "ssl_ctx":  ssl.create_default_context() if use_ssl else None,
-        })
+        db_conf.update(
+            {
+                "uri": db_uri,
+                "host": db_uri,
+                "port": 27017,
+                "user": "",
+                "password": "",
+                "database": db_database,
+                "ssl_ctx": ssl.create_default_context() if use_ssl else None,
+            }
+        )
 
     else:
-        db_host     = prompt("Host", "localhost")
-        db_port     = prompt("Port", default_port)
-        db_user     = prompt("Username", default_user_map.get(db_type, ""))
+        db_host = prompt("Host", "localhost")
+        db_port = prompt("Port", default_port)
+        db_user = prompt("Username", default_user_map.get(db_type, ""))
         db_password = prompt("Password", secret=True)
         db_database = prompt("Database name")
-        use_ssl     = prompt("Use SSL? (y/n)", "n").lower() in ("y", "yes")
+        use_ssl = prompt("Use SSL? (y/n)", "n").lower() in ("y", "yes")
 
         if not db_database:
             print("  ✗ Database name required. Exiting.")
             sys.exit(1)
 
-        db_conf.update({
-            "host":     db_host,
-            "port":     int(db_port),
-            "user":     db_user,
-            "password": db_password,
-            "database": db_database,
-            "ssl_ctx":  ssl.create_default_context() if use_ssl else None,
-        })
+        db_conf.update(
+            {
+                "host": db_host,
+                "port": int(db_port),
+                "user": db_user,
+                "password": db_password,
+                "database": db_database,
+                "ssl_ctx": ssl.create_default_context() if use_ssl else None,
+            }
+        )
 
     print("\n" + "-" * 58)
     print(f"  Server  : {server_url}")
@@ -981,7 +1124,6 @@ def main_manual(allow_writes: bool = False, server: str = ""):
         print("\n\n  Agent stopped.")
 
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  One-click mode
 #    python agent.py --pair ABCD-EFGH
@@ -994,10 +1136,10 @@ CONFIG_DIR = Path(os.environ.get("THEGODSTOOL_HOME") or (Path.home() / ".thegods
 CONFIG_FILE = CONFIG_DIR / "agent.json"
 
 DB_CHOICES = {
-    "mysql":    {"label": "MySQL / MariaDB", "port": "3306", "user": "root"},
-    "postgres": {"label": "PostgreSQL",      "port": "5432", "user": "postgres"},
-    "mongodb":  {"label": "MongoDB",         "port": "27017", "user": ""},
-    "redshift": {"label": "AWS Redshift",    "port": "5439", "user": "awsuser"},
+    "mysql": {"label": "MySQL / MariaDB", "port": "3306", "user": "root"},
+    "postgres": {"label": "PostgreSQL", "port": "5432", "user": "postgres"},
+    "mongodb": {"label": "MongoDB", "port": "27017", "user": ""},
+    "redshift": {"label": "AWS Redshift", "port": "5439", "user": "awsuser"},
 }
 
 
@@ -1039,7 +1181,7 @@ def _agent_command() -> list:
         return [sys.executable]
     exe = sys.executable
     if os.name == "nt":
-        w = Path(exe).with_name("pythonw.exe")   # no console window
+        w = Path(exe).with_name("pythonw.exe")  # no console window
         if w.exists():
             exe = str(w)
     return [exe, str(Path(__file__).resolve())]
@@ -1047,6 +1189,7 @@ def _agent_command() -> list:
 
 def _run(cmd: list, check: bool = True):
     import subprocess
+
     r = subprocess.run(cmd, capture_output=True, text=True)
     if check and r.returncode != 0:
         raise RuntimeError((r.stderr or r.stdout or f"{cmd[0]} failed").strip())
@@ -1054,7 +1197,9 @@ def _run(cmd: list, check: bool = True):
 
 
 def _systemd_quote(parts: list) -> str:
-    return " ".join('"' + p.replace("\\", "\\\\").replace('"', '\\"') + '"' if (" " in p or '"' in p) else p for p in parts)
+    return " ".join(
+        '"' + p.replace("\\", "\\\\").replace('"', '\\"') + '"' if (" " in p or '"' in p) else p for p in parts
+    )
 
 
 def systemd_unit_text() -> str:
@@ -1062,13 +1207,21 @@ def systemd_unit_text() -> str:
     return (
         "[Unit]\nDescription=The God's Tool agent\nAfter=network-online.target\nWants=network-online.target\n\n"
         f"[Service]\nExecStart={_systemd_quote(_agent_command())}\n{env}Restart=always\nRestartSec=5\n\n"
-        "[Install]\nWantedBy=default.target\n")
+        "[Install]\nWantedBy=default.target\n"
+    )
 
 
 def mac_plist_bytes() -> bytes:
     import plistlib
-    data = {"Label": MAC_LABEL, "ProgramArguments": _agent_command(), "RunAtLoad": True, "KeepAlive": True,
-            "StandardOutPath": str(CONFIG_DIR / "agent.log"), "StandardErrorPath": str(CONFIG_DIR / "agent.log")}
+
+    data = {
+        "Label": MAC_LABEL,
+        "ProgramArguments": _agent_command(),
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "StandardOutPath": str(CONFIG_DIR / "agent.log"),
+        "StandardErrorPath": str(CONFIG_DIR / "agent.log"),
+    }
     if os.environ.get("THEGODSTOOL_HOME"):
         data["EnvironmentVariables"] = {"THEGODSTOOL_HOME": str(CONFIG_DIR)}
     return plistlib.dumps(data)
@@ -1094,13 +1247,20 @@ def install_service() -> str:
         except (RuntimeError, FileNotFoundError, OSError) as e:
             (unit_dir / f"{SERVICE_NAME}.service").unlink(missing_ok=True)
             import shutil
+
             if not shutil.which("crontab"):
                 raise RuntimeError(f"Could not set up start-on-boot here ({e}).")
             line = f"@reboot {_systemd_quote(_agent_command())} >> {CONFIG_DIR}/agent.log 2>&1 # {SERVICE_NAME}"
             cur = _run(["crontab", "-l"], check=False).stdout
             if SERVICE_NAME not in cur:
                 import subprocess
-                subprocess.run(["crontab", "-"], input=(cur.rstrip("\n") + "\n" if cur.strip() else "") + line + "\n", text=True, check=True)
+
+                subprocess.run(
+                    ["crontab", "-"],
+                    input=(cur.rstrip("\n") + "\n" if cur.strip() else "") + line + "\n",
+                    text=True,
+                    check=True,
+                )
             return "Added a start-at-reboot entry to your crontab. It runs at the next restart."
     if sys.platform == "darwin":
         path = Path.home() / "Library" / "LaunchAgents" / f"{MAC_LABEL}.plist"
@@ -1114,7 +1274,21 @@ def install_service() -> str:
             _run(["launchctl", "load", "-w", str(path)])
         return "Installed as a login item. It starts when you log in and restarts if it stops."
     if os.name == "nt":
-        _run(["schtasks", "/Create", "/F", "/TN", WIN_TASK, "/SC", "ONLOGON", "/RL", "LIMITED", "/TR", windows_task_command()])
+        _run(
+            [
+                "schtasks",
+                "/Create",
+                "/F",
+                "/TN",
+                WIN_TASK,
+                "/SC",
+                "ONLOGON",
+                "/RL",
+                "LIMITED",
+                "/TR",
+                windows_task_command(),
+            ]
+        )
         _run(["schtasks", "/Run", "/TN", WIN_TASK], check=False)
         return "Installed as a scheduled task. It starts when you sign in."
     raise RuntimeError("Start-on-boot is not supported on this system.")
@@ -1126,8 +1300,10 @@ def remove_service() -> str:
         (Path.home() / ".config" / "systemd" / "user" / f"{SERVICE_NAME}.service").unlink(missing_ok=True)
         _run(["systemctl", "--user", "daemon-reload"], check=False)
         import shutil
+
         if shutil.which("crontab"):
             import subprocess
+
             cur = _run(["crontab", "-l"], check=False).stdout
             kept = "".join(l + "\n" for l in cur.splitlines() if SERVICE_NAME not in l)
             if kept != cur:
@@ -1144,8 +1320,9 @@ def remove_service() -> str:
 
 def claim_pair_code(server: str, code: str) -> dict:
     body = json.dumps({"code": code, "device": socket.gethostname()}).encode()
-    req = urllib.request.Request(server.rstrip("/") + "/api/agent/claim", data=body,
-                                 headers={"Content-Type": "application/json"}, method="POST")
+    req = urllib.request.Request(
+        server.rstrip("/") + "/api/agent/claim", data=body, headers={"Content-Type": "application/json"}, method="POST"
+    )
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
             return json.loads(r.read())
@@ -1163,12 +1340,20 @@ def build_db_conf(saved: dict) -> dict:
     """Turn the saved (JSON-safe) database settings into what the handlers expect."""
     t = saved["db_type"]
     use_ssl = bool(saved.get("ssl"))
-    conf = {"db_type": t, "host": saved["host"], "port": int(saved["port"] or 0),
-            "user": saved.get("user", ""), "password": saved.get("password", ""),
-            "database": saved["database"], "ssl_ctx": ssl.create_default_context() if use_ssl else None}
+    conf = {
+        "db_type": t,
+        "host": saved["host"],
+        "port": int(saved["port"] or 0),
+        "user": saved.get("user", ""),
+        "password": saved.get("password", ""),
+        "database": saved["database"],
+        "ssl_ctx": ssl.create_default_context() if use_ssl else None,
+    }
     if t == "mongodb":
         cred = f"{quote_plus(conf['user'])}:{quote_plus(conf['password'])}@" if conf["user"] else ""
-        conf["uri"] = f"mongodb://{cred}{conf['host']}:{conf['port']}/?authSource=admin" + ("&tls=true" if use_ssl else "")
+        conf["uri"] = f"mongodb://{cred}{conf['host']}:{conf['port']}/?authSource=admin" + (
+            "&tls=true" if use_ssl else ""
+        )
     return conf
 
 
@@ -1176,14 +1361,28 @@ async def test_db(conf: dict) -> None:
     """Raises with a readable message if this computer cannot reach the database."""
     t = conf["db_type"]
     if t == "mysql":
-        conn = await aiomysql.connect(host=conf["host"], port=conf["port"], user=conf["user"], password=conf["password"],
-                                      db=conf["database"], ssl=conf["ssl_ctx"], connect_timeout=10)
+        conn = await aiomysql.connect(
+            host=conf["host"],
+            port=conf["port"],
+            user=conf["user"],
+            password=conf["password"],
+            db=conf["database"],
+            ssl=conf["ssl_ctx"],
+            connect_timeout=10,
+        )
         conn.close()
     elif t == "postgres":
         if not HAS_ASYNCPG:
             raise RuntimeError("PostgreSQL support is missing. Run: pip install asyncpg")
-        conn = await asyncpg.connect(host=conf["host"], port=conf["port"], user=conf["user"], password=conf["password"],
-                                     database=conf["database"], ssl=conf["ssl_ctx"], timeout=10)
+        conn = await asyncpg.connect(
+            host=conf["host"],
+            port=conf["port"],
+            user=conf["user"],
+            password=conf["password"],
+            database=conf["database"],
+            ssl=conf["ssl_ctx"],
+            timeout=10,
+        )
         await conn.close()
     elif t == "mongodb":
         if not HAS_MOTOR:
@@ -1268,8 +1467,12 @@ def run_setup_page(cfg: dict) -> dict:
         def do_GET(self):
             if not self._host_ok() or self.path.split("?")[0] != "/":
                 return self._send(404, "{}")
-            page = (SETUP_PAGE.replace("__OPTIONS__", options).replace("__SECRET__", secret)
-                    .replace("__MODE__", mode).replace("__DEFAULTS__", json.dumps(DB_CHOICES)))
+            page = (
+                SETUP_PAGE.replace("__OPTIONS__", options)
+                .replace("__SECRET__", secret)
+                .replace("__MODE__", mode)
+                .replace("__DEFAULTS__", json.dumps(DB_CHOICES))
+            )
             self._send(200, page, "text/html")
 
         def do_POST(self):
@@ -1287,13 +1490,28 @@ def run_setup_page(cfg: dict) -> dict:
             port = str(body.get("port", "")).strip()
             database = str(body.get("database", "")).strip()
             if t not in DB_CHOICES or not host or not database or not port.isdigit():
-                return self._send(200, json.dumps({"ok": False, "error": "Please fill in host, a numeric port and the database name."}))
-            saved = {"db_type": t, "host": host, "port": port, "user": str(body.get("user", "")),
-                     "password": str(body.get("password", "")), "database": database, "ssl": bool(body.get("ssl"))}
+                return self._send(
+                    200,
+                    json.dumps({"ok": False, "error": "Please fill in host, a numeric port and the database name."}),
+                )
+            saved = {
+                "db_type": t,
+                "host": host,
+                "port": port,
+                "user": str(body.get("user", "")),
+                "password": str(body.get("password", "")),
+                "database": database,
+                "ssl": bool(body.get("ssl")),
+            }
             try:
                 asyncio.run(asyncio.wait_for(test_db(build_db_conf(saved)), timeout=25))
             except Exception as e:
-                return self._send(200, json.dumps({"ok": False, "error": f"Could not connect from this computer: {e or type(e).__name__}"}))
+                return self._send(
+                    200,
+                    json.dumps(
+                        {"ok": False, "error": f"Could not connect from this computer: {e or type(e).__name__}"}
+                    ),
+                )
             cfg["db"] = saved
             cfg["autostart"] = bool(body.get("autostart"))
             save_config(cfg)
@@ -1325,11 +1543,18 @@ def main_oneclick(args) -> None:
     if args.pair:
         print("  Pairing this computer with your workspace...")
         got = claim_pair_code(server, args.pair)
-        cfg = {"server": server, "token": got["token"], "allowWrites": bool(got.get("allowWrites")), "label": got.get("label", "")}
+        cfg = {
+            "server": server,
+            "token": got["token"],
+            "allowWrites": bool(got.get("allowWrites")),
+            "label": got.get("label", ""),
+        }
         save_config(cfg)
         print(f"  ✓ Paired as \"{cfg['label']}\"")
     elif not cfg.get("token"):
-        raise SystemExit("  ✗ This computer is not paired yet. Create a code in the app (Tunneling > One click) and run:\n    python agent.py --pair ABCD-EFGH")
+        raise SystemExit(
+            "  ✗ This computer is not paired yet. Create a code in the app (Tunneling > One click) and run:\n    python agent.py --pair ABCD-EFGH"
+        )
 
     if args.reset:
         cfg.pop("db", None)
@@ -1362,11 +1587,15 @@ def main_oneclick(args) -> None:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="The God's Tool agent: use your own computer as the connector to your database.")
+    ap = argparse.ArgumentParser(
+        description="The God's Tool agent: use your own computer as the connector to your database."
+    )
     ap.add_argument("--pair", metavar="CODE", help="one-click setup: the pairing code shown in the app")
     ap.add_argument("--server", help="server URL (defaults to the hosted service)")
     ap.add_argument("--reset", action="store_true", help="forget the saved database and enter it again")
-    ap.add_argument("--install-service", action="store_true", help="start the agent automatically when this computer starts")
+    ap.add_argument(
+        "--install-service", action="store_true", help="start the agent automatically when this computer starts"
+    )
     ap.add_argument("--remove-service", action="store_true", help="undo --install-service")
     ap.add_argument("--manual", action="store_true", help="old step-by-step prompts in this terminal")
     ap.add_argument("--allow-writes", action="store_true", help="manual mode only: allow non read-only SQL")
@@ -1378,11 +1607,11 @@ def main():
             raise SystemExit(f"  ✗ {e}")
         return
     if args.manual:
-        main_manual(args.allow_writes, args.server or '')
+        main_manual(args.allow_writes, args.server or "")
     elif args.pair or CONFIG_FILE.exists():
         main_oneclick(args)
     else:
-        main_manual(args.allow_writes, args.server or '')
+        main_manual(args.allow_writes, args.server or "")
 
 
 if __name__ == "__main__":

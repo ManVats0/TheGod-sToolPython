@@ -1,4 +1,19 @@
+# main.py: the Python service of The God's Tool (FastAPI). Everything the app needs apart from sign-in lives here.
+#
+# Where things are (search for the "# ── " banners to jump between parts):
+#   Helpers      request models, token check, MongoDB storage, agent tunnel store, session check, rate limits, email
+#   Analysis     primary key, sensitive data, time series, schema drift, anomalies, flow failure, problems list
+#   Routes       permissions, dashboard, connections, PDF statement, free try, pipelines and their run engine
+#   AI           private AI mode, the safe runner for AI written pandas code
+#   Team         scheduler, organisations and roles, team join, audit logs
+#   Connectors   agent tunnel, Google OAuth, MongoDB, GA4, BigQuery, Cloud SQL, GCS, Databricks, REST API
+#   Saved data   analysis results (metadata only), data catalog, alert email
+# Other files: free_try.py (free try limits), pdf_statement.py and pdf_tables.py (PDF reading),
+# site_chat.py (website support chat), agent.py (the tunnel agent customers install).
+# Settings come from environment variables, listed in README.md.
+#
 import os
+
 os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,6 +29,7 @@ class ContactFormRequest(BaseModel):
     name: str
     email: str
     message: str
+
 
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
@@ -38,9 +54,11 @@ if _env_path.exists():
 
 SMTP_EMAIL = os.getenv("SMTP_EMAIL", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
-GOOGLE_REDIRECT_URI  = os.getenv("GOOGLE_REDIRECT_URI", "https://bubbly-empathy-production-7977.up.railway.app/api/auth/google/callback")
+GOOGLE_REDIRECT_URI = os.getenv(
+    "GOOGLE_REDIRECT_URI", "https://bubbly-empathy-production-7977.up.railway.app/api/auth/google/callback"
+)
 
 # ── JWT verification (isolated — not yet used by any existing route) ──────────
 JWT_SECRET = os.getenv("JWT_SECRET", "")
@@ -59,18 +77,22 @@ mongo_db = mongo_client["test"] if mongo_client else None
 CRED_ENCRYPTION_KEY = os.getenv("CRED_ENCRYPTION_KEY", "")
 _fernet = Fernet(CRED_ENCRYPTION_KEY.encode()) if CRED_ENCRYPTION_KEY else None
 
+
 def encrypt_credentials(data: dict) -> str:
     if not _fernet:
         raise RuntimeError("CRED_ENCRYPTION_KEY not set in credentials.env")
     return _fernet.encrypt(json.dumps(data).encode()).decode()
+
 
 def decrypt_credentials(token: str) -> dict:
     if not _fernet:
         raise RuntimeError("CRED_ENCRYPTION_KEY not set in credentials.env")
     return json.loads(_fernet.decrypt(token.encode()).decode())
 
+
 def require_user(request: Request) -> dict | None:
     return verify_jwt_token(request.headers.get("Authorization", ""))
+
 
 def _stringify_ids(value):
     """MongoDB ObjectIds (orgId, ids inside lists, ...) cannot be encoded by FastAPI: any response that
@@ -83,12 +105,14 @@ def _stringify_ids(value):
         return [_stringify_ids(v) for v in value]
     return value
 
+
 def serialize_doc(doc: dict, drop: list | None = None) -> dict:
     doc = dict(doc)
     doc["_id"] = str(doc["_id"])
-    for f in (drop or []):
+    for f in drop or []:
         doc.pop(f, None)
     return _stringify_ids(doc)
+
 
 def verify_jwt_token(authorization_header: str = "") -> dict | None:
     """
@@ -104,11 +128,14 @@ def verify_jwt_token(authorization_header: str = "") -> dict | None:
         return None
     try:
         import jwt as _pyjwt
+
         payload = _pyjwt.decode(token, JWT_SECRET, algorithms=["HS256"])
         return payload
     except Exception as e:
         print(f"JWT verification failed: {e}")
         return None
+
+
 import asyncio
 import hmac
 import secrets
@@ -126,6 +153,7 @@ _session_store: dict = {}
 # requests that belong to the same organisation, so two customers who both have a
 # database called "sales@localhost" can never reach each other's agent.
 import contextvars as _cv
+
 _agent_org_var: "_cv.ContextVar[str]" = _cv.ContextVar("agent_org", default="")
 
 
@@ -170,7 +198,8 @@ class _OrgScopedAgents:
 # (orgId, "database@host") -> {websocket, database, host, registered_at, tokenId, allowWrites}
 _agent_connections = _OrgScopedAgents()
 # request_id -> asyncio.Future (for matching query responses)
-_pending_queries: dict = {} 
+_pending_queries: dict = {}
+
 
 async def _get_session_tokens(session_id: str) -> dict:
     """Get tokens for a specific session. In-memory cache first (fast,
@@ -196,6 +225,7 @@ async def _get_session_tokens(session_id: str) -> dict:
             pass
     return {}
 
+
 async def _save_session_tokens(session_id: str, tokens: dict):
     """Save tokens for a specific session — in-memory cache for speed,
     MongoDB for persistence across restarts/redeploys."""
@@ -204,7 +234,14 @@ async def _save_session_tokens(session_id: str, tokens: dict):
         try:
             await mongo_db.google_sessions.update_one(
                 {"session_id": session_id},
-                {"$set": {"tokens": tokens, "userId": tokens.get("userId"), "orgId": tokens.get("orgId"), "updatedAt": datetime.now()}},
+                {
+                    "$set": {
+                        "tokens": tokens,
+                        "userId": tokens.get("userId"),
+                        "orgId": tokens.get("orgId"),
+                        "updatedAt": datetime.now(),
+                    }
+                },
                 upsert=True,
             )
             return
@@ -216,17 +253,24 @@ async def _save_session_tokens(session_id: str, tokens: dict):
     except Exception as e:
         print(f"Could not save tokens for session {session_id}: {e}")
 
+
 def _get_session_id(request: Request) -> str:
     """Extract session ID from cookie or header."""
-    return (
-        request.cookies.get("datapro_session", "") or
-        request.headers.get("X-Session-ID", "")
-    )
+    return request.cookies.get("datapro_session", "") or request.headers.get("X-Session-ID", "")
+
 
 # Keep these for backward compatibility but make them no-ops
 google_tokens: dict = {}
-def _load_tokens(): return {}
-def _save_tokens(t): pass
+
+
+def _load_tokens():
+    return {}
+
+
+def _save_tokens(t):
+    pass
+
+
 # ── Auto-refresh tokens on server startup ─────────────────────────────────────
 def _warmup_credentials():
     """Silently refresh tokens at startup so first request is instant."""
@@ -237,6 +281,7 @@ def _warmup_credentials():
                 print(f"✓ Google credentials auto-refreshed for {google_tokens.get('email', 'unknown')}")
         except Exception as e:
             print(f"⚠ Could not warm up Google credentials: {e}")
+
 
 # Run warmup in background so it doesn't delay server start
 threading.Thread(target=_warmup_credentials, daemon=True).start()
@@ -251,23 +296,31 @@ app = FastAPI()
 #   * ADMIN_EMAILS    comma-separated founder/admin emails that get full access for free. Lives only in Railway.
 # ══════════════════════════════════════════════════════════════════════════════
 from datetime import timezone
+
 PAID_PLANS = frozenset({"trial", "lite", "starter", "pro", "team", "enterprise"})
 FREE_SOURCE_TYPES = frozenset({"csv", "sheets"})
 FREE_LIMITS = {
-    "maxSources": 3,                    # saved data sources (CSV files + Google Sheets together)
-    "maxCsvBytes": 5 * 1024 * 1024,     # largest CSV that can be stored
-    "maxCleanRows": 5000,               # rows cleaned / exported per run on the server
-    "maxPipelines": 1,                  # saved pipelines (manual only: no schedule, no server runs)
-    "teamSeats": 1,                     # just you: no invites
+    "maxSources": 3,  # saved data sources (CSV files + Google Sheets together)
+    "maxCsvBytes": 5 * 1024 * 1024,  # largest CSV that can be stored
+    "maxCleanRows": 5000,  # rows cleaned / exported per run on the server
+    "maxPipelines": 1,  # saved pipelines (manual only: no schedule, no server runs)
+    "teamSeats": 1,  # just you: no invites
 }
 PLAN_LOCKS_ENABLED = os.getenv("PLAN_LOCKS", "on").strip().lower() not in ("off", "0", "false", "no")
 ENFORCE_PLAN_EXPIRY = os.getenv("ENFORCE_PLAN_EXPIRY", "").strip().lower() in ("1", "true", "yes")
 
 # Connector routes that only paying (or trial) workspaces may call. CSV and Google Sheets are not in this list.
 LOCKED_PREFIXES = {
-    "/api/mysql/": "MySQL", "/api/postgres/": "PostgreSQL", "/api/bigquery/": "BigQuery",
-    "/api/cloudsql/": "Cloud SQL", "/api/gcs/": "Google Cloud Storage", "/api/databricks/": "Databricks",
-    "/api/rest/": "REST API", "/api/aws/": "AWS", "/api/mongo/": "MongoDB", "/api/ga4/": "Google Analytics",
+    "/api/mysql/": "MySQL",
+    "/api/postgres/": "PostgreSQL",
+    "/api/bigquery/": "BigQuery",
+    "/api/cloudsql/": "Cloud SQL",
+    "/api/gcs/": "Google Cloud Storage",
+    "/api/databricks/": "Databricks",
+    "/api/rest/": "REST API",
+    "/api/aws/": "AWS",
+    "/api/mongo/": "MongoDB",
+    "/api/ga4/": "Google Analytics",
     "/api/pdf/": "PDF to table",
 }
 
@@ -299,8 +352,13 @@ def _plan_from_user_doc(u: dict | None) -> str:
     now = datetime.utcnow()
     if plan == "trial" and exp is not None and exp < now:
         return "none"
-    if plan in PAID_PLANS and plan != "trial" and ENFORCE_PLAN_EXPIRY and exp is not None \
-            and exp + timedelta(days=3) < now:
+    if (
+        plan in PAID_PLANS
+        and plan != "trial"
+        and ENFORCE_PLAN_EXPIRY
+        and exp is not None
+        and exp + timedelta(days=3) < now
+    ):
         return "none"
     return plan if plan in PAID_PLANS else "none"
 
@@ -350,8 +408,10 @@ def _is_paid(plan: str) -> bool:
 
 
 def _upgrade_response(feature: str, message: str, status: int = 402):
-    return JSONResponse(status_code=status, content={
-        "error": message, "code": "upgrade_required", "feature": feature, "upgradeUrl": "/pricing"})
+    return JSONResponse(
+        status_code=status,
+        content={"error": message, "code": "upgrade_required", "feature": feature, "upgradeUrl": "/pricing"},
+    )
 
 
 async def _free_source_gate(ctx: dict, conn_type: str, size_bytes: int | None = None):
@@ -360,15 +420,23 @@ async def _free_source_gate(ctx: dict, conn_type: str, size_bytes: int | None = 
     if _is_paid(plan):
         return None
     if conn_type not in FREE_SOURCE_TYPES:
-        return _upgrade_response("connectors", "Database and cloud connectors are part of the paid plans. "
-                                 "CSV files and Google Sheets are free - upgrade to connect more.")
+        return _upgrade_response(
+            "connectors",
+            "Database and cloud connectors are part of the paid plans. "
+            "CSV files and Google Sheets are free - upgrade to connect more.",
+        )
     have = await mongo_db.connections.count_documents({"orgId": ctx["orgId"]})
     if have >= FREE_LIMITS["maxSources"]:
-        return _upgrade_response("sources", f"The free plan keeps up to {FREE_LIMITS['maxSources']} saved sources. "
-                                 "Delete one, or upgrade for unlimited sources.")
+        return _upgrade_response(
+            "sources",
+            f"The free plan keeps up to {FREE_LIMITS['maxSources']} saved sources. "
+            "Delete one, or upgrade for unlimited sources.",
+        )
     if size_bytes is not None and size_bytes > FREE_LIMITS["maxCsvBytes"]:
         mb = FREE_LIMITS["maxCsvBytes"] // (1024 * 1024)
-        return _upgrade_response("csv_size", f"Free plan CSV files can be up to {mb} MB. Upgrade to upload larger files.")
+        return _upgrade_response(
+            "csv_size", f"Free plan CSV files can be up to {mb} MB. Upgrade to upload larger files."
+        )
     return None
 
 
@@ -398,7 +466,8 @@ class PlanGateMiddleware(_PlanBase):
                         return _upgrade_response(
                             "connectors",
                             f"{label} is part of the paid plans. CSV files and Google Sheets are free - "
-                            f"upgrade to unlock {label} and everything else on the paid plans.")
+                            f"upgrade to unlock {label} and everything else on the paid plans.",
+                        )
                     break
         return await call_next(request)
 
@@ -433,7 +502,9 @@ async def _session_is_alive(payload: dict) -> bool:
     if hit and now - hit[1] < SESSION_CHECK_TTL:
         return hit[0]
     try:
-        found = await mongo_db.users.count_documents({"_id": ObjectId(str(uid)), "sessions.sessionId": str(sid)}, limit=1)
+        found = await mongo_db.users.count_documents(
+            {"_id": ObjectId(str(uid)), "sessions.sessionId": str(sid)}, limit=1
+        )
         alive = found > 0
     except Exception as e:
         print(f"⚠ session check failed, allowing request: {e}")
@@ -453,12 +524,15 @@ class SessionGateMiddleware(_PlanBase):
             if auth.startswith("Bearer ") and JWT_SECRET:
                 try:
                     import jwt as _pyjwt
+
                     payload = _pyjwt.decode(auth[7:], JWT_SECRET, algorithms=["HS256"])
                 except Exception:
-                    payload = None   # not one of our login tokens: the route decides what to do with it
+                    payload = None  # not one of our login tokens: the route decides what to do with it
                 if payload and not await _session_is_alive(payload):
-                    return JSONResponse(status_code=401, content={
-                        "error": "You were signed out. Please sign in again.", "code": "session_ended"})
+                    return JSONResponse(
+                        status_code=401,
+                        content={"error": "You were signed out. Please sign in again.", "code": "session_ended"},
+                    )
         return await call_next(request)
 
 
@@ -488,6 +562,7 @@ app.add_middleware(
 
 from starlette.middleware.base import BaseHTTPMiddleware
 
+
 class RelaxCOOPMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         response = await call_next(request)
@@ -495,10 +570,12 @@ class RelaxCOOPMiddleware(BaseHTTPMiddleware):
         response.headers["Cross-Origin-Embedder-Policy"] = "unsafe-none"
         return response
 
+
 app.add_middleware(RelaxCOOPMiddleware)
 
 # ── Google Sheets rate-limit guards ───────────────────────────────────────────
 import threading as _threading
+
 _gsheets_write_lock = _threading.Lock()
 _gsheets_last_write: dict = {}
 GSHEETS_MIN_INTERVAL_SECONDS = 60
@@ -513,6 +590,7 @@ _destination_write_lock = _threading.Lock()
 _destination_last_write: dict = {}
 WRITE_MIN_INTERVAL_SECONDS = 30  # matches the backend scheduler's poll interval
 
+
 def _check_write_rate_limit(dest_key: str) -> dict | None:
     """Call after validating required fields, before doing the real write.
     Returns a skip-response dict if written too recently; else claims the
@@ -521,10 +599,14 @@ def _check_write_rate_limit(dest_key: str) -> dict | None:
         last = _destination_last_write.get(dest_key, 0)
         elapsed = time.time() - last
         if elapsed < WRITE_MIN_INTERVAL_SECONDS:
-            return {"success": False, "skipped": True,
-                    "error": f"Rate-limited: wrote to this destination {round(elapsed,1)}s ago. Min interval {WRITE_MIN_INTERVAL_SECONDS}s."}
+            return {
+                "success": False,
+                "skipped": True,
+                "error": f"Rate-limited: wrote to this destination {round(elapsed,1)}s ago. Min interval {WRITE_MIN_INTERVAL_SECONDS}s.",
+            }
         _destination_last_write[dest_key] = time.time()
         return None
+
 
 UPLOAD_DIR = "uploads"
 META_DIR = "meta"
@@ -534,6 +616,7 @@ os.makedirs(META_DIR, exist_ok=True)
 from google.auth.transport.requests import Request as GoogleAuthRequest
 
 from google.auth.transport.requests import Request as GoogleAuthRequest
+
 
 async def _get_valid_credentials(session_id: str = ""):
     """Return valid credentials for this session, or None if not authenticated."""
@@ -559,10 +642,12 @@ async def _get_valid_credentials(session_id: str = ""):
         print(f"Credential refresh failed: {e}")
         return None
 
+
 # ── EMAIL ──────────────────────────────────────────────────────────────────────
 def get_thread_id(filename: str) -> str:
     key = hashlib.md5(filename.encode()).hexdigest()
     return f"<datapro-{key}@datapro.pro>"
+
 
 def send_email_alert(to_email: str, filename: str, alerts: list):
     if not to_email or not alerts:
@@ -570,13 +655,18 @@ def send_email_alert(to_email: str, filename: str, alerts: list):
         return
     try:
         import resend
+
         resend.api_key = os.getenv("RESEND_API_KEY", "")
 
         color_map = {
-            "missing": "#f97316", "duplicate": "#ef4444",
-            "outlier": "#eab308", "schema": "#8b5cf6",
-            "failure": "#ef4444", "staleness": "#06b6d4",
-            "anomaly": "#ec4899", "imbalance": "#f59e0b"
+            "missing": "#f97316",
+            "duplicate": "#ef4444",
+            "outlier": "#eab308",
+            "schema": "#8b5cf6",
+            "failure": "#ef4444",
+            "staleness": "#06b6d4",
+            "anomaly": "#ec4899",
+            "imbalance": "#f59e0b",
         }
         alert_rows = ""
         for a in alerts:
@@ -617,15 +707,18 @@ def send_email_alert(to_email: str, filename: str, alerts: list):
         </div>
         </body></html>"""
 
-        resend.Emails.send({
-            "from": "The Gods Tool <noreply@thegodstool.com>",
-            "to": [to_email],
-            "subject": f"Data Quality Alert — {filename}",
-            "html": html
-        })
+        resend.Emails.send(
+            {
+                "from": "The Gods Tool <noreply@thegodstool.com>",
+                "to": [to_email],
+                "subject": f"Data Quality Alert — {filename}",
+                "html": html,
+            }
+        )
         print(f"✓ Resend alert sent to {to_email} for {filename}")
     except Exception as e:
         print(f"✗ Email error: {e}")
+
 
 def send_otp_email(to_email: str, code: str):
     if not to_email:
@@ -634,6 +727,7 @@ def send_otp_email(to_email: str, code: str):
         return False, "RESEND_API_KEY is not set on the backend."
     try:
         import resend
+
         resend.api_key = os.getenv("RESEND_API_KEY", "")
         html_body = f"""
         <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:24px auto;padding:28px;background:#1a1040;border:1px solid #2d1b69;border-radius:14px;color:#e2e8f0;">
@@ -642,17 +736,20 @@ def send_otp_email(to_email: str, code: str):
           <p style="font-size:32px;font-weight:800;letter-spacing:8px;margin:0 0 18px;color:#a78bfa;">{code}</p>
           <p style="color:#64748b;font-size:12px;margin:0;">It expires in 10 minutes. If you didn't request it, ignore this email.</p>
         </div>"""
-        resend.Emails.send({
-            "from": "The Gods Tool <noreply@thegodstool.com>",
-            "to": [to_email],
-            "subject": f"Your verification code: {code}",
-            "html": html_body,
-            "text": f"Your The God's Tool verification code is {code}. It expires in 10 minutes.",
-        })
+        resend.Emails.send(
+            {
+                "from": "The Gods Tool <noreply@thegodstool.com>",
+                "to": [to_email],
+                "subject": f"Your verification code: {code}",
+                "html": html_body,
+                "text": f"Your The God's Tool verification code is {code}. It expires in 10 minutes.",
+            }
+        )
         return True, ""
     except Exception as e:
         print(f"✗ OTP email error: {e}")
         return False, str(e)
+
 
 def send_invite_email(to_email: str, org_name: str, role_label: str, inviter_email: str):
     """Best effort: tells the person a team added their email. Never raises."""
@@ -660,13 +757,15 @@ def send_invite_email(to_email: str, org_name: str, role_label: str, inviter_ema
         return False, "RESEND_API_KEY is not set on the backend."
     try:
         import resend
+
         resend.api_key = os.getenv("RESEND_API_KEY", "")
         link = (os.getenv("FRONTEND_URL", "") or "https://thegodstool.com").rstrip("/") + "/team"
-        resend.Emails.send({
-            "from": "The Gods Tool <noreply@thegodstool.com>",
-            "to": [to_email],
-            "subject": f"You were invited to join {org_name} on The God's Tool",
-            "html": f"""
+        resend.Emails.send(
+            {
+                "from": "The Gods Tool <noreply@thegodstool.com>",
+                "to": [to_email],
+                "subject": f"You were invited to join {org_name} on The God's Tool",
+                "html": f"""
         <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:24px auto;padding:28px;background:#1a1040;border:1px solid #2d1b69;border-radius:14px;color:#e2e8f0;">
           <h2 style="margin:0 0 8px;color:white;">You're invited</h2>
           <p style="color:#94a3b8;margin:0 0 18px;"><b style="color:white">{inviter_email or 'A teammate'}</b> invited you to join
@@ -674,12 +773,14 @@ def send_invite_email(to_email: str, org_name: str, role_label: str, inviter_ema
           <p style="margin:0 0 18px;"><a href="{link}" style="background:#7c3aed;color:white;padding:10px 20px;border-radius:10px;text-decoration:none;font-weight:700;">Review invitation</a></p>
           <p style="color:#64748b;font-size:12px;margin:0;">Sign in with this email address, open Team, and accept. Your own workspace stays available.</p>
         </div>""",
-            "text": f"{inviter_email or 'A teammate'} invited you to join {org_name} as {role_label}. Sign in and open {link} to accept.",
-        })
+                "text": f"{inviter_email or 'A teammate'} invited you to join {org_name} as {role_label}. Sign in and open {link} to accept.",
+            }
+        )
         return True, ""
     except Exception as e:
         print(f"✗ Invite email error: {e}")
         return False, str(e)
+
 
 # ── PRIMARY KEY ────────────────────────────────────────────────────────────────
 def detect_primary_key(df):
@@ -698,20 +799,21 @@ def detect_pii_columns(df):
     Never modifies df. Never raises — any per-column error is skipped.
     """
     import re
+
     patterns = {
-        "pan":     re.compile(r"^[A-Z]{5}[0-9]{4}[A-Z]$"),
+        "pan": re.compile(r"^[A-Z]{5}[0-9]{4}[A-Z]$"),
         "aadhaar": re.compile(r"^\d{4}\s?\d{4}\s?\d{4}$"),
-        "gstin":   re.compile(r"^\d{2}[A-Z]{5}\d{4}[A-Z]\d[A-Z\d]Z[A-Z\d]$"),
-        "email":   re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$"),
-        "phone":   re.compile(r"^(\+?91[\-\s]?)?[6-9]\d{9}$"),
+        "gstin": re.compile(r"^\d{2}[A-Z]{5}\d{4}[A-Z]\d[A-Z\d]Z[A-Z\d]$"),
+        "email": re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$"),
+        "phone": re.compile(r"^(\+?91[\-\s]?)?[6-9]\d{9}$"),
     }
     name_hints = {
-        "pan":     ["pan", "pan_no", "pan_number"],
+        "pan": ["pan", "pan_no", "pan_number"],
         "aadhaar": ["aadhaar", "aadhar", "uidai"],
-        "gstin":   ["gstin", "gst_no", "gst_number"],
-        "email":   ["email", "e_mail", "mail"],
-        "phone":   ["phone", "mobile", "contact_no", "phone_number"],
-        "name":    ["name", "full_name", "customer_name", "first_name", "last_name"],
+        "gstin": ["gstin", "gst_no", "gst_number"],
+        "email": ["email", "e_mail", "mail"],
+        "phone": ["phone", "mobile", "contact_no", "phone_number"],
+        "name": ["name", "full_name", "customer_name", "first_name", "last_name"],
     }
     results = {}
     for col in df.columns:
@@ -742,12 +844,13 @@ def detect_pii_columns(df):
 
     return results
 
+
 # ── TIME SERIES ────────────────────────────────────────────────────────────────
 def detect_time_series(df):
     date_col = None
     for col in df.columns:
         try:
-            parsed = pd.to_datetime(df[col], infer_datetime_format=True, errors='coerce')
+            parsed = pd.to_datetime(df[col], infer_datetime_format=True, errors="coerce")
             if parsed.notna().sum() > len(df) * 0.7:
                 date_col = col
                 df[col] = parsed
@@ -776,6 +879,7 @@ def detect_time_series(df):
     else:
         return date_col, "yearly", 365
 
+
 def check_staleness(df, date_col, freq_label, freq_days, filename):
     alerts = []
     if date_col is None or freq_days is None:
@@ -786,22 +890,24 @@ def check_staleness(df, date_col, freq_label, freq_days, filename):
     age_days = (now - latest).days
 
     thresholds = {
-        "daily":     {"alert_after_days": 1,  "label": "1 day"},
-        "weekly":    {"alert_after_days": 7,  "label": "1 week"},
-        "monthly":   {"alert_after_days": 7,  "label": "1 week after month end"},
+        "daily": {"alert_after_days": 1, "label": "1 day"},
+        "weekly": {"alert_after_days": 7, "label": "1 week"},
+        "monthly": {"alert_after_days": 7, "label": "1 week after month end"},
         "quarterly": {"alert_after_days": 14, "label": "2 weeks"},
-        "yearly":    {"alert_after_days": 30, "label": "1 month"},
+        "yearly": {"alert_after_days": 30, "label": "1 month"},
     }
     threshold = thresholds.get(freq_label, {"alert_after_days": 7, "label": "expected period"})
 
     if age_days > threshold["alert_after_days"]:
-        alerts.append({
-            "id": str(uuid.uuid4()),
-            "type": "staleness",
-            "title": "Data Staleness Detected",
-            "message": f"Latest record is {age_days} days old. {freq_label.capitalize()} data should update every {threshold['label']}. Source: {filename}",
-            "severity": "warning"
-        })
+        alerts.append(
+            {
+                "id": str(uuid.uuid4()),
+                "type": "staleness",
+                "title": "Data Staleness Detected",
+                "message": f"Latest record is {age_days} days old. {freq_label.capitalize()} data should update every {threshold['label']}. Source: {filename}",
+                "severity": "warning",
+            }
+        )
 
     meta_path = os.path.join(META_DIR, f"{hashlib.md5(filename.encode()).hexdigest()}.json")
     now_ts = time.time()
@@ -811,26 +917,31 @@ def check_staleness(df, date_col, freq_label, freq_days, filename):
         last_upload = meta.get("last_upload", now_ts)
         hours_since = (now_ts - last_upload) / 3600
         if freq_label == "daily" and hours_since > 25:
-            alerts.append({
-                "id": str(uuid.uuid4()),
-                "type": "staleness",
-                "title": "Upload Gap Detected",
-                "message": f"No new upload in {int(hours_since)} hours. Daily data expected every 24h.",
-                "severity": "warning"
-            })
+            alerts.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "type": "staleness",
+                    "title": "Upload Gap Detected",
+                    "message": f"No new upload in {int(hours_since)} hours. Daily data expected every 24h.",
+                    "severity": "warning",
+                }
+            )
         elif freq_label == "monthly" and hours_since > 24 * 7:
-            alerts.append({
-                "id": str(uuid.uuid4()),
-                "type": "staleness",
-                "title": "Upload Gap Detected",
-                "message": f"No new upload in {int(hours_since / 24)} days. Monthly data expected weekly check.",
-                "severity": "warning"
-            })
+            alerts.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "type": "staleness",
+                    "title": "Upload Gap Detected",
+                    "message": f"No new upload in {int(hours_since / 24)} days. Monthly data expected weekly check.",
+                    "severity": "warning",
+                }
+            )
 
     with open(meta_path, "w") as f:
         json.dump({"last_upload": now_ts, "freq": freq_label}, f)
 
     return alerts
+
 
 # ── SCHEMA DRIFT ───────────────────────────────────────────────────────────────
 def _diff_schema(prev_schema: dict, current_schema: dict) -> list:
@@ -841,16 +952,22 @@ def _diff_schema(prev_schema: dict, current_schema: dict) -> list:
 
     if added or removed or type_changed:
         parts = []
-        if added:        parts.append(f"{len(added)} column(s) added: {', '.join(added[:3])}")
-        if removed:      parts.append(f"{len(removed)} column(s) removed: {', '.join(removed[:3])}")
-        if type_changed: parts.append(f"{len(type_changed)} type change(s): {', '.join(type_changed[:3])}")
-        alerts.append({
-            "id": str(uuid.uuid4()),
-            "type": "schema",
-            "title": "Schema Drift Detected",
-            "message": ". ".join(parts) + f". Previous schema had {len(prev_schema)} columns, now {len(current_schema)}.",
-            "severity": "error"
-        })
+        if added:
+            parts.append(f"{len(added)} column(s) added: {', '.join(added[:3])}")
+        if removed:
+            parts.append(f"{len(removed)} column(s) removed: {', '.join(removed[:3])}")
+        if type_changed:
+            parts.append(f"{len(type_changed)} type change(s): {', '.join(type_changed[:3])}")
+        alerts.append(
+            {
+                "id": str(uuid.uuid4()),
+                "type": "schema",
+                "title": "Schema Drift Detected",
+                "message": ". ".join(parts)
+                + f". Previous schema had {len(prev_schema)} columns, now {len(current_schema)}.",
+                "severity": "error",
+            }
+        )
     return alerts
 
 
@@ -882,6 +999,7 @@ async def check_schema_drift(df, filename, scope=""):
     )
     return alerts
 
+
 # ── ANOMALIES & IMBALANCES ─────────────────────────────────────────────────────
 def check_anomalies(df):
     alerts = []
@@ -889,13 +1007,15 @@ def check_anomalies(df):
     for col in df.select_dtypes(include="object").columns:
         vc = df[col].value_counts(normalize=True)
         if len(vc) >= 2 and vc.iloc[0] > 0.85:
-            alerts.append({
-                "id": str(uuid.uuid4()),
-                "type": "imbalance",
-                "title": f"Class Imbalance in '{col}'",
-                "message": f"'{vc.index[0]}' makes up {round(vc.iloc[0]*100)}% of values. Severe imbalance may affect model training.",
-                "severity": "warning"
-            })
+            alerts.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "type": "imbalance",
+                    "title": f"Class Imbalance in '{col}'",
+                    "message": f"'{vc.index[0]}' makes up {round(vc.iloc[0]*100)}% of values. Severe imbalance may affect model training.",
+                    "severity": "warning",
+                }
+            )
 
     for col in df.select_dtypes(include=[np.number]).columns:
         col_data = df[col].dropna()
@@ -903,51 +1023,61 @@ def check_anomalies(df):
             continue
         skew = float(col_data.skew())
         if abs(skew) > 3:
-            alerts.append({
-                "id": str(uuid.uuid4()),
-                "type": "anomaly",
-                "title": f"High Skew in '{col}'",
-                "message": f"Skewness = {round(skew, 2)}. Severely skewed data can distort statistical analysis and ML models.",
-                "severity": "warning"
-            })
+            alerts.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "type": "anomaly",
+                    "title": f"High Skew in '{col}'",
+                    "message": f"Skewness = {round(skew, 2)}. Severely skewed data can distort statistical analysis and ML models.",
+                    "severity": "warning",
+                }
+            )
 
     return alerts[:5]
+
 
 # ── FLOW FAILURE ───────────────────────────────────────────────────────────────
 def check_flow_failure(df, date_col, freq_label):
     alerts = []
 
     if len(df) == 0:
-        alerts.append({
-            "id": str(uuid.uuid4()),
-            "type": "failure",
-            "title": "Flow Failure — Empty Dataset",
-            "message": "No rows found. Data pipeline may have failed to deliver records.",
-            "severity": "error"
-        })
+        alerts.append(
+            {
+                "id": str(uuid.uuid4()),
+                "type": "failure",
+                "title": "Flow Failure — Empty Dataset",
+                "message": "No rows found. Data pipeline may have failed to deliver records.",
+                "severity": "error",
+            }
+        )
         return alerts
 
     all_null_cols = [c for c in df.columns if df[c].isnull().all()]
     if all_null_cols:
-        alerts.append({
-            "id": str(uuid.uuid4()),
-            "type": "failure",
-            "title": "Flow Failure — Blank Columns",
-            "message": f"{len(all_null_cols)} column(s) are entirely empty: {', '.join(all_null_cols[:3])}. Source may have sent empty fields.",
-            "severity": "error"
-        })
+        alerts.append(
+            {
+                "id": str(uuid.uuid4()),
+                "type": "failure",
+                "title": "Flow Failure — Blank Columns",
+                "message": f"{len(all_null_cols)} column(s) are entirely empty: {', '.join(all_null_cols[:3])}. Source may have sent empty fields.",
+                "severity": "error",
+            }
+        )
 
     if date_col and freq_label in ["daily", "weekly", "monthly"]:
         if len(df) < 10:
-            alerts.append({
-                "id": str(uuid.uuid4()),
-                "type": "failure",
-                "title": "Flow Failure — Very Few Records",
-                "message": f"Only {len(df)} rows found. Expected more based on {freq_label} frequency. Possible partial load.",
-                "severity": "error"
-            })
+            alerts.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "type": "failure",
+                    "title": "Flow Failure — Very Few Records",
+                    "message": f"Only {len(df)} rows found. Expected more based on {freq_label} frequency. Possible partial load.",
+                    "severity": "error",
+                }
+            )
 
     return alerts
+
 
 # ── PROBLEMS ───────────────────────────────────────────────────────────────────
 def find_problems_fast(df, pk_col):
@@ -961,25 +1091,29 @@ def find_problems_fast(df, pk_col):
     for col in df_sample.columns:
         null_idx = df_sample.index[df_sample[col].isnull()].tolist()
         for idx in null_idx[:50]:
-            problems.append({
-                "row_number": int(idx + 2),
-                "primary_key": pk(idx, df_sample.loc[idx]),
-                "pk_column": pk_col or "row_number",
-                "column": col,
-                "issue": "Missing value",
-                "value": ""
-            })
+            problems.append(
+                {
+                    "row_number": int(idx + 2),
+                    "primary_key": pk(idx, df_sample.loc[idx]),
+                    "pk_column": pk_col or "row_number",
+                    "column": col,
+                    "issue": "Missing value",
+                    "value": "",
+                }
+            )
 
     dup_idx = df_sample.index[df_sample.duplicated(keep=False)].tolist()
     for idx in dup_idx[:50]:
-        problems.append({
-            "row_number": int(idx + 2),
-            "primary_key": pk(idx, df_sample.loc[idx]),
-            "pk_column": pk_col or "row_number",
-            "column": "ALL COLUMNS",
-            "issue": "Duplicate row",
-            "value": ""
-        })
+        problems.append(
+            {
+                "row_number": int(idx + 2),
+                "primary_key": pk(idx, df_sample.loc[idx]),
+                "pk_column": pk_col or "row_number",
+                "column": "ALL COLUMNS",
+                "issue": "Duplicate row",
+                "value": "",
+            }
+        )
 
     for col in df_sample.select_dtypes(include=[np.number]).columns:
         col_data = df_sample[col].dropna()
@@ -993,16 +1127,19 @@ def find_problems_fast(df, pk_col):
         mask = modified_z.abs() > 3.5
         out_idx = df_sample.index[mask].tolist()
         for idx in out_idx[:30]:
-            problems.append({
-                "row_number": int(idx + 2),
-                "primary_key": pk(idx, df_sample.loc[idx]),
-                "pk_column": pk_col or "row_number",
-                "column": col,
-                "issue": "Outlier",
-                "value": str(round(float(df_sample.loc[idx, col]), 2))
-            })
+            problems.append(
+                {
+                    "row_number": int(idx + 2),
+                    "primary_key": pk(idx, df_sample.loc[idx]),
+                    "pk_column": pk_col or "row_number",
+                    "column": col,
+                    "issue": "Outlier",
+                    "value": str(round(float(df_sample.loc[idx, col]), 2)),
+                }
+            )
 
     return problems
+
 
 def count_real_outliers(df):
     total = 0
@@ -1022,6 +1159,7 @@ def count_real_outliers(df):
             cols += 1
     return total, cols
 
+
 # ── ROUTES ─────────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
@@ -1040,8 +1178,6 @@ async def test_jwt_auth(request: Request):
     if payload:
         return {"authenticated": True, "userId": payload.get("userId"), "email": payload.get("email")}
     return {"authenticated": False}
-
-
 
 
 # ── What the signed-in person may do (the app uses this only to decide what to SHOW; the server enforces) ──
@@ -1084,7 +1220,14 @@ async def dashboard(request: Request):
     perms = ctx["permissions"]
     org_id = ctx["orgId"]
     now = datetime.now()
-    out: dict = {"role": ctx["roleKey"], "sources": None, "pipelines": None, "runs": None, "team": None, "activity": None}
+    out: dict = {
+        "role": ctx["roleKey"],
+        "sources": None,
+        "pipelines": None,
+        "runs": None,
+        "team": None,
+        "activity": None,
+    }
 
     org = await mongo_db.organizations.find_one({"_id": org_id}) or {}
     out["workspace"] = {"name": org.get("name", ""), "personal": str(org.get("slug", "")).startswith("personal-")}
@@ -1104,29 +1247,50 @@ async def dashboard(request: Request):
             "total": len(pipelines),
             "active": sum(1 for p in pipelines if p.get("isActive")),
             "pendingApproval": sum(1 for p in pipelines if p.get("status") == "pending_approval"),
-            "items": [{
-                "id": str(p["_id"]), "name": p.get("name", "Untitled"),
-                "sourceName": p.get("sourceName", ""), "destinationName": p.get("destinationName", ""),
-                "isActive": bool(p.get("isActive")), "status": p.get("status", "approved"),
-                "scheduleLabel": p.get("scheduleLabel"), "lastRun": _iso(p.get("lastRun")),
-                "runCount": int(p.get("runCount") or 0),
-            } for p in pipelines[:6]],
+            "items": [
+                {
+                    "id": str(p["_id"]),
+                    "name": p.get("name", "Untitled"),
+                    "sourceName": p.get("sourceName", ""),
+                    "destinationName": p.get("destinationName", ""),
+                    "isActive": bool(p.get("isActive")),
+                    "status": p.get("status", "approved"),
+                    "scheduleLabel": p.get("scheduleLabel"),
+                    "lastRun": _iso(p.get("lastRun")),
+                    "runCount": int(p.get("runCount") or 0),
+                }
+                for p in pipelines[:6]
+            ],
         }
         ids = [str(p["_id"]) for p in pipelines]
         names = {str(p["_id"]): p.get("name", "Untitled") for p in pipelines}
         runs = []
         if ids:
             since = now - timedelta(days=7)
-            runs = await mongo_db.runs.find({"pipelineId": {"$in": ids}, "ts": {"$gte": since}}).sort("ts", -1).to_list(length=500)
+            runs = (
+                await mongo_db.runs.find({"pipelineId": {"$in": ids}, "ts": {"$gte": since}})
+                .sort("ts", -1)
+                .to_list(length=500)
+            )
         ok = [r for r in runs if r.get("status") in ("success", "succeeded", "ok", "completed")]
         out["runs"] = {
-            "last7": {"total": len(runs), "success": len(ok), "failed": sum(1 for r in runs if r.get("status") in ("failed", "error")),
-                      "rowsOut": int(sum(int(r.get("rowsOut") or 0) for r in ok))},
-            "recent": [{
-                "ts": _iso(r.get("ts")), "pipelineName": names.get(r.get("pipelineId"), "Pipeline"),
-                "status": r.get("status", ""), "rowsOut": int(r.get("rowsOut") or 0),
-                "durationMs": int(r.get("durationMs") or 0), "triggeredBy": r.get("triggeredBy", ""),
-            } for r in runs[:6]],
+            "last7": {
+                "total": len(runs),
+                "success": len(ok),
+                "failed": sum(1 for r in runs if r.get("status") in ("failed", "error")),
+                "rowsOut": int(sum(int(r.get("rowsOut") or 0) for r in ok)),
+            },
+            "recent": [
+                {
+                    "ts": _iso(r.get("ts")),
+                    "pipelineName": names.get(r.get("pipelineId"), "Pipeline"),
+                    "status": r.get("status", ""),
+                    "rowsOut": int(r.get("rowsOut") or 0),
+                    "durationMs": int(r.get("durationMs") or 0),
+                    "triggeredBy": r.get("triggeredBy", ""),
+                }
+                for r in runs[:6]
+            ],
         }
 
     if perms.get("org.manageMembers"):
@@ -1137,17 +1301,26 @@ async def dashboard(request: Request):
 
     if perms.get("audit.view"):
         logs = await mongo_db.audit_logs.find({"orgId": org_id}).sort("createdAt", -1).limit(6).to_list(length=6)
-        out["activity"] = [{
-            "action": l.get("action", ""), "resourceName": l.get("resourceName", ""),
-            "severity": l.get("severity", "info"), "at": _iso(l.get("createdAt")),
-        } for l in logs]
+        out["activity"] = [
+            {
+                "action": l.get("action", ""),
+                "resourceName": l.get("resourceName", ""),
+                "severity": l.get("severity", "info"),
+                "at": _iso(l.get("createdAt")),
+            }
+            for l in logs
+        ]
 
     plan = await _effective_plan(ctx["userId"])
     paid = _is_paid(plan)
     out["entitlements"] = {
-        "plan": plan, "paid": paid, "limits": None if paid else FREE_LIMITS,
-        "usage": {"sources": await mongo_db.connections.count_documents({"orgId": org_id}),
-                  "pipelines": await mongo_db.pipelines.count_documents({"orgId": org_id})},
+        "plan": plan,
+        "paid": paid,
+        "limits": None if paid else FREE_LIMITS,
+        "usage": {
+            "sources": await mongo_db.connections.count_documents({"orgId": org_id}),
+            "pipelines": await mongo_db.pipelines.count_documents({"orgId": org_id}),
+        },
     }
     return out
 
@@ -1199,10 +1372,15 @@ async def create_connection(request: Request, body: dict):
     }
     result = await mongo_db.connections.insert_one(doc)
     doc["_id"] = result.inserted_id
-    await log_audit(user["userId"], "connection.created", "connection", str(doc["_id"]),
-                    metadata={"name": name, "type": conn_type}, resource_name=name)
+    await log_audit(
+        user["userId"],
+        "connection.created",
+        "connection",
+        str(doc["_id"]),
+        metadata={"name": name, "type": conn_type},
+        resource_name=name,
+    )
     return serialize_doc(doc, drop=["credentialsEncrypted"])
-
 
 
 # ── PDF bank statement -> checked table (paid plans; no AI is used, so nothing leaves this server) ─────────
@@ -1221,11 +1399,15 @@ async def pdf_extract(request: Request, file: UploadFile = File(...), date_order
         return JSONResponse(status_code=400, content={"error": "date_order must be DMY or MDY."})
     from starlette.concurrency import run_in_threadpool
     import pdf_statement
+
     try:
         return await run_in_threadpool(pdf_statement.extract_statement, data, order or None)
     except Exception as e:  # never leak a stack trace; the file itself is not stored anywhere
         print(f"⚠ pdf_extract failed: {type(e).__name__}: {e}")
-        return JSONResponse(status_code=500, content={"error": "This PDF could not be read. Try the original PDF from your bank."})
+        return JSONResponse(
+            status_code=500, content={"error": "This PDF could not be read. Try the original PDF from your bank."}
+        )
+
 
 @app.post("/api/pdf/tables")
 async def pdf_tables(request: Request, file: UploadFile = File(...)):
@@ -1240,14 +1422,19 @@ async def pdf_tables(request: Request, file: UploadFile = File(...)):
         return JSONResponse(status_code=400, content={"error": "That file is not a PDF."})
     from starlette.concurrency import run_in_threadpool
     import pdf_tables
+
     try:
         return await run_in_threadpool(pdf_tables.extract_tables, data)
     except Exception as e:
         print(f"⚠ pdf_tables failed: {type(e).__name__}: {e}")
-        return JSONResponse(status_code=500, content={"error": "This PDF could not be read. Try the original PDF, not a scan."})
+        return JSONResponse(
+            status_code=500, content={"error": "This PDF could not be read. Try the original PDF, not a scan."}
+        )
+
 
 # ── Free try: one small PDF or CSV, no account. Limits live in free_try.py ──────────────────────────────────
 _free_try_slots = asyncio.Semaphore(2)
+
 
 def _client_ip(request: Request) -> str:
     for h in ("cf-connecting-ip", "x-real-ip"):
@@ -1255,40 +1442,73 @@ def _client_ip(request: Request) -> str:
         if v:
             return v.strip()
     xff = request.headers.get("x-forwarded-for", "")
-    return (xff.split(",")[0].strip() if xff else (request.client.host if request.client else "unknown"))
+    return xff.split(",")[0].strip() if xff else (request.client.host if request.client else "unknown")
+
 
 @app.post("/api/public/try")
 async def public_free_try(request: Request, file: UploadFile = File(...)):
     import free_try
     from starlette.concurrency import run_in_threadpool
+
     data = await file.read(free_try.MAX_BYTES + 1)
     if len(data) > free_try.MAX_BYTES:
-        return JSONResponse(status_code=413, content={"ok": False, "code": "too_big", "error": "The free try takes files up to 5 MB. Create a free account to use larger files."})
+        return JSONResponse(
+            status_code=413,
+            content={
+                "ok": False,
+                "code": "too_big",
+                "error": "The free try takes files up to 5 MB. Create a free account to use larger files.",
+            },
+        )
     ok, left = free_try.allow_try(_client_ip(request))
     if not ok:
-        return JSONResponse(status_code=429, content={"ok": False, "code": "limit", "error": f"That is {free_try.TRIES_PER_HOUR} free tries in the last hour. Create a free account to keep going, or try again later."})
+        return JSONResponse(
+            status_code=429,
+            content={
+                "ok": False,
+                "code": "limit",
+                "error": f"That is {free_try.TRIES_PER_HOUR} free tries in the last hour. Create a free account to keep going, or try again later.",
+            },
+        )
     if _free_try_slots.locked():
-        return JSONResponse(status_code=503, content={"ok": False, "code": "busy", "error": "Many people are trying it right now. Please try again in a minute."})
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "code": "busy",
+                "error": "Many people are trying it right now. Please try again in a minute.",
+            },
+        )
     async with _free_try_slots:
         try:
             res = await run_in_threadpool(free_try.preview, file.filename or "", data)
         except Exception as e:
             print(f"⚠ free try failed: {type(e).__name__}: {e}")
-            return JSONResponse(status_code=500, content={"ok": False, "code": "error", "error": "This file could not be read. Try the original PDF or CSV."})
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "ok": False,
+                    "code": "error",
+                    "error": "This file could not be read. Try the original PDF or CSV.",
+                },
+            )
     if res.get("ok"):
         res["triesLeft"] = left
     return res
+
 
 @app.post("/api/public/chat")
 async def public_site_chat(request: Request):
     import site_chat
     from starlette.concurrency import run_in_threadpool
+
     try:
         body = await request.json()
     except Exception:
         body = None
     status, payload = await run_in_threadpool(site_chat.handle, body, _client_ip(request))
     return JSONResponse(status_code=status, content=payload)
+
 
 @app.post("/api/connections/upload-csv")
 async def upload_csv_connection(request: Request, file: UploadFile = File(...)):
@@ -1308,22 +1528,35 @@ async def upload_csv_connection(request: Request, file: UploadFile = File(...)):
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": f"Not a readable CSV: {e}"})
     from motor.motor_asyncio import AsyncIOMotorGridFSBucket
+
     bucket = AsyncIOMotorGridFSBucket(mongo_db)
     file_id = await bucket.upload_from_stream(
-        file.filename or "upload.csv", data,
+        file.filename or "upload.csv",
+        data,
         metadata={"orgId": ctx["orgId"], "uploadedBy": ctx["userId"]},
     )
     doc = {
-        "userId": ctx["userId"], "orgId": ctx["orgId"], "createdBy": ctx["userId"],
-        "name": file.filename or "upload.csv", "type": "csv",
+        "userId": ctx["userId"],
+        "orgId": ctx["orgId"],
+        "createdBy": ctx["userId"],
+        "name": file.filename or "upload.csv",
+        "type": "csv",
         "config": {"fileId": str(file_id), "filename": file.filename, "sizeBytes": len(data)},
-        "credentialsEncrypted": "", "status": "active",
-        "createdAt": datetime.now(), "updatedAt": datetime.now(),
+        "credentialsEncrypted": "",
+        "status": "active",
+        "createdAt": datetime.now(),
+        "updatedAt": datetime.now(),
     }
     result = await mongo_db.connections.insert_one(doc)
     doc["_id"] = result.inserted_id
-    await log_audit(ctx["userId"], "connection.created", "connection", str(doc["_id"]),
-                    metadata={"name": doc["name"], "type": "csv"}, resource_name=doc["name"])
+    await log_audit(
+        ctx["userId"],
+        "connection.created",
+        "connection",
+        str(doc["_id"]),
+        metadata={"name": doc["name"], "type": "csv"},
+        resource_name=doc["name"],
+    )
     return serialize_doc(doc, drop=["credentialsEncrypted"])
 
 
@@ -1348,25 +1581,45 @@ async def create_google_sheets_connection(request: Request, body: dict):
     _sid, tokens = await _owned_google_session(request, ctx, str(body.get("sessionId") or "").strip())
     refresh_token = tokens.get("refresh_token") or ""
     if not refresh_token:
-        return JSONResponse(status_code=400, content={"error": "Your Google sign-in has expired or did not include long-lived access. Sign in with Google again and accept all permissions."})
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "Your Google sign-in has expired or did not include long-lived access. Sign in with Google again and accept all permissions."
+            },
+        )
     try:
         tab = await asyncio.to_thread(_sheets_check_access_sync, {"refresh_token": refresh_token}, sheet_id, tab)
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": f"This Google account cannot use that Sheet: {e}"})
     now = datetime.now()
     doc = {
-        "userId": ctx["userId"], "orgId": ctx["orgId"], "createdBy": ctx["userId"],
-        "name": sheet_name, "type": "sheets",
-        "config": {"sheetId": sheet_id, "sheetName": sheet_name, "tab": tab,
-                   "googleEmail": tokens.get("email", "")},
+        "userId": ctx["userId"],
+        "orgId": ctx["orgId"],
+        "createdBy": ctx["userId"],
+        "name": sheet_name,
+        "type": "sheets",
+        "config": {"sheetId": sheet_id, "sheetName": sheet_name, "tab": tab, "googleEmail": tokens.get("email", "")},
         "credentialsEncrypted": encrypt_credentials({"refresh_token": refresh_token}),
-        "status": "active", "createdAt": now, "updatedAt": now,
+        "status": "active",
+        "createdAt": now,
+        "updatedAt": now,
     }
     result = await mongo_db.connections.insert_one(doc)
-    await log_audit(ctx["userId"], "connection.created", "connection", str(result.inserted_id),
-                    metadata={"name": sheet_name, "type": "sheets"}, resource_name=sheet_name)
-    return {"_id": str(result.inserted_id), "name": sheet_name, "type": "sheets",
-            "status": "active", "config": doc["config"]}
+    await log_audit(
+        ctx["userId"],
+        "connection.created",
+        "connection",
+        str(result.inserted_id),
+        metadata={"name": sheet_name, "type": "sheets"},
+        resource_name=sheet_name,
+    )
+    return {
+        "_id": str(result.inserted_id),
+        "name": sheet_name,
+        "type": "sheets",
+        "status": "active",
+        "config": doc["config"],
+    }
 
 
 @app.put("/api/connections/{connection_id}/reauth-google")
@@ -1388,22 +1641,38 @@ async def reauth_google_connection(request: Request, connection_id: str, body: d
     _sid, tokens = await _owned_google_session(request, ctx, str(body.get("sessionId") or "").strip())
     refresh_token = tokens.get("refresh_token") or ""
     if not refresh_token:
-        return JSONResponse(status_code=400, content={"error": "No Google sign-in found. Sign in with Google again and accept all permissions."})
+        return JSONResponse(
+            status_code=400,
+            content={"error": "No Google sign-in found. Sign in with Google again and accept all permissions."},
+        )
     cfg = conn.get("config", {})
     try:
-        await asyncio.to_thread(_sheets_check_access_sync, {"refresh_token": refresh_token},
-                                cfg.get("sheetId", ""), cfg.get("tab", ""))
+        await asyncio.to_thread(
+            _sheets_check_access_sync, {"refresh_token": refresh_token}, cfg.get("sheetId", ""), cfg.get("tab", "")
+        )
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": f"This Google account cannot open that Sheet: {e}"})
     await mongo_db.connections.update_one(
         {"_id": oid},
-        {"$set": {"credentialsEncrypted": encrypt_credentials({"refresh_token": refresh_token}),
-                  "status": "active", "config.googleEmail": tokens.get("email", ""),
-                  "updatedAt": datetime.now()}},
+        {
+            "$set": {
+                "credentialsEncrypted": encrypt_credentials({"refresh_token": refresh_token}),
+                "status": "active",
+                "config.googleEmail": tokens.get("email", ""),
+                "updatedAt": datetime.now(),
+            }
+        },
     )
-    await log_audit(ctx["userId"], "connection.reauthorized", "connection", connection_id,
-                    resource_name=conn.get("name", ""), severity="warning")
+    await log_audit(
+        ctx["userId"],
+        "connection.reauthorized",
+        "connection",
+        connection_id,
+        resource_name=conn.get("name", ""),
+        severity="warning",
+    )
     return {"success": True}
+
 
 @app.delete("/api/connections/{connection_id}")
 async def delete_connection(request: Request, connection_id: str):
@@ -1427,8 +1696,14 @@ async def delete_connection(request: Request, connection_id: str):
     result = await mongo_db.connections.delete_one({"_id": oid, "orgId": ctx["orgId"]})
     if result.deleted_count and doc.get("type") == "csv":
         await _delete_gridfs_file((doc.get("config") or {}).get("fileId"))
-    await log_audit(ctx["userId"], "connection.deleted", "connection", connection_id,
-                    resource_name=doc.get("name", ""), severity="warning")
+    await log_audit(
+        ctx["userId"],
+        "connection.deleted",
+        "connection",
+        connection_id,
+        resource_name=doc.get("name", ""),
+        severity="warning",
+    )
     return {"success": result.deleted_count > 0}
 
 
@@ -1454,18 +1729,28 @@ async def set_connection_access(request: Request, connection_id: str, body: dict
     user_ids = sorted({str(u) for u in raw_ids}) if mode == "restricted" else []
     if user_ids:
         n = await mongo_db.org_members.count_documents(
-            {"orgId": ctx["orgId"], "status": "active", "userId": {"$in": user_ids}})
+            {"orgId": ctx["orgId"], "status": "active", "userId": {"$in": user_ids}}
+        )
         if n != len(user_ids):
-            return JSONResponse(status_code=400, content={"error": "Everyone you add must be an active member of this workspace."})
+            return JSONResponse(
+                status_code=400, content={"error": "Everyone you add must be an active member of this workspace."}
+            )
     doc = await mongo_db.connections.find_one({"_id": oid, "orgId": ctx["orgId"]}, {"name": 1})
     if not doc:
         return JSONResponse(status_code=404, content={"error": "Data source not found."})
     access = {"mode": mode, "userIds": user_ids, "updatedBy": ctx["userId"], "updatedAt": datetime.now().isoformat()}
     await mongo_db.connections.update_one({"_id": oid}, {"$set": {"access": access, "updatedAt": datetime.now()}})
-    await log_audit(ctx["userId"], "connection.access_updated", "connection", connection_id,
-                    metadata={"mode": mode, "people": len(user_ids)}, resource_name=doc.get("name", ""),
-                    severity="warning" if mode == "restricted" else "info")
+    await log_audit(
+        ctx["userId"],
+        "connection.access_updated",
+        "connection",
+        connection_id,
+        metadata={"mode": mode, "people": len(user_ids)},
+        resource_name=doc.get("name", ""),
+        severity="warning" if mode == "restricted" else "info",
+    )
     return {"success": True, "access": access}
+
 
 @app.post("/api/connections/{connection_id}/retention")
 async def set_connection_retention(request: Request, connection_id: str, body: dict):
@@ -1498,7 +1783,10 @@ async def set_connection_retention(request: Request, connection_id: str, body: d
         {"$set": {"config.retentionDays": retention_days, "updatedAt": datetime.now()}},
     )
     await log_audit(
-        user["userId"], "connection.retention_updated", "connection", connection_id,
+        user["userId"],
+        "connection.retention_updated",
+        "connection",
+        connection_id,
         metadata={"retentionDays": retention_days},
         resource_name=existing.get("name", ""),
     )
@@ -1524,7 +1812,10 @@ async def erase_connection_data(request: Request, connection_id: str):
         return {"error": "Connection not found"}
     result = await _erase_connection_data(conn["type"], conn.get("config", {}), conn.get("credentials", {}))
     await log_audit(
-        user["userId"], "connection.erased", "connection", connection_id,
+        user["userId"],
+        "connection.erased",
+        "connection",
+        connection_id,
         metadata={"detail": result.get("detail", "")},
         resource_name=conn.get("name", ""),
         status="success" if result.get("success") else "failure",
@@ -1554,6 +1845,7 @@ async def get_latest_analysis_result(request: Request, source_key: str):
         return {"result": None}
     return {"result": serialize_doc(doc)}
 
+
 @app.get("/api/connections/{connection_id}/reveal")
 async def reveal_connection(request: Request, connection_id: str):
     """
@@ -1579,9 +1871,16 @@ async def reveal_connection(request: Request, connection_id: str):
     conn = await get_decrypted_connection(connection_id, ctx["orgId"])
     if not conn:
         return {"error": "Connection not found"}
-    await log_audit(user["userId"], "connection.revealed", "connection", connection_id,
-                    resource_name=conn.get("name", ""), severity="warning")
+    await log_audit(
+        user["userId"],
+        "connection.revealed",
+        "connection",
+        connection_id,
+        resource_name=conn.get("name", ""),
+        severity="warning",
+    )
     return conn
+
 
 async def get_decrypted_connection(connection_id: str, org_id, legacy_user_id: str | None = None) -> dict | None:
     """
@@ -1639,8 +1938,7 @@ async def _assert_conn_allowed(ctx: dict, connection_id):
         oid = ObjectId(str(connection_id))
     except Exception:
         return None  # downstream code reports the bad id
-    doc = await mongo_db.connections.find_one(
-        {"_id": oid, "orgId": ctx["orgId"]}, {"access": 1, "createdBy": 1})
+    doc = await mongo_db.connections.find_one({"_id": oid, "orgId": ctx["orgId"]}, {"access": 1, "createdBy": 1})
     if doc and not _conn_allowed(ctx, doc):
         return JSONResponse(status_code=403, content={"error": _RESTRICTED_MSG})
     return None
@@ -1650,6 +1948,7 @@ async def _delete_gridfs_file(file_id) -> bool:
     """Deletes an uploaded CSV's stored bytes. Best effort; never raises."""
     try:
         from motor.motor_asyncio import AsyncIOMotorGridFSBucket
+
         await AsyncIOMotorGridFSBucket(mongo_db).delete(ObjectId(str(file_id)))
         return True
     except Exception as e:
@@ -1668,9 +1967,13 @@ async def _erase_connection_data(conn_type: str, cfg: dict, creds: dict) -> dict
     try:
         if conn_type == "csv":
             ok = await _delete_gridfs_file(cfg.get("fileId"))
-            return {"success": ok, "detail": "Deleted the uploaded file." if ok else "Could not delete the uploaded file."}
+            return {
+                "success": ok,
+                "detail": "Deleted the uploaded file." if ok else "Could not delete the uploaded file.",
+            }
         if conn_type == "mysql" or (conn_type == "cloudsql" and cfg.get("dbType", "postgres") == "mysql"):
             import aiomysql, ssl as ssl_lib
+
             host = cfg.get("instanceConnectionName") or cfg.get("host", "")
             port = int(cfg.get("port", 3306))
             database = cfg.get("database", "")
@@ -1678,8 +1981,15 @@ async def _erase_connection_data(conn_type: str, cfg: dict, creds: dict) -> dict
             table = cfg.get("table") or (tables[0] if tables else "")
             ssl_ctx = ssl_lib.create_default_context() if cfg.get("ssl") else None
             conn = await asyncio.wait_for(
-                aiomysql.connect(host=host, port=port, user=creds.get("user", ""),
-                    password=creds.get("password", ""), db=database, ssl=ssl_ctx, connect_timeout=10),
+                aiomysql.connect(
+                    host=host,
+                    port=port,
+                    user=creds.get("user", ""),
+                    password=creds.get("password", ""),
+                    db=database,
+                    ssl=ssl_ctx,
+                    connect_timeout=10,
+                ),
                 timeout=12,
             )
             async with conn.cursor() as cur:
@@ -1690,6 +2000,7 @@ async def _erase_connection_data(conn_type: str, cfg: dict, creds: dict) -> dict
 
         if conn_type == "postgres" or (conn_type == "cloudsql" and cfg.get("dbType", "postgres") != "mysql"):
             import asyncpg, ssl as ssl_lib
+
             host = cfg.get("instanceConnectionName") or cfg.get("host", "")
             port = int(cfg.get("port", 5432))
             database = cfg.get("database", "")
@@ -1697,8 +2008,15 @@ async def _erase_connection_data(conn_type: str, cfg: dict, creds: dict) -> dict
             table = cfg.get("table") or (tables[0] if tables else "")
             ssl_ctx = ssl_lib.create_default_context() if cfg.get("ssl") else None
             conn = await asyncio.wait_for(
-                asyncpg.connect(host=host, port=port, user=creds.get("user", ""),
-                    password=creds.get("password", ""), database=database, ssl=ssl_ctx, timeout=10),
+                asyncpg.connect(
+                    host=host,
+                    port=port,
+                    user=creds.get("user", ""),
+                    password=creds.get("password", ""),
+                    database=database,
+                    ssl=ssl_ctx,
+                    timeout=10,
+                ),
                 timeout=12,
             )
             await conn.execute(f'DROP TABLE IF EXISTS "{table}"')
@@ -1718,13 +2036,15 @@ async def _erase_connection_data(conn_type: str, cfg: dict, creds: dict) -> dict
         if conn_type == "bigquery":
             from google.cloud import bigquery as bq
             from google.oauth2 import service_account
+
             info = json.loads(creds.get("key_json", "{}"))
             project = cfg.get("project", "")
             dataset = cfg.get("dataset", "")
             tables = cfg.get("tables") or []
             table = cfg.get("table") or (tables[0] if tables else "")
             gcreds = service_account.Credentials.from_service_account_info(
-                info, scopes=["https://www.googleapis.com/auth/bigquery"])
+                info, scopes=["https://www.googleapis.com/auth/bigquery"]
+            )
             client = bq.Client(project=project, credentials=gcreds)
             client.delete_table(f"{project}.{dataset}.{table}", not_found_ok=True)
             return {"success": True, "detail": f"Deleted BigQuery table {project}.{dataset}.{table}"}
@@ -1732,13 +2052,15 @@ async def _erase_connection_data(conn_type: str, cfg: dict, creds: dict) -> dict
         if conn_type == "gcs":
             from google.cloud import storage as gcs_lib
             from google.oauth2 import service_account
+
             info = json.loads(creds.get("key_json", "{}"))
             project = cfg.get("project", "")
             bucket = cfg.get("bucket", "")
             files = cfg.get("files") or []
             file_path = cfg.get("file") or (files[0] if files else "")
             gcreds = service_account.Credentials.from_service_account_info(
-                info, scopes=["https://www.googleapis.com/auth/devstorage.read_write"])
+                info, scopes=["https://www.googleapis.com/auth/devstorage.read_write"]
+            )
             client = gcs_lib.Client(project=project, credentials=gcreds)
             blob = client.bucket(bucket).blob(file_path)
             if blob.exists():
@@ -1747,6 +2069,7 @@ async def _erase_connection_data(conn_type: str, cfg: dict, creds: dict) -> dict
 
         if conn_type == "databricks":
             from databricks import sql as databricks_sql
+
             host = cfg.get("host", "")
             http_path = cfg.get("httpPath", "")
             token = creds.get("token", "")
@@ -1755,17 +2078,20 @@ async def _erase_connection_data(conn_type: str, cfg: dict, creds: dict) -> dict
             tables = cfg.get("tables") or []
             table = cfg.get("table") or (tables[0] if tables else "")
             loop = asyncio.get_event_loop()
+
             def _drop():
                 conn = databricks_sql.connect(server_hostname=host, http_path=http_path, access_token=token)
                 cursor = conn.cursor()
                 cursor.execute(f"DROP TABLE IF EXISTS {catalog}.{schema}.{table}")
                 cursor.close()
                 conn.close()
+
             await loop.run_in_executor(None, _drop)
             return {"success": True, "detail": f"Dropped Databricks table {catalog}.{schema}.{table}"}
 
         if conn_type == "aws":
             import boto3
+
             service = cfg.get("service", "")
             region = cfg.get("region", "us-east-1")
             access_key_id = creds.get("accessKeyId", "")
@@ -1774,19 +2100,21 @@ async def _erase_connection_data(conn_type: str, cfg: dict, creds: dict) -> dict
                 bucket = cfg.get("bucket", "")
                 tables = cfg.get("tables") or []
                 key = cfg.get("table") or (tables[0] if tables else "")
-                s3 = boto3.client("s3", region_name=region,
-                    aws_access_key_id=access_key_id, aws_secret_access_key=secret_key)
+                s3 = boto3.client(
+                    "s3", region_name=region, aws_access_key_id=access_key_id, aws_secret_access_key=secret_key
+                )
                 s3.delete_object(Bucket=bucket, Key=key)
                 return {"success": True, "detail": f"Deleted S3 object {bucket}/{key}"}
             if service == "dynamodb":
                 tables = cfg.get("tables") or []
                 table_name = cfg.get("table") or (tables[0] if tables else "")
-                dynamo = boto3.resource("dynamodb", region_name=region,
-                    aws_access_key_id=access_key_id, aws_secret_access_key=secret_key)
+                dynamo = boto3.resource(
+                    "dynamodb", region_name=region, aws_access_key_id=access_key_id, aws_secret_access_key=secret_key
+                )
                 dyn_table = dynamo.Table(table_name)
-                scan = dyn_table.scan(ProjectionExpression=",".join(
-                    [attr["AttributeName"] for attr in dyn_table.key_schema]
-                ))
+                scan = dyn_table.scan(
+                    ProjectionExpression=",".join([attr["AttributeName"] for attr in dyn_table.key_schema])
+                )
                 with dyn_table.batch_writer() as batch:
                     for item in scan.get("Items", []):
                         batch.delete_item(Key=item)
@@ -1845,7 +2173,10 @@ async def _retention_sweep():
                     {"$set": {"updatedAt": datetime.now()}},
                 )
                 await log_audit(
-                    conn_doc.get("userId", ""), "connection.retention_erased", "connection", connection_id,
+                    conn_doc.get("userId", ""),
+                    "connection.retention_erased",
+                    "connection",
+                    connection_id,
                     metadata={"retentionDays": retention_days, "detail": result.get("detail", "")},
                     resource_name=conn_doc.get("name", ""),
                     status="success" if result.get("success") else "failure",
@@ -1887,11 +2218,20 @@ async def save_pipeline(request: Request, body: dict):
     _plan = await _effective_plan(ctx["userId"])
     if not _is_paid(_plan):
         if body.get("isActive"):
-            return _upgrade_response("scheduling", "Scheduled pipelines are part of the paid plans. "
-                                     "You can still build and run this one by hand on the free plan.")
-        if not pipeline_id and await mongo_db.pipelines.count_documents({"orgId": ctx["orgId"]}) >= FREE_LIMITS["maxPipelines"]:
-            return _upgrade_response("pipelines", f"The free plan keeps {FREE_LIMITS['maxPipelines']} saved pipeline. "
-                                     "Delete it, or upgrade to save as many as you like.")
+            return _upgrade_response(
+                "scheduling",
+                "Scheduled pipelines are part of the paid plans. "
+                "You can still build and run this one by hand on the free plan.",
+            )
+        if (
+            not pipeline_id
+            and await mongo_db.pipelines.count_documents({"orgId": ctx["orgId"]}) >= FREE_LIMITS["maxPipelines"]
+        ):
+            return _upgrade_response(
+                "pipelines",
+                f"The free plan keeps {FREE_LIMITS['maxPipelines']} saved pipeline. "
+                "Delete it, or upgrade to save as many as you like.",
+            )
     # Preserve an existing approval status across ordinary edits (e.g. the
     # Flow.tsx "Save Pipeline" button) so a pipeline someone marked
     # pending_approval doesn't silently flip back to approved just because
@@ -1904,8 +2244,9 @@ async def save_pipeline(request: Request, body: dict):
     # Workspace policy: when "require approval" is on, anything built or changed by someone who cannot
     # approve waits for a Steward / Admin / Owner before it can run or be scheduled.
     _org_row = await mongo_db.organizations.find_one({"_id": ctx["orgId"]}) or {}
-    needs_review = bool((_org_row.get("settings") or {}).get("requirePipelineApproval")) \
-        and not ctx["permissions"].get("pipeline.approve")
+    needs_review = bool((_org_row.get("settings") or {}).get("requirePipelineApproval")) and not ctx["permissions"].get(
+        "pipeline.approve"
+    )
     existing_status = "pending_approval" if (needs_review and not pipeline_id) else "approved"
     if pipeline_id:
         prev_status_doc = await mongo_db.pipelines.find_one(
@@ -1936,10 +2277,12 @@ async def save_pipeline(request: Request, body: dict):
         "scheduleTimezone": body.get("scheduleTimezone"),
         "scheduleStartDate": body.get("scheduleStartDate"),
         "isActive": body.get("isActive", False),
-        "status": (body.get("status")
-                if ctx["permissions"].get("pipeline.approve")
-                and body.get("status") in ("approved", "pending_approval", "rejected")
-                else existing_status),
+        "status": (
+            body.get("status")
+            if ctx["permissions"].get("pipeline.approve")
+            and body.get("status") in ("approved", "pending_approval", "rejected")
+            else existing_status
+        ),
         "updatedAt": datetime.now(),
     }
 
@@ -1950,9 +2293,15 @@ async def save_pipeline(request: Request, body: dict):
         await mongo_db.pipelines.update_one({"_id": ObjectId(pipeline_id), "orgId": ctx["orgId"]}, {"$set": payload})
         doc = await mongo_db.pipelines.find_one({"_id": ObjectId(pipeline_id)})
         diff = _diff_dict(prev_doc or {}, payload, ignore={"updatedAt"}) if prev_doc else None
-        await log_audit(user["userId"], "pipeline.updated", "pipeline", pipeline_id,
-                        metadata={"name": payload["name"]}, resource_name=payload["name"],
-                        changes=diff)
+        await log_audit(
+            user["userId"],
+            "pipeline.updated",
+            "pipeline",
+            pipeline_id,
+            metadata={"name": payload["name"]},
+            resource_name=payload["name"],
+            changes=diff,
+        )
     else:
         payload["userId"] = ctx["userId"]
         payload["createdBy"] = ctx["userId"]
@@ -1961,8 +2310,14 @@ async def save_pipeline(request: Request, body: dict):
         payload["lastRun"] = None
         result = await mongo_db.pipelines.insert_one(payload)
         doc = await mongo_db.pipelines.find_one({"_id": result.inserted_id})
-        await log_audit(user["userId"], "pipeline.created", "pipeline", str(result.inserted_id),
-                        metadata={"name": payload["name"]}, resource_name=payload["name"])
+        await log_audit(
+            user["userId"],
+            "pipeline.created",
+            "pipeline",
+            str(result.inserted_id),
+            metadata={"name": payload["name"]},
+            resource_name=payload["name"],
+        )
 
     return serialize_doc(doc)
 
@@ -1977,8 +2332,14 @@ async def delete_pipeline(request: Request, pipeline_id: str):
     user = ctx
     prev_pipeline = await mongo_db.pipelines.find_one({"_id": ObjectId(pipeline_id), "orgId": ctx["orgId"]})
     result = await mongo_db.pipelines.delete_one({"_id": ObjectId(pipeline_id), "orgId": ctx["orgId"]})
-    await log_audit(user["userId"], "pipeline.deleted", "pipeline", pipeline_id,
-                    resource_name=(prev_pipeline or {}).get("name", ""), severity="warning")
+    await log_audit(
+        user["userId"],
+        "pipeline.deleted",
+        "pipeline",
+        pipeline_id,
+        resource_name=(prev_pipeline or {}).get("name", ""),
+        severity="warning",
+    )
     return {"success": result.deleted_count > 0}
 
 
@@ -2011,7 +2372,10 @@ async def set_pipeline_status(request: Request, pipeline_id: str, body: dict):
         {"$set": {"status": new_status, "updatedAt": datetime.now()}},
     )
     await log_audit(
-        user["userId"], "pipeline.status_changed", "pipeline", pipeline_id,
+        user["userId"],
+        "pipeline.status_changed",
+        "pipeline",
+        pipeline_id,
         metadata={"from": prev_doc.get("status", "approved"), "to": new_status},
         resource_name=prev_doc.get("name", ""),
         severity="warning" if new_status == "pending_approval" else "info",
@@ -2025,33 +2389,43 @@ async def set_pipeline_status(request: Request, pipeline_id: str, body: dict):
 # credentials. Scoped to mongodb + mysql source/destination types for now —
 # add more branches following the same shape once these are verified.
 
-async def log_pipeline_run(user_id: str, pipeline_id: str, status: str, rows_in: int,
-                            rows_out: int, duration_ms: int, steps: list,
-                            triggered_by: str = "manual", error: str | None = None,
-                            correlation_id: str | None = None):
+
+async def log_pipeline_run(
+    user_id: str,
+    pipeline_id: str,
+    status: str,
+    rows_in: int,
+    rows_out: int,
+    duration_ms: int,
+    steps: list,
+    triggered_by: str = "manual",
+    error: str | None = None,
+    correlation_id: str | None = None,
+):
     if mongo_db is None:
         return
     try:
-        await mongo_db.runs.insert_one({
-            "ts": datetime.now(),
-            "pipelineId": pipeline_id,
-            "userId": user_id,
-            "orgId": await _org_id_for_user(user_id),
-            "status": status,
-            "rowsIn": rows_in,
-            "rowsOut": rows_out,
-            "durationMs": duration_ms,
-            "steps": steps,
-            "triggeredBy": triggered_by,
-            "error": error,
-            "correlationId": correlation_id,
-        })
+        await mongo_db.runs.insert_one(
+            {
+                "ts": datetime.now(),
+                "pipelineId": pipeline_id,
+                "userId": user_id,
+                "orgId": await _org_id_for_user(user_id),
+                "status": status,
+                "rowsIn": rows_in,
+                "rowsOut": rows_out,
+                "durationMs": duration_ms,
+                "steps": steps,
+                "triggeredBy": triggered_by,
+                "error": error,
+                "correlationId": correlation_id,
+            }
+        )
     except Exception as e:
         print(f"Run log write failed: {e}")
 
 
-async def _fetch_mongo_source_df(uri: str, database: str, collection: str,
-                                max_docs: int = 500000) -> pd.DataFrame:
+async def _fetch_mongo_source_df(uri: str, database: str, collection: str, max_docs: int = 500000) -> pd.DataFrame:
     """
     Streams the collection via async cursor iteration with an explicit
     batch_size, instead of the single .to_list(length=500000) call used
@@ -2078,8 +2452,7 @@ async def _fetch_mongo_source_df(uri: str, database: str, collection: str,
         client.close()
 
 
-async def _write_gsheet_df(session_id: str, sheet_id: str, sheet_name: str,
-                            df: pd.DataFrame, mode: str) -> dict:
+async def _write_gsheet_df(session_id: str, sheet_id: str, sheet_name: str, df: pd.DataFrame, mode: str) -> dict:
     """
     Writes to Google Sheets using the OAuth session tokens already stored
     for `session_id` (same store update_gsheet/sheet_to_csv use). The
@@ -2088,7 +2461,10 @@ async def _write_gsheet_df(session_id: str, sheet_id: str, sheet_name: str,
     fails with a clear, actionable error rather than silently no-op'ing.
     """
     if not session_id:
-        return {"success": False, "error": "No Google session linked to this destination. Reconnect Google Sheets for this pipeline in Flow."}
+        return {
+            "success": False,
+            "error": "No Google session linked to this destination. Reconnect Google Sheets for this pipeline in Flow.",
+        }
     tokens = await _get_session_tokens(session_id)
     if "access_token" not in tokens:
         return {"success": False, "error": "Google Sheets session expired or not authenticated. Reconnect in Flow."}
@@ -2112,8 +2488,11 @@ async def _write_gsheet_df(session_id: str, sheet_id: str, sheet_name: str,
             last = _gsheets_last_write.get(sheet_id, 0)
             elapsed = time.time() - last
             if elapsed < GSHEETS_MIN_INTERVAL_SECONDS:
-                return {"success": False, "skipped": True,
-                        "error": f"Rate-limited: wrote to this sheet {round(elapsed,1)}s ago. Min interval {GSHEETS_MIN_INTERVAL_SECONDS}s."}
+                return {
+                    "success": False,
+                    "skipped": True,
+                    "error": f"Rate-limited: wrote to this sheet {round(elapsed,1)}s ago. Min interval {GSHEETS_MIN_INTERVAL_SECONDS}s.",
+                }
             _gsheets_last_write[sheet_id] = time.time()
 
         service = build("sheets", "v4", credentials=creds)
@@ -2139,8 +2518,10 @@ async def _write_gsheet_df(session_id: str, sheet_id: str, sheet_name: str,
 
         service.spreadsheets().values().clear(spreadsheetId=sheet_id, range=f"{tab}!A1:ZZ1000000").execute()
         service.spreadsheets().values().update(
-            spreadsheetId=sheet_id, range=f"{tab}!A1",
-            valueInputOption="RAW", body={"values": values},
+            spreadsheetId=sheet_id,
+            range=f"{tab}!A1",
+            valueInputOption="RAW",
+            body={"values": values},
         ).execute()
 
         print(f"✅ Sheets write (pipeline executor): {sheet_name} ({sheet_id}) — {len(df)} rows")
@@ -2156,14 +2537,26 @@ def _is_safe_readonly_sql(sql: str) -> tuple[bool, str]:
     """Same allow-list logic as /api/sql-clean's inline check, factored out
     so the executor's sql_custom steps get the same protection."""
     import re
+
     no_block = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
     no_line = re.sub(r"--[^\n]*", "", no_block)
     stripped = no_line.strip().lstrip("(").strip()
     lowered = stripped.lower()
     if not (lowered.startswith("select") or lowered.startswith("with")):
         return False, "Only SELECT / WITH queries are allowed."
-    blocked = ["attach ", "pragma ", "copy ", "install ", "load ", "create ",
-            "insert ", "update ", "delete ", "drop ", "call "]
+    blocked = [
+        "attach ",
+        "pragma ",
+        "copy ",
+        "install ",
+        "load ",
+        "create ",
+        "insert ",
+        "update ",
+        "delete ",
+        "drop ",
+        "call ",
+    ]
     if any(b in lowered for b in blocked):
         return False, "Query contains a disallowed keyword."
     return True, ""
@@ -2171,6 +2564,7 @@ def _is_safe_readonly_sql(sql: str) -> tuple[bool, str]:
 
 async def _apply_sql_custom_step(df: pd.DataFrame, sql: str) -> tuple[pd.DataFrame, str | None]:
     import duckdb
+
     ok, reason = _is_safe_readonly_sql(sql)
     if not ok:
         return df, reason
@@ -2192,6 +2586,7 @@ import re as _re
 
 
 import contextvars as _contextvars
+
 # True while handling a request or pipeline run for a workspace that chose to share sample rows.
 _ai_share_var: "_contextvars.ContextVar[bool]" = _contextvars.ContextVar("ai_share_samples", default=False)
 
@@ -2259,6 +2654,7 @@ def _column_kind(series) -> str:
         return "boolean-like"
     try:
         import warnings
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             if pd.to_datetime(t, errors="coerce").notna().mean() > 0.8 and t.str.contains(r"\d").mean() > 0.9:
@@ -2296,9 +2692,11 @@ def _privacy_profile(df) -> str:
 
 def _ai_data_block(df) -> str:
     if _ai_private_mode():
-        return ("Column profiles. You are NOT shown real values, only structure. Write code that copes with messy "
-                "values (use errors='coerce', convert with astype(str) before string methods, handle blanks).\n"
-                + _privacy_profile(df))
+        return (
+            "Column profiles. You are NOT shown real values, only structure. Write code that copes with messy "
+            "values (use errors='coerce', convert with astype(str) before string methods, handle blanks).\n"
+            + _privacy_profile(df)
+        )
     return f"Columns: {list(df.columns)}\nSample rows: {df.head(5).fillna('').to_dict('records')}"
 
 
@@ -2309,24 +2707,132 @@ def _ai_data_block(df) -> str:
 import ast as _ast
 import builtins as _builtins
 
-_AI_ALLOWED_BUILTINS = {n: getattr(_builtins, n) for n in (
-    "len", "min", "max", "sum", "range", "round", "abs", "str", "int", "float", "bool",
-    "list", "dict", "set", "tuple", "sorted", "enumerate", "zip", "isinstance", "any", "all",
-    "map", "filter", "reversed", "slice", "divmod", "pow", "True", "False", "None",
-    "ValueError", "TypeError", "KeyError", "Exception", "object",
-)}
-_AI_BLOCKED_NAMES = {
-    "eval", "exec", "compile", "open", "input", "globals", "locals", "vars", "getattr", "setattr",
-    "delattr", "hasattr", "dir", "type", "super", "breakpoint", "help", "memoryview",
-    "os", "sys", "subprocess", "importlib", "shutil", "socket", "pathlib", "builtins", "ctypes",
+_AI_ALLOWED_BUILTINS = {
+    n: getattr(_builtins, n)
+    for n in (
+        "len",
+        "min",
+        "max",
+        "sum",
+        "range",
+        "round",
+        "abs",
+        "str",
+        "int",
+        "float",
+        "bool",
+        "list",
+        "dict",
+        "set",
+        "tuple",
+        "sorted",
+        "enumerate",
+        "zip",
+        "isinstance",
+        "any",
+        "all",
+        "map",
+        "filter",
+        "reversed",
+        "slice",
+        "divmod",
+        "pow",
+        "True",
+        "False",
+        "None",
+        "ValueError",
+        "TypeError",
+        "KeyError",
+        "Exception",
+        "object",
+    )
 }
-_AI_BLOCKED_ATTRS = {"eval", "query", "system", "popen", "load", "loads", "save", "savez", "fromfile",
-                     "tofile", "loadtxt", "genfromtxt", "memmap", "ctypeslib", "testing", "f2py",
-                     "os", "sys", "io", "environ", "environb", "getenv", "modules", "compat", "util", "core", "lib",
-                     "DataSource", "pickle", "pickle_compat", "path", "listdir", "remove", "unlink", "popen",
-                     "spawn", "format", "format_map", "style", "plotting", "errors", "__builtins__"}
-_AI_SAFE_TO = {"to_numeric", "to_datetime", "to_timedelta", "to_list", "to_dict", "to_string",
-               "to_period", "to_timestamp", "to_frame", "to_series", "to_numpy"}
+_AI_BLOCKED_NAMES = {
+    "eval",
+    "exec",
+    "compile",
+    "open",
+    "input",
+    "globals",
+    "locals",
+    "vars",
+    "getattr",
+    "setattr",
+    "delattr",
+    "hasattr",
+    "dir",
+    "type",
+    "super",
+    "breakpoint",
+    "help",
+    "memoryview",
+    "os",
+    "sys",
+    "subprocess",
+    "importlib",
+    "shutil",
+    "socket",
+    "pathlib",
+    "builtins",
+    "ctypes",
+}
+_AI_BLOCKED_ATTRS = {
+    "eval",
+    "query",
+    "system",
+    "popen",
+    "load",
+    "loads",
+    "save",
+    "savez",
+    "fromfile",
+    "tofile",
+    "loadtxt",
+    "genfromtxt",
+    "memmap",
+    "ctypeslib",
+    "testing",
+    "f2py",
+    "os",
+    "sys",
+    "io",
+    "environ",
+    "environb",
+    "getenv",
+    "modules",
+    "compat",
+    "util",
+    "core",
+    "lib",
+    "DataSource",
+    "pickle",
+    "pickle_compat",
+    "path",
+    "listdir",
+    "remove",
+    "unlink",
+    "popen",
+    "spawn",
+    "format",
+    "format_map",
+    "style",
+    "plotting",
+    "errors",
+    "__builtins__",
+}
+_AI_SAFE_TO = {
+    "to_numeric",
+    "to_datetime",
+    "to_timedelta",
+    "to_list",
+    "to_dict",
+    "to_string",
+    "to_period",
+    "to_timestamp",
+    "to_frame",
+    "to_series",
+    "to_numpy",
+}
 
 
 def _check_ai_code(code: str) -> None:
@@ -2334,14 +2840,31 @@ def _check_ai_code(code: str) -> None:
         raise ValueError("AI code is too long")
     tree = _ast.parse(code, mode="exec")
     for node in _ast.walk(tree):
-        if isinstance(node, (_ast.Import, _ast.ImportFrom, _ast.Global, _ast.Nonlocal,
-                             _ast.ClassDef, _ast.AsyncFunctionDef, _ast.Await, _ast.Try, _ast.While)):
+        if isinstance(
+            node,
+            (
+                _ast.Import,
+                _ast.ImportFrom,
+                _ast.Global,
+                _ast.Nonlocal,
+                _ast.ClassDef,
+                _ast.AsyncFunctionDef,
+                _ast.Await,
+                _ast.Try,
+                _ast.While,
+            ),
+        ):
             raise ValueError(f"'{type(node).__name__}' is not allowed in AI code")
         if isinstance(node, _ast.Name) and (node.id in _AI_BLOCKED_NAMES or node.id.startswith("__")):
             raise ValueError(f"'{node.id}' is not allowed in AI code")
         if isinstance(node, _ast.Attribute):
             a = node.attr
-            if a.startswith("_") or a in _AI_BLOCKED_ATTRS or a.startswith("read_") or (a.startswith("to_") and a not in _AI_SAFE_TO):
+            if (
+                a.startswith("_")
+                or a in _AI_BLOCKED_ATTRS
+                or a.startswith("read_")
+                or (a.startswith("to_") and a not in _AI_SAFE_TO)
+            ):
                 raise ValueError(f"'.{a}' is not allowed in AI code")
 
 
@@ -2351,10 +2874,13 @@ def _run_ai_code(code: str, df):
     scope = {"df": df, "pd": pd, "np": np}
     # Stop runaway code (for example a huge range loop) after 30 seconds where the platform allows it.
     import signal, threading
+
     use_alarm = hasattr(signal, "setitimer") and threading.current_thread() is threading.main_thread()
     if use_alarm:
+
         def _timeout(*_a):
             raise TimeoutError("AI code took too long")
+
         old = signal.signal(signal.SIGALRM, _timeout)
         signal.setitimer(signal.ITIMER_REAL, 30)
     try:
@@ -2379,15 +2905,17 @@ async def _apply_ai_custom_rule(df: pd.DataFrame, instruction: str) -> tuple[pd.
         return df, "Empty instruction — skipped."
     try:
         import anthropic
+
         preview_cols = list(df.columns)
         sample = df.head(5).fillna("").to_dict("records")
         client = anthropic.Anthropic(api_key=api_key)
         message = client.messages.create(
             model="claude-haiku-4-5",
             max_tokens=1024,
-            messages=[{
-                "role": "user",
-                "content": f"""You are a pandas data cleaning expert. Given this DataFrame info and instruction, write ONLY the pandas Python code to apply the transformation.
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"""You are a pandas data cleaning expert. Given this DataFrame info and instruction, write ONLY the pandas Python code to apply the transformation.
 
 {_ai_data_block(df)}
 Instruction: {instruction}
@@ -2399,8 +2927,9 @@ Rules:
 - If replacing a value in a numeric column with a non-numeric value, convert the column to string first (df['col'] = df['col'].astype(str))
 - Keep it simple and safe
 
-Reply with ONLY the Python code, nothing else, no markdown, no backticks."""
-            }]
+Reply with ONLY the Python code, nothing else, no markdown, no backticks.""",
+                }
+            ],
         )
         code = message.content[0].text.strip()
         code = code.replace("```python", "").replace("```", "").strip()
@@ -2465,30 +2994,40 @@ async def _apply_transformations(df: pd.DataFrame, transformations: list) -> tup
             continue
         if t.get("type") == "sql_custom":
             df, err = await _apply_sql_custom_step(df, t.get("sql", ""))
-            steps_log.append({"name": t.get("label", "SQL Query"),
-                            "status": "failed" if err else "success", "message": err})
+            steps_log.append(
+                {"name": t.get("label", "SQL Query"), "status": "failed" if err else "success", "message": err}
+            )
         elif t.get("type") == "ai_custom":
             df, err = await _apply_ai_custom_rule(df, t.get("instruction", ""))
-            steps_log.append({"name": t.get("label", "AI Custom Rule"),
-                            "status": "failed" if err else "success", "message": err})
+            steps_log.append(
+                {"name": t.get("label", "AI Custom Rule"), "status": "failed" if err else "success", "message": err}
+            )
 
     known_types = {
-        "remove_duplicates", "remove_empty_rows", "standardize_text",
-        "fill_missing", "cap_outliers", "fix_dates", "ai_clean",
-        "sql_custom", "ai_custom",
+        "remove_duplicates",
+        "remove_empty_rows",
+        "standardize_text",
+        "fill_missing",
+        "cap_outliers",
+        "fix_dates",
+        "ai_clean",
+        "sql_custom",
+        "ai_custom",
     }
     for u in sorted(types_present - known_types):
-        steps_log.append({"name": u, "status": "skipped",
-                        "message": "Not yet supported by server-side executor"})
+        steps_log.append({"name": u, "status": "skipped", "message": "Not yet supported by server-side executor"})
 
     return df, steps_log
+
 
 class SheetsReauthRequired(RuntimeError):
     """The stored Google refresh token is missing, expired or revoked."""
 
 
-_REAUTH_MSG = ("Google access for this Sheet has expired or was revoked. "
-               "The owner or an Admin must click 'Reconnect Google' on the Data Sources page.")
+_REAUTH_MSG = (
+    "Google access for this Sheet has expired or was revoked. "
+    "The owner or an Admin must click 'Reconnect Google' on the Data Sources page."
+)
 
 
 def _a1_tab(tab: str) -> str:
@@ -2545,8 +3084,7 @@ async def _mark_sheets_needs_reauth(connection_id):
     if mongo_db is None or not connection_id:
         return
     try:
-        await mongo_db.connections.update_one(
-            {"_id": ObjectId(connection_id)}, {"$set": {"status": "needs_reauth"}})
+        await mongo_db.connections.update_one({"_id": ObjectId(connection_id)}, {"$set": {"status": "needs_reauth"}})
     except Exception as e:
         print(f"Could not mark connection {connection_id} needs_reauth: {e}")
 
@@ -2576,8 +3114,7 @@ def _sheets_service(creds: dict):
 def _sheets_check_access_sync(creds: dict, sheet_id: str, tab: str) -> str:
     """Confirms the account can open the Sheet; returns the tab to use."""
     service = _sheets_service(creds)
-    meta = service.spreadsheets().get(
-        spreadsheetId=sheet_id, fields="sheets.properties.title").execute()
+    meta = service.spreadsheets().get(spreadsheetId=sheet_id, fields="sheets.properties.title").execute()
     titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
     if tab and tab not in titles:
         raise RuntimeError(f"Tab '{tab}' was not found in this Sheet.")
@@ -2596,8 +3133,7 @@ async def _sheets_fetch_df(cfg: dict, creds: dict) -> pd.DataFrame:
         raise RuntimeError(str(e))
 
     def _get():
-        return service.spreadsheets().values().get(
-            spreadsheetId=sheet_id, range=_a1_tab(tab)).execute()
+        return service.spreadsheets().values().get(spreadsheetId=sheet_id, range=_a1_tab(tab)).execute()
 
     result = await asyncio.to_thread(_get)
     values = result.get("values", [])
@@ -2613,50 +3149,62 @@ def _sheets_write_sync(service, sheet_id: str, tab: str, df: pd.DataFrame, mode:
     """Order matters so a failure never empties the sheet: (1) grow the grid
     if needed, (2) overwrite from A1, (3) clear only leftover rows/columns."""
     a1 = _a1_tab(tab)
-    meta = service.spreadsheets().get(
-        spreadsheetId=sheet_id,
-        fields="sheets.properties(sheetId,title,gridProperties(rowCount,columnCount))",
-    ).execute()
-    props = next((s["properties"] for s in meta.get("sheets", [])
-                  if s["properties"].get("title") == tab), None)
+    meta = (
+        service.spreadsheets()
+        .get(
+            spreadsheetId=sheet_id,
+            fields="sheets.properties(sheetId,title,gridProperties(rowCount,columnCount))",
+        )
+        .execute()
+    )
+    props = next((s["properties"] for s in meta.get("sheets", []) if s["properties"].get("title") == tab), None)
     if props is None:
         raise RuntimeError(f"Tab '{tab}' was not found in this Google Sheet.")
     grid_rows = int(props.get("gridProperties", {}).get("rowCount", 1000))
     grid_cols = int(props.get("gridProperties", {}).get("columnCount", 26))
 
     if mode == "append":
-        existing = service.spreadsheets().values().get(
-            spreadsheetId=sheet_id, range=a1).execute().get("values", [])
+        existing = service.spreadsheets().values().get(spreadsheetId=sheet_id, range=a1).execute().get("values", [])
         if existing:
             old_headers = [str(h) for h in existing[0]]
             width = len(old_headers)
             old_df = pd.DataFrame(
-                [(list(r) + [""] * (width - len(r)))[:width] for r in existing[1:]],
-                columns=old_headers)
+                [(list(r) + [""] * (width - len(r)))[:width] for r in existing[1:]], columns=old_headers
+            )
             new_df = df.rename(columns=str)
             all_cols = list(dict.fromkeys(list(old_df.columns) + list(new_df.columns)))
-            df = pd.concat([old_df.reindex(columns=all_cols),
-                            new_df.reindex(columns=all_cols)], ignore_index=True)
+            df = pd.concat([old_df.reindex(columns=all_cols), new_df.reindex(columns=all_cols)], ignore_index=True)
 
     header = [str(c) for c in df.columns]
     if not header:
         raise RuntimeError("Nothing to write: the result has no columns.")
-    values = [header] + [[_sheet_cell(v) for v in row]
-                         for row in df.itertuples(index=False, name=None)]
+    values = [header] + [[_sheet_cell(v) for v in row] for row in df.itertuples(index=False, name=None)]
     n_rows, n_cols = len(values), len(header)
     final_rows, final_cols = max(n_rows, grid_rows), max(n_cols, grid_cols)
 
     if final_rows > grid_rows or final_cols > grid_cols:
-        service.spreadsheets().batchUpdate(spreadsheetId=sheet_id, body={"requests": [{
-            "updateSheetProperties": {
-                "properties": {"sheetId": props["sheetId"],
-                               "gridProperties": {"rowCount": final_rows, "columnCount": final_cols}},
-                "fields": "gridProperties.rowCount,gridProperties.columnCount",
-            }}]}).execute()
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={
+                "requests": [
+                    {
+                        "updateSheetProperties": {
+                            "properties": {
+                                "sheetId": props["sheetId"],
+                                "gridProperties": {"rowCount": final_rows, "columnCount": final_cols},
+                            },
+                            "fields": "gridProperties.rowCount,gridProperties.columnCount",
+                        }
+                    }
+                ]
+            },
+        ).execute()
 
     service.spreadsheets().values().update(
-        spreadsheetId=sheet_id, range=f"{a1}!A1",
-        valueInputOption="RAW", body={"values": values},
+        spreadsheetId=sheet_id,
+        range=f"{a1}!A1",
+        valueInputOption="RAW",
+        body={"values": values},
     ).execute()
 
     if grid_rows > n_rows:
@@ -2688,8 +3236,10 @@ async def _sheets_write_df(cfg: dict, creds: dict, df: pd.DataFrame, mode: str) 
         prev = _gsheets_last_write.get(rl_key, 0)
         elapsed = time.time() - prev
         if elapsed < GSHEETS_MIN_INTERVAL_SECONDS:
-            raise RuntimeError(f"Rate-limited: wrote to this sheet {round(elapsed, 1)}s ago. "
-                               f"Min interval {GSHEETS_MIN_INTERVAL_SECONDS}s.")
+            raise RuntimeError(
+                f"Rate-limited: wrote to this sheet {round(elapsed, 1)}s ago. "
+                f"Min interval {GSHEETS_MIN_INTERVAL_SECONDS}s."
+            )
         _gsheets_last_write[rl_key] = time.time()
     try:
         rows_written = await asyncio.to_thread(_sheets_write_sync, service, sheet_id, tab, df, mode)
@@ -2702,10 +3252,12 @@ async def _sheets_write_df(cfg: dict, creds: dict, df: pd.DataFrame, mode: str) 
         raise RuntimeError(err_str)
     return {"success": True, "rows_written": rows_written, "sheet_id": sheet_id}
 
+
 async def _fetch_source_df(conn_type: str, cfg: dict, creds: dict) -> pd.DataFrame:
     """Returns a DataFrame for any supported source connection type."""
     if conn_type == "csv":
         from motor.motor_asyncio import AsyncIOMotorGridFSBucket
+
         stream = await AsyncIOMotorGridFSBucket(mongo_db).open_download_stream(ObjectId(cfg["fileId"]))
         return pd.read_csv(io.BytesIO(await stream.read()))
     if conn_type == "mongodb":
@@ -2720,11 +3272,17 @@ async def _fetch_source_df(conn_type: str, cfg: dict, creds: dict) -> pd.DataFra
     if conn_type == "mysql":
         tables = cfg.get("tables") or []
         table = cfg.get("table") or (tables[0] if tables else "")
-        result = await mysql_fetch_table({
-            "host": cfg.get("host", ""), "port": cfg.get("port", 3306),
-            "user": creds.get("user", ""), "password": creds.get("password", ""),
-            "database": cfg.get("database", ""), "table": table, "ssl": cfg.get("ssl", False),
-        })
+        result = await mysql_fetch_table(
+            {
+                "host": cfg.get("host", ""),
+                "port": cfg.get("port", 3306),
+                "user": creds.get("user", ""),
+                "password": creds.get("password", ""),
+                "database": cfg.get("database", ""),
+                "table": table,
+                "ssl": cfg.get("ssl", False),
+            }
+        )
         if result.get("error"):
             raise RuntimeError(f"MySQL fetch failed: {result['error']}")
         return pd.read_csv(os.path.join(UPLOAD_DIR, result["filename"]))
@@ -2732,11 +3290,17 @@ async def _fetch_source_df(conn_type: str, cfg: dict, creds: dict) -> pd.DataFra
     if conn_type == "postgres":
         tables = cfg.get("tables") or []
         table = cfg.get("table") or (tables[0] if tables else "")
-        result = await postgres_fetch_table({
-            "host": cfg.get("host", ""), "port": cfg.get("port", 5432),
-            "user": creds.get("user", ""), "password": creds.get("password", ""),
-            "database": cfg.get("database", ""), "table": table, "ssl": cfg.get("ssl", False),
-        })
+        result = await postgres_fetch_table(
+            {
+                "host": cfg.get("host", ""),
+                "port": cfg.get("port", 5432),
+                "user": creds.get("user", ""),
+                "password": creds.get("password", ""),
+                "database": cfg.get("database", ""),
+                "table": table,
+                "ssl": cfg.get("ssl", False),
+            }
+        )
         if result.get("error"):
             raise RuntimeError(f"PostgreSQL fetch failed: {result['error']}")
         return pd.read_csv(os.path.join(UPLOAD_DIR, result["filename"]))
@@ -2747,11 +3311,17 @@ async def _fetch_source_df(conn_type: str, cfg: dict, creds: dict) -> pd.DataFra
         db_type = cfg.get("dbType", "postgres")
         fetch_fn = mysql_fetch_table if db_type == "mysql" else postgres_fetch_table
         port_default = 3306 if db_type == "mysql" else 5432
-        result = await fetch_fn({
-            "host": cfg.get("instanceConnectionName", ""), "port": cfg.get("port", port_default),
-            "user": creds.get("user", ""), "password": creds.get("password", ""),
-            "database": cfg.get("database", ""), "table": table, "ssl": True,
-        })
+        result = await fetch_fn(
+            {
+                "host": cfg.get("instanceConnectionName", ""),
+                "port": cfg.get("port", port_default),
+                "user": creds.get("user", ""),
+                "password": creds.get("password", ""),
+                "database": cfg.get("database", ""),
+                "table": table,
+                "ssl": True,
+            }
+        )
         if result.get("error"):
             raise RuntimeError(f"Cloud SQL fetch failed: {result['error']}")
         return pd.read_csv(os.path.join(UPLOAD_DIR, result["filename"]))
@@ -2759,10 +3329,14 @@ async def _fetch_source_df(conn_type: str, cfg: dict, creds: dict) -> pd.DataFra
     if conn_type == "bigquery":
         tables = cfg.get("tables") or []
         table = cfg.get("table") or (tables[0] if tables else "")
-        result = await bigquery_fetch_table({
-            "key_json": creds.get("key_json", ""), "project": cfg.get("project", ""),
-            "dataset": cfg.get("dataset", ""), "table": table,
-        })
+        result = await bigquery_fetch_table(
+            {
+                "key_json": creds.get("key_json", ""),
+                "project": cfg.get("project", ""),
+                "dataset": cfg.get("dataset", ""),
+                "table": table,
+            }
+        )
         if result.get("error"):
             raise RuntimeError(f"BigQuery fetch failed: {result['error']}")
         return pd.read_csv(os.path.join(UPLOAD_DIR, result["filename"]))
@@ -2770,10 +3344,14 @@ async def _fetch_source_df(conn_type: str, cfg: dict, creds: dict) -> pd.DataFra
     if conn_type == "gcs":
         files = cfg.get("files") or []
         file_path = cfg.get("file") or (files[0] if files else "")
-        result = await gcs_fetch_file({
-            "key_json": creds.get("key_json", ""), "project": cfg.get("project", ""),
-            "bucket": cfg.get("bucket", ""), "file": file_path,
-        })
+        result = await gcs_fetch_file(
+            {
+                "key_json": creds.get("key_json", ""),
+                "project": cfg.get("project", ""),
+                "bucket": cfg.get("bucket", ""),
+                "file": file_path,
+            }
+        )
         if result.get("error"):
             raise RuntimeError(f"GCS fetch failed: {result['error']}")
         return pd.read_csv(os.path.join(UPLOAD_DIR, result["filename"]))
@@ -2781,11 +3359,16 @@ async def _fetch_source_df(conn_type: str, cfg: dict, creds: dict) -> pd.DataFra
     if conn_type == "databricks":
         tables = cfg.get("tables") or []
         table = cfg.get("table") or (tables[0] if tables else "")
-        result = await databricks_fetch_table({
-            "host": cfg.get("host", ""), "httpPath": cfg.get("httpPath", ""),
-            "token": creds.get("token", ""), "catalog": cfg.get("catalog", "hive_metastore"),
-            "schema": cfg.get("schema", "default"), "table": table,
-        })
+        result = await databricks_fetch_table(
+            {
+                "host": cfg.get("host", ""),
+                "httpPath": cfg.get("httpPath", ""),
+                "token": creds.get("token", ""),
+                "catalog": cfg.get("catalog", "hive_metastore"),
+                "schema": cfg.get("schema", "default"),
+                "table": table,
+            }
+        )
         if result.get("error"):
             raise RuntimeError(f"Databricks fetch failed: {result['error']}")
         return pd.read_csv(os.path.join(UPLOAD_DIR, result["filename"]))
@@ -2793,37 +3376,59 @@ async def _fetch_source_df(conn_type: str, cfg: dict, creds: dict) -> pd.DataFra
     if conn_type == "aws":
         tables = cfg.get("tables") or []
         table = cfg.get("table") or (tables[0] if tables else "")
-        result = await aws_fetch_table({
-                "costStartDate": cfg.get("costStartDate", ""), "costEndDate": cfg.get("costEndDate", ""),
-                "costGranularity": cfg.get("costGranularity", "MONTHLY"), "costGroupBy": cfg.get("costGroupBy", "SERVICE"),
+        result = await aws_fetch_table(
+            {
+                "costStartDate": cfg.get("costStartDate", ""),
+                "costEndDate": cfg.get("costEndDate", ""),
+                "costGranularity": cfg.get("costGranularity", "MONTHLY"),
+                "costGroupBy": cfg.get("costGroupBy", "SERVICE"),
                 "ssl": cfg.get("ssl", True),
-            "service": cfg.get("service", "rds-mysql"), "region": cfg.get("region", "us-east-1"),
-            "accessKeyId": creds.get("accessKeyId", ""), "secretAccessKey": creds.get("secretAccessKey", ""),
-            "table": table, "bucket": cfg.get("bucket", ""), "host": cfg.get("host", ""),
-            "port": cfg.get("port", ""), "user": creds.get("user", ""), "password": creds.get("password", ""),
-            "database": cfg.get("database", ""),
-        })
+                "service": cfg.get("service", "rds-mysql"),
+                "region": cfg.get("region", "us-east-1"),
+                "accessKeyId": creds.get("accessKeyId", ""),
+                "secretAccessKey": creds.get("secretAccessKey", ""),
+                "table": table,
+                "bucket": cfg.get("bucket", ""),
+                "host": cfg.get("host", ""),
+                "port": cfg.get("port", ""),
+                "user": creds.get("user", ""),
+                "password": creds.get("password", ""),
+                "database": cfg.get("database", ""),
+            }
+        )
         if result.get("error"):
             raise RuntimeError(f"AWS fetch failed: {result['error']}")
         return pd.read_csv(os.path.join(UPLOAD_DIR, result["filename"]))
 
     if conn_type == "rest":
-        cfg = {**cfg, "headers": creds.get("headers") or cfg.get("headers", {}),
-               "endpoint": cfg.get("endpoint") or (cfg.get("endpoints") or ["/"])[0]}
-        result = await rest_fetch_endpoint({
-            "base_url": cfg.get("base_url", ""), "endpoint": cfg.get("endpoint", "/"),
-            "headers": cfg.get("headers", {}), "verify_ssl": cfg.get("verify_ssl", True),
-        })
+        cfg = {
+            **cfg,
+            "headers": creds.get("headers") or cfg.get("headers", {}),
+            "endpoint": cfg.get("endpoint") or (cfg.get("endpoints") or ["/"])[0],
+        }
+        result = await rest_fetch_endpoint(
+            {
+                "base_url": cfg.get("base_url", ""),
+                "endpoint": cfg.get("endpoint", "/"),
+                "headers": cfg.get("headers", {}),
+                "verify_ssl": cfg.get("verify_ssl", True),
+            }
+        )
         if result.get("error"):
             raise RuntimeError(f"REST API fetch failed: {result['error']}")
         return pd.read_csv(os.path.join(UPLOAD_DIR, result["filename"]))
 
     if conn_type == "ga4":
-        result = await ga4_fetch_report({
-            "key_json": creds.get("key_json", ""), "property_id": cfg.get("property_id", ""),
-            "metrics": cfg.get("metrics", "sessions,activeUsers"), "dimensions": cfg.get("dimensions", "date"),
-            "start_date": cfg.get("start_date", "30daysAgo"), "end_date": cfg.get("end_date", "today"),
-        })
+        result = await ga4_fetch_report(
+            {
+                "key_json": creds.get("key_json", ""),
+                "property_id": cfg.get("property_id", ""),
+                "metrics": cfg.get("metrics", "sessions,activeUsers"),
+                "dimensions": cfg.get("dimensions", "date"),
+                "start_date": cfg.get("start_date", "30daysAgo"),
+                "end_date": cfg.get("end_date", "today"),
+            }
+        )
         if result.get("error"):
             raise RuntimeError(f"GA4 fetch failed: {result['error']}")
         return pd.read_csv(os.path.join(UPLOAD_DIR, result["filename"]))
@@ -2843,10 +3448,15 @@ async def _write_destination_df(conn_type: str, cfg: dict, creds: dict, df: pd.D
     if conn_type == "mongodb":
         collections = cfg.get("collections") or []
         collection = cfg.get("collection") or (collections[0] if collections else "")
-        result = await mongo_write_collection({
-            "uri": creds.get("uri") or cfg.get("uri", ""), "database": cfg.get("database", ""),
-            "collection": collection, "csvData": csv_data, "mode": mode,
-        })
+        result = await mongo_write_collection(
+            {
+                "uri": creds.get("uri") or cfg.get("uri", ""),
+                "database": cfg.get("database", ""),
+                "collection": collection,
+                "csvData": csv_data,
+                "mode": mode,
+            }
+        )
         if not result.get("success"):
             raise RuntimeError(f"MongoDB write failed: {result.get('error')}")
         return result
@@ -2854,12 +3464,19 @@ async def _write_destination_df(conn_type: str, cfg: dict, creds: dict, df: pd.D
     if conn_type == "mysql":
         tables = cfg.get("tables") or []
         table = cfg.get("table") or (tables[0] if tables else "")
-        result = await mysql_write_table({
-            "host": cfg.get("host", ""), "port": cfg.get("port", 3306),
-            "user": creds.get("user", ""), "password": creds.get("password", ""),
-            "database": cfg.get("database", ""), "table": table, "ssl": cfg.get("ssl", False),
-            "csvData": csv_data, "mode": mode,
-        })
+        result = await mysql_write_table(
+            {
+                "host": cfg.get("host", ""),
+                "port": cfg.get("port", 3306),
+                "user": creds.get("user", ""),
+                "password": creds.get("password", ""),
+                "database": cfg.get("database", ""),
+                "table": table,
+                "ssl": cfg.get("ssl", False),
+                "csvData": csv_data,
+                "mode": mode,
+            }
+        )
         if not result.get("success"):
             raise RuntimeError(f"MySQL write failed: {result.get('error')}")
         return result
@@ -2867,12 +3484,19 @@ async def _write_destination_df(conn_type: str, cfg: dict, creds: dict, df: pd.D
     if conn_type == "postgres":
         tables = cfg.get("tables") or []
         table = cfg.get("table") or (tables[0] if tables else "")
-        result = await postgres_write_table({
-            "host": cfg.get("host", ""), "port": cfg.get("port", 5432),
-            "user": creds.get("user", ""), "password": creds.get("password", ""),
-            "database": cfg.get("database", ""), "table": table, "ssl": cfg.get("ssl", False),
-            "csvData": csv_data, "mode": mode,
-        })
+        result = await postgres_write_table(
+            {
+                "host": cfg.get("host", ""),
+                "port": cfg.get("port", 5432),
+                "user": creds.get("user", ""),
+                "password": creds.get("password", ""),
+                "database": cfg.get("database", ""),
+                "table": table,
+                "ssl": cfg.get("ssl", False),
+                "csvData": csv_data,
+                "mode": mode,
+            }
+        )
         if not result.get("success"):
             raise RuntimeError(f"PostgreSQL write failed: {result.get('error')}")
         return result
@@ -2883,12 +3507,19 @@ async def _write_destination_df(conn_type: str, cfg: dict, creds: dict, df: pd.D
         db_type = cfg.get("dbType", "postgres")
         write_fn = mysql_write_table if db_type == "mysql" else postgres_write_table
         port_default = 3306 if db_type == "mysql" else 5432
-        result = await write_fn({
-            "host": cfg.get("instanceConnectionName", ""), "port": cfg.get("port", port_default),
-            "user": creds.get("user", ""), "password": creds.get("password", ""),
-            "database": cfg.get("database", ""), "table": table, "ssl": True,
-            "csvData": csv_data, "mode": mode,
-        })
+        result = await write_fn(
+            {
+                "host": cfg.get("instanceConnectionName", ""),
+                "port": cfg.get("port", port_default),
+                "user": creds.get("user", ""),
+                "password": creds.get("password", ""),
+                "database": cfg.get("database", ""),
+                "table": table,
+                "ssl": True,
+                "csvData": csv_data,
+                "mode": mode,
+            }
+        )
         if not result.get("success"):
             raise RuntimeError(f"Cloud SQL write failed: {result.get('error')}")
         return result
@@ -2896,10 +3527,16 @@ async def _write_destination_df(conn_type: str, cfg: dict, creds: dict, df: pd.D
     if conn_type == "bigquery":
         tables = cfg.get("tables") or []
         table = cfg.get("table") or (tables[0] if tables else "")
-        result = await bigquery_write_table({
-            "key_json": creds.get("key_json", ""), "project": cfg.get("project", ""),
-            "dataset": cfg.get("dataset", ""), "table": table, "csvData": csv_data, "mode": mode,
-        })
+        result = await bigquery_write_table(
+            {
+                "key_json": creds.get("key_json", ""),
+                "project": cfg.get("project", ""),
+                "dataset": cfg.get("dataset", ""),
+                "table": table,
+                "csvData": csv_data,
+                "mode": mode,
+            }
+        )
         if not result.get("success"):
             raise RuntimeError(f"BigQuery write failed: {result.get('error')}")
         return result
@@ -2907,10 +3544,16 @@ async def _write_destination_df(conn_type: str, cfg: dict, creds: dict, df: pd.D
     if conn_type == "gcs":
         files = cfg.get("files") or []
         file_path = cfg.get("file") or (files[0] if files else "")
-        result = await gcs_write_file({
-            "key_json": creds.get("key_json", ""), "project": cfg.get("project", ""),
-            "bucket": cfg.get("bucket", ""), "file": file_path, "csvData": csv_data, "mode": mode,
-        })
+        result = await gcs_write_file(
+            {
+                "key_json": creds.get("key_json", ""),
+                "project": cfg.get("project", ""),
+                "bucket": cfg.get("bucket", ""),
+                "file": file_path,
+                "csvData": csv_data,
+                "mode": mode,
+            }
+        )
         if not result.get("success"):
             raise RuntimeError(f"GCS write failed: {result.get('error')}")
         return result
@@ -2918,11 +3561,18 @@ async def _write_destination_df(conn_type: str, cfg: dict, creds: dict, df: pd.D
     if conn_type == "databricks":
         tables = cfg.get("tables") or []
         table = cfg.get("table") or (tables[0] if tables else "")
-        result = await databricks_write_table({
-            "host": cfg.get("host", ""), "httpPath": cfg.get("httpPath", ""),
-            "token": creds.get("token", ""), "catalog": cfg.get("catalog", "hive_metastore"),
-            "schema": cfg.get("schema", "default"), "table": table, "csvData": csv_data, "mode": mode,
-        })
+        result = await databricks_write_table(
+            {
+                "host": cfg.get("host", ""),
+                "httpPath": cfg.get("httpPath", ""),
+                "token": creds.get("token", ""),
+                "catalog": cfg.get("catalog", "hive_metastore"),
+                "schema": cfg.get("schema", "default"),
+                "table": table,
+                "csvData": csv_data,
+                "mode": mode,
+            }
+        )
         if not result.get("success"):
             raise RuntimeError(f"Databricks write failed: {result.get('error')}")
         return result
@@ -2930,26 +3580,44 @@ async def _write_destination_df(conn_type: str, cfg: dict, creds: dict, df: pd.D
     if conn_type == "aws":
         tables = cfg.get("tables") or []
         table = cfg.get("table") or (tables[0] if tables else "")
-        result = await aws_write_table({
-                "bucket": cfg.get("bucket", ""), "ssl": cfg.get("ssl", True),
-            "service": cfg.get("service", "rds-mysql"), "region": cfg.get("region", "us-east-1"),
-            "accessKeyId": creds.get("accessKeyId", ""), "secretAccessKey": creds.get("secretAccessKey", ""),
-            "table": table, "host": cfg.get("host", ""), "port": cfg.get("port", ""),
-            "user": creds.get("user", ""), "password": creds.get("password", ""),
-            "database": cfg.get("database", ""), "csvData": csv_data, "mode": mode,
-        })
+        result = await aws_write_table(
+            {
+                "bucket": cfg.get("bucket", ""),
+                "ssl": cfg.get("ssl", True),
+                "service": cfg.get("service", "rds-mysql"),
+                "region": cfg.get("region", "us-east-1"),
+                "accessKeyId": creds.get("accessKeyId", ""),
+                "secretAccessKey": creds.get("secretAccessKey", ""),
+                "table": table,
+                "host": cfg.get("host", ""),
+                "port": cfg.get("port", ""),
+                "user": creds.get("user", ""),
+                "password": creds.get("password", ""),
+                "database": cfg.get("database", ""),
+                "csvData": csv_data,
+                "mode": mode,
+            }
+        )
         if not result.get("success"):
             raise RuntimeError(f"AWS write failed: {result.get('error')}")
         return result
 
     if conn_type == "rest":
-        cfg = {**cfg, "headers": creds.get("headers") or cfg.get("headers", {}),
-               "endpoint": cfg.get("endpoint") or (cfg.get("endpoints") or ["/"])[0]}
-        result = await rest_write_endpoint({
-            "base_url": cfg.get("base_url", ""), "endpoint": cfg.get("endpoint", "/"),
-            "headers": cfg.get("headers", {}), "verify_ssl": cfg.get("verify_ssl", True),
-            "csvData": csv_data, "mode": mode,
-        })
+        cfg = {
+            **cfg,
+            "headers": creds.get("headers") or cfg.get("headers", {}),
+            "endpoint": cfg.get("endpoint") or (cfg.get("endpoints") or ["/"])[0],
+        }
+        result = await rest_write_endpoint(
+            {
+                "base_url": cfg.get("base_url", ""),
+                "endpoint": cfg.get("endpoint", "/"),
+                "headers": cfg.get("headers", {}),
+                "verify_ssl": cfg.get("verify_ssl", True),
+                "csvData": csv_data,
+                "mode": mode,
+            }
+        )
         if not result.get("success"):
             raise RuntimeError(f"REST API write failed: {result.get('error')}")
         return result
@@ -2959,7 +3627,11 @@ async def _write_destination_df(conn_type: str, cfg: dict, creds: dict, df: pd.D
 
     if conn_type == "google_sheets_legacy_unused":
         result = await _write_gsheet_df(
-            creds.get("sessionId", ""), cfg.get("sheetId", ""), cfg.get("sheetName", ""), df, mode,
+            creds.get("sessionId", ""),
+            cfg.get("sheetId", ""),
+            cfg.get("sheetName", ""),
+            df,
+            mode,
         )
         if not result.get("success"):
             raise RuntimeError(f"Google Sheets write failed: {result.get('error')}")
@@ -3019,9 +3691,17 @@ async def _run_pipeline(pipeline: dict, triggered_by: str = "manual") -> dict:
             dcreds = dest_conn.get("credentials", {})
             result_info = await _write_destination_df(dest_type, dcfg, dcreds, df, dest_mode)
             await log_audit(
-                user_id, "destination.write", "connection", dest_conn_id,
-                metadata={"destType": dest_type, "mode": dest_mode, "rowsOut": rows_out,
-                        "pipelineId": pipeline_id, "triggeredBy": triggered_by},
+                user_id,
+                "destination.write",
+                "connection",
+                dest_conn_id,
+                metadata={
+                    "destType": dest_type,
+                    "mode": dest_mode,
+                    "rowsOut": rows_out,
+                    "pipelineId": pipeline_id,
+                    "triggeredBy": triggered_by,
+                },
                 resource_name=dest_conn.get("name", dest_type),
                 correlation_id=correlation_id,
                 actor_type="user" if triggered_by == "manual" else "scheduler",
@@ -3038,19 +3718,29 @@ async def _run_pipeline(pipeline: dict, triggered_by: str = "manual") -> dict:
             {"_id": pipeline["_id"]},
             {"$set": {"lastRun": datetime.now()}, "$inc": {"runCount": 1}},
         )
-        await log_pipeline_run(user_id, pipeline_id, "success", rows_in, rows_out,
-                                duration_ms, steps_log, triggered_by, correlation_id=correlation_id)
+        await log_pipeline_run(
+            user_id,
+            pipeline_id,
+            "success",
+            rows_in,
+            rows_out,
+            duration_ms,
+            steps_log,
+            triggered_by,
+            correlation_id=correlation_id,
+        )
         await log_audit(
-            user_id, "pipeline.executed", "pipeline", pipeline_id,
-            metadata={"triggeredBy": triggered_by, "rowsIn": rows_in, "rowsOut": rows_out,
-                    "durationMs": duration_ms},
+            user_id,
+            "pipeline.executed",
+            "pipeline",
+            pipeline_id,
+            metadata={"triggeredBy": triggered_by, "rowsIn": rows_in, "rowsOut": rows_out, "durationMs": duration_ms},
             resource_name=pipeline_name,
             status="success",
             correlation_id=correlation_id,
             actor_type="user" if triggered_by == "manual" else "scheduler",
         )
-        return {"status": "success", "rowsIn": rows_in, "rowsOut": rows_out,
-                "durationMs": duration_ms, **result_info}
+        return {"status": "success", "rowsIn": rows_in, "rowsOut": rows_out, "durationMs": duration_ms, **result_info}
 
     except Exception as e:
         duration_ms = int((time.time() - start) * 1000)
@@ -3062,10 +3752,23 @@ async def _run_pipeline(pipeline: dict, triggered_by: str = "manual") -> dict:
             )
         except Exception:
             pass
-        await log_pipeline_run(user_id, pipeline_id, "failed", 0, 0, duration_ms,
-                                steps_log, triggered_by, error=str(e), correlation_id=correlation_id)
+        await log_pipeline_run(
+            user_id,
+            pipeline_id,
+            "failed",
+            0,
+            0,
+            duration_ms,
+            steps_log,
+            triggered_by,
+            error=str(e),
+            correlation_id=correlation_id,
+        )
         await log_audit(
-            user_id, "pipeline.executed", "pipeline", pipeline_id,
+            user_id,
+            "pipeline.executed",
+            "pipeline",
+            pipeline_id,
             metadata={"triggeredBy": triggered_by, "error": str(e), "durationMs": duration_ms},
             resource_name=pipeline_name,
             status="failure",
@@ -3156,11 +3859,13 @@ async def _try_acquire_pipeline_lock(pipeline_id: str, ttl_seconds: int = 300) -
         return True
     now = datetime.now()
     try:
-        await mongo_db.pipeline_locks.insert_one({
-            "pipelineId": pipeline_id,
-            "lockedAt": now,
-            "expiresAt": now + timedelta(seconds=ttl_seconds),
-        })
+        await mongo_db.pipeline_locks.insert_one(
+            {
+                "pipelineId": pipeline_id,
+                "lockedAt": now,
+                "expiresAt": now + timedelta(seconds=ttl_seconds),
+            }
+        )
         return True
     except DuplicateKeyError:
         return False
@@ -3190,11 +3895,13 @@ async def _scheduler_loop():
         try:
             if mongo_db is not None:
                 now = datetime.now()
-                cursor = mongo_db.pipelines.find({
-                    "isActive": True,
-                    "scheduleMs": {"$gt": 0},
-                    "status": {"$nin": ["pending_approval", "rejected"]},
-                })
+                cursor = mongo_db.pipelines.find(
+                    {
+                        "isActive": True,
+                        "scheduleMs": {"$gt": 0},
+                        "status": {"$nin": ["pending_approval", "rejected"]},
+                    }
+                )
                 async for pipeline in cursor:
                     pid = str(pipeline["_id"])
                     interval_ms = pipeline.get("scheduleMs") or 0
@@ -3212,7 +3919,7 @@ async def _scheduler_loop():
                     if due and PLAN_LOCKS_ENABLED and pipeline.get("orgId") is not None:
                         try:
                             if not _is_paid(await _plan_of_org(pipeline["orgId"])):
-                                due = False   # free workspaces do not get scheduled server runs
+                                due = False  # free workspaces do not get scheduled server runs
                         except Exception:
                             pass
                     if due:
@@ -3281,22 +3988,42 @@ async def _ensure_org_indexes():
     except Exception as e:
         print(f"Could not ensure org indexes: {e}")
 
+
 # ── IAM: organizations, membership, roles (auto-provisioning) ──────────────
 
 _ALL_PERMISSION_KEYS = [
-    "connection.view", "connection.create", "connection.edit", "connection.deleteOwn",
-    "connection.delete", "connection.erase", "connection.revealCredentials",
-    "catalog.view", "catalog.editText", "catalog.editLabels", "catalog.assignOwner", "catalog.delete",
-    "pipeline.view", "pipeline.create", "pipeline.edit", "pipeline.execute",
-    "pipeline.approve", "pipeline.delete",
-    "analysis.view", "analysis.run",
-    "audit.view", "audit.export",
-    "org.manageMembers", "org.transferOwnership",
-    "tunnel.use", "tunnel.manage",
+    "connection.view",
+    "connection.create",
+    "connection.edit",
+    "connection.deleteOwn",
+    "connection.delete",
+    "connection.erase",
+    "connection.revealCredentials",
+    "catalog.view",
+    "catalog.editText",
+    "catalog.editLabels",
+    "catalog.assignOwner",
+    "catalog.delete",
+    "pipeline.view",
+    "pipeline.create",
+    "pipeline.edit",
+    "pipeline.execute",
+    "pipeline.approve",
+    "pipeline.delete",
+    "analysis.view",
+    "analysis.run",
+    "audit.view",
+    "audit.export",
+    "org.manageMembers",
+    "org.transferOwnership",
+    "tunnel.use",
+    "tunnel.manage",
 ]
+
 
 def _perm_set(*granted: str) -> dict:
     return {k: (k in granted) for k in _ALL_PERMISSION_KEYS}
+
 
 _FULL_ACCESS = [k for k in _ALL_PERMISSION_KEYS if k != "org.transferOwnership"]
 
@@ -3304,26 +4031,47 @@ DEFAULT_ROLE_PERMISSIONS = {
     "owner": _perm_set(*_ALL_PERMISSION_KEYS),
     "admin": _perm_set(*_FULL_ACCESS),
     "steward": _perm_set(
-        "connection.view", "connection.create", "connection.deleteOwn",
-        "catalog.view", "catalog.editText", "catalog.editLabels", "catalog.assignOwner", "catalog.delete",
-        "pipeline.view", "pipeline.create", "pipeline.edit", "pipeline.execute", "pipeline.approve",
-        "analysis.view", "analysis.run",
+        "connection.view",
+        "connection.create",
+        "connection.deleteOwn",
+        "catalog.view",
+        "catalog.editText",
+        "catalog.editLabels",
+        "catalog.assignOwner",
+        "catalog.delete",
+        "pipeline.view",
+        "pipeline.create",
+        "pipeline.edit",
+        "pipeline.execute",
+        "pipeline.approve",
+        "analysis.view",
+        "analysis.run",
         "audit.view",
         "tunnel.use",
     ),
     "editor": _perm_set(
-        "connection.view", "connection.create", "connection.deleteOwn",
-        "catalog.view", "catalog.editText",
-        "pipeline.view", "pipeline.create", "pipeline.edit", "pipeline.execute",
-        "analysis.view", "analysis.run",
+        "connection.view",
+        "connection.create",
+        "connection.deleteOwn",
+        "catalog.view",
+        "catalog.editText",
+        "pipeline.view",
+        "pipeline.create",
+        "pipeline.edit",
+        "pipeline.execute",
+        "analysis.view",
+        "analysis.run",
         "tunnel.use",
     ),
     "viewer": _perm_set("connection.view", "catalog.view", "pipeline.view", "analysis.view"),
 }
 
 ROLE_LABELS = {
-    "owner": "Organization Owner", "admin": "Admin", "steward": "Data Steward",
-    "editor": "Editor", "viewer": "Viewer",
+    "owner": "Organization Owner",
+    "admin": "Admin",
+    "steward": "Data Steward",
+    "editor": "Editor",
+    "viewer": "Viewer",
 }
 ASSIGNABLE_ROLES = ("admin", "steward", "editor", "viewer")
 
@@ -3334,18 +4082,22 @@ async def _seed_role_definitions(org_id):
     for role_key, perms in DEFAULT_ROLE_PERMISSIONS.items():
         existing = await mongo_db.role_definitions.find_one({"orgId": org_id, "key": role_key})
         if not existing:
-            await mongo_db.role_definitions.insert_one({
-                "orgId": org_id,
-                "key": role_key,
-                "name": role_key.capitalize(),
-                "permissions": perms,
-                "createdAt": datetime.now(),
-            })
+            await mongo_db.role_definitions.insert_one(
+                {
+                    "orgId": org_id,
+                    "key": role_key,
+                    "name": role_key.capitalize(),
+                    "permissions": perms,
+                    "createdAt": datetime.now(),
+                }
+            )
 
 
 def _is_personal_org(org: dict | None, user_id: str) -> bool:
     """True only for the person's OWN auto-created workspace. The same org is a *team* to everyone invited into it."""
-    return str((org or {}).get("slug", "")).startswith("personal-") and str((org or {}).get("ownerId", "")) == str(user_id)
+    return str((org or {}).get("slug", "")).startswith("personal-") and str((org or {}).get("ownerId", "")) == str(
+        user_id
+    )
 
 
 async def _resolve_membership(user_id: str) -> dict | None:
@@ -3356,8 +4108,7 @@ async def _resolve_membership(user_id: str) -> dict | None:
     stored (or it is no longer valid) we fall back to their personal workspace."""
     pref = await mongo_db.org_prefs.find_one({"userId": user_id})
     if pref and pref.get("activeOrgId") is not None:
-        m = await mongo_db.org_members.find_one(
-            {"userId": user_id, "orgId": pref["activeOrgId"], "status": "active"})
+        m = await mongo_db.org_members.find_one({"userId": user_id, "orgId": pref["activeOrgId"], "status": "active"})
         if m:
             return m
     ms = await mongo_db.org_members.find({"userId": user_id, "status": "active"}).to_list(length=100)
@@ -3409,11 +4160,15 @@ async def _provision_personal(user_id: str) -> dict:
         membership_doc = await mongo_db.org_members.find_one({"orgId": org_id, "userId": user_id})
 
     org_doc["_id"] = org_id
-    await log_audit(user_id, "org.autoprovisioned", "organization", str(org_id),
-                    metadata={"slug": org_doc["slug"]}, resource_name=org_doc["name"])
+    await log_audit(
+        user_id,
+        "org.autoprovisioned",
+        "organization",
+        str(org_id),
+        metadata={"slug": org_doc["slug"]},
+        resource_name=org_doc["name"],
+    )
     return {"org": org_doc, "membership": membership_doc}
-
-
 
 
 async def _ensure_personal_workspace(user_id: str) -> None:
@@ -3428,7 +4183,8 @@ async def _ensure_personal_workspace(user_id: str) -> None:
     current = await _resolve_membership(user_id)
     if current and not await mongo_db.org_prefs.find_one({"userId": user_id}):
         await mongo_db.org_prefs.update_one(
-            {"userId": user_id}, {"$set": {"userId": user_id, "activeOrgId": current["orgId"]}}, upsert=True)
+            {"userId": user_id}, {"$set": {"userId": user_id, "activeOrgId": current["orgId"]}}, upsert=True
+        )
     await _provision_personal(user_id)
 
 
@@ -3459,8 +4215,8 @@ async def _check_permission(user_id: str, permission_key: str) -> bool:
 from fastapi.responses import JSONResponse
 
 _ORG_CACHE_TTL = 60
-_org_cache: dict = {}          # user_id -> (timestamp, orgId)
-_legacy_stamped: set = set()   # user_ids already stamped in this process
+_org_cache: dict = {}  # user_id -> (timestamp, orgId)
+_legacy_stamped: set = set()  # user_ids already stamped in this process
 
 
 async def _org_id_for_user(user_id: str):
@@ -3620,11 +4376,15 @@ async def update_org_settings(request: Request, body: dict):
     if not updates:
         return JSONResponse(status_code=400, content={"error": "Nothing to update."})
     if updates.get("aiShareSamples") and os.getenv("AI_ALLOW_SHARING", "on").strip().lower() == "off":
-        return JSONResponse(status_code=403, content={"error": "Sharing sample rows with the AI is turned off for this service."})
+        return JSONResponse(
+            status_code=403, content={"error": "Sharing sample rows with the AI is turned off for this service."}
+        )
     await mongo_db.organizations.update_one(
-        {"_id": ctx["orgId"]}, {"$set": {f"settings.{k}": v for k, v in updates.items()}})
-    await log_audit(ctx["userId"], "org.settings_updated", "organization", str(ctx["orgId"]),
-                    metadata=updates, severity="warning")
+        {"_id": ctx["orgId"]}, {"$set": {f"settings.{k}": v for k, v in updates.items()}}
+    )
+    await log_audit(
+        ctx["userId"], "org.settings_updated", "organization", str(ctx["orgId"]), metadata=updates, severity="warning"
+    )
     return {"success": True, "settings": updates}
 
 
@@ -3665,14 +4425,13 @@ async def list_org_members(request: Request):
     ]
 
 
-
 @app.post("/api/org/members")
 async def add_org_member(request: Request, body: dict):
     """Adds an existing userId (already resolved from email by the caller's
-        auth service — see TeamSettings.tsx) to the caller's org. Requires
-        org.manageMembers. Refuses to invite someone who already has an active
-        membership anywhere, matching the one-active-org-per-user assumption
-        in _ensure_org_for_user."""
+    auth service — see TeamSettings.tsx) to the caller's org. Requires
+    org.manageMembers. Refuses to invite someone who already has an active
+    membership anywhere, matching the one-active-org-per-user assumption
+    in _ensure_org_for_user."""
     user = require_user(request)
     if not user:
         return Response(status_code=401)
@@ -3694,7 +4453,8 @@ async def add_org_member(request: Request, body: dict):
         if role_key not in DEFAULT_ROLE_PERMISSIONS:
             return {"error": f"Unknown role '{role_key}' for this organization"}
         role_def = {
-            "orgId": org_id, "key": role_key,
+            "orgId": org_id,
+            "key": role_key,
             "name": role_key.capitalize(),
             "permissions": DEFAULT_ROLE_PERMISSIONS[role_key],
             "createdAt": datetime.now(),
@@ -3710,12 +4470,24 @@ async def add_org_member(request: Request, body: dict):
 
     await mongo_db.org_members.update_one(
         {"orgId": org_id, "userId": target_user_id},
-        {"$set": {"orgId": org_id, "userId": target_user_id, "roleKey": role_key,
-                "status": "active", "joinedAt": datetime.now()}},
+        {
+            "$set": {
+                "orgId": org_id,
+                "userId": target_user_id,
+                "roleKey": role_key,
+                "status": "active",
+                "joinedAt": datetime.now(),
+            }
+        },
         upsert=True,
     )
-    await log_audit(user["userId"], "org.member_added", "organization", str(org_id),
-                    metadata={"targetUserId": target_user_id, "roleKey": role_key})
+    await log_audit(
+        user["userId"],
+        "org.member_added",
+        "organization",
+        str(org_id),
+        metadata={"targetUserId": target_user_id, "roleKey": role_key},
+    )
     return {"success": True}
 
 
@@ -3752,7 +4524,8 @@ async def update_org_member_role(request: Request, target_user_id: str, body: di
         if new_role not in DEFAULT_ROLE_PERMISSIONS:
             return {"error": f"Unknown role '{new_role}' for this organization"}
         role_def = {
-            "orgId": org_id, "key": new_role,
+            "orgId": org_id,
+            "key": new_role,
             "name": new_role.capitalize(),
             "permissions": DEFAULT_ROLE_PERMISSIONS[new_role],
             "createdAt": datetime.now(),
@@ -3763,8 +4536,13 @@ async def update_org_member_role(request: Request, target_user_id: str, body: di
         {"orgId": org_id, "userId": target_user_id},
         {"$set": {"roleKey": new_role}},
     )
-    await log_audit(user["userId"], "org.member_role_changed", "organization", str(org_id),
-                    metadata={"targetUserId": target_user_id, "from": member.get("roleKey"), "to": new_role})
+    await log_audit(
+        user["userId"],
+        "org.member_role_changed",
+        "organization",
+        str(org_id),
+        metadata={"targetUserId": target_user_id, "from": member.get("roleKey"), "to": new_role},
+    )
     return {"success": True}
 
 
@@ -3796,8 +4574,14 @@ async def remove_org_member(request: Request, target_user_id: str):
         {"orgId": org_id, "type": "sheets", "createdBy": target_user_id},
         {"$set": {"credentialsEncrypted": "", "status": "needs_reauth"}},
     )
-    await log_audit(user["userId"], "org.member_removed", "organization", str(org_id),
-                    metadata={"targetUserId": target_user_id}, severity="warning")
+    await log_audit(
+        user["userId"],
+        "org.member_removed",
+        "organization",
+        str(org_id),
+        metadata={"targetUserId": target_user_id},
+        severity="warning",
+    )
     return {"success": result.deleted_count > 0}
 
 
@@ -3830,8 +4614,10 @@ async def _seat_error(org_id, extra: int = 1, count_pending: bool = True):
         # Free workspaces are just you. This holds even when seat counting (ENFORCE_SEAT_LIMITS) is off.
         try:
             if not _is_paid(await _plan_of_org(org_id)):
-                return _upgrade_response("team", "Adding teammates is part of the paid plans. "
-                                         "Upgrade to invite people and give them roles.")
+                return _upgrade_response(
+                    "team",
+                    "Adding teammates is part of the paid plans. " "Upgrade to invite people and give them roles.",
+                )
         except Exception as e:
             print(f"⚠ team plan check failed, allowing: {e}")
     if not ENFORCE_SEAT_LIMITS:
@@ -3839,10 +4625,14 @@ async def _seat_error(org_id, extra: int = 1, count_pending: bool = True):
     u = await _seat_usage(org_id)
     taken = u["used"] + (u["pending"] if count_pending else 0)
     if taken + extra > u["limit"]:
-        return JSONResponse(status_code=403, content={
-            "error": f"Your {u['plan']} plan includes {u['limit']} user{'s' if u['limit'] != 1 else ''} "
-                     f"(you have {u['used']} member{'s' if u['used'] != 1 else ''} and {u['pending']} pending invite"
-                     f"{'s' if u['pending'] != 1 else ''}). Upgrade your plan to add more teammates."})
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": f"Your {u['plan']} plan includes {u['limit']} user{'s' if u['limit'] != 1 else ''} "
+                f"(you have {u['used']} member{'s' if u['used'] != 1 else ''} and {u['pending']} pending invite"
+                f"{'s' if u['pending'] != 1 else ''}). Upgrade your plan to add more teammates."
+            },
+        )
     return None
 
 
@@ -3852,6 +4642,7 @@ ROLE_DESCRIPTIONS = {
     "editor": "Connect data sources, build, schedule and run pipelines, and analyze data.",
     "viewer": "Read-only access to connections, pipelines, analysis results and the catalog.",
 }
+
 
 async def _org_label(org: dict) -> str:
     name = (org or {}).get("name", "")
@@ -3866,6 +4657,7 @@ async def _org_label(org: dict) -> str:
     base = owner_email.split("@")[0]
     return f"{base}'s workspace" if base else "Workspace"
 
+
 @app.put("/api/org")
 async def rename_org(request: Request, body: dict):
     ctx, err = await _auth(request, "org.manageMembers")
@@ -3875,9 +4667,11 @@ async def rename_org(request: Request, body: dict):
     if len(name) < 2:
         return JSONResponse(status_code=400, content={"error": "Name must be at least 2 characters."})
     await mongo_db.organizations.update_one({"_id": ctx["orgId"]}, {"$set": {"name": name}})
-    await log_audit(ctx["userId"], "org.renamed", "organization", str(ctx["orgId"]),
-                    metadata={"name": name}, resource_name=name)
+    await log_audit(
+        ctx["userId"], "org.renamed", "organization", str(ctx["orgId"]), metadata={"name": name}, resource_name=name
+    )
     return {"success": True, "name": name}
+
 
 @app.post("/api/org/invites")
 async def create_org_invite(request: Request, body: dict):
@@ -3899,9 +4693,12 @@ async def create_org_invite(request: Request, body: dict):
     existing_user = await mongo_db.users.find_one({"email": email})
     if existing_user:
         m = await mongo_db.org_members.find_one(
-            {"userId": str(existing_user["_id"]), "orgId": org_id, "status": "active"})
+            {"userId": str(existing_user["_id"]), "orgId": org_id, "status": "active"}
+        )
         if m:
-            return JSONResponse(status_code=400, content={"error": "This person is already a member of your organization."})
+            return JSONResponse(
+                status_code=400, content={"error": "This person is already a member of your organization."}
+            )
         # A person can belong to several teams, so being in another team is no reason to refuse.
 
     now = datetime.now()
@@ -3916,18 +4713,26 @@ async def create_org_invite(request: Request, body: dict):
             {"$set": {"roleKey": role_key, "invitedBy": ctx["userId"], "updatedAt": now}},
         )
     else:
-        await mongo_db.org_invites.insert_one({
-            "orgId": org_id, "email": email, "roleKey": role_key, "status": "pending",
-            "invitedBy": ctx["userId"], "createdAt": now,
-            # Not used anymore, but org_invites has a UNIQUE index on "token";
-            # a unique value avoids duplicate-null errors.
-            "token": secrets.token_urlsafe(16),
-        })
-    await log_audit(ctx["userId"], "org.email_approved", "organization", str(org_id),
-                    metadata={"email": email, "roleKey": role_key})
+        await mongo_db.org_invites.insert_one(
+            {
+                "orgId": org_id,
+                "email": email,
+                "roleKey": role_key,
+                "status": "pending",
+                "invitedBy": ctx["userId"],
+                "createdAt": now,
+                # Not used anymore, but org_invites has a UNIQUE index on "token";
+                # a unique value avoids duplicate-null errors.
+                "token": secrets.token_urlsafe(16),
+            }
+        )
+    await log_audit(
+        ctx["userId"], "org.email_approved", "organization", str(org_id), metadata={"email": email, "roleKey": role_key}
+    )
     org_row = await mongo_db.organizations.find_one({"_id": org_id}) or {}
     emailed, _mail_err = await asyncio.to_thread(
-        send_invite_email, email, await _org_label(org_row), ROLE_LABELS.get(role_key, role_key), ctx.get("email", ""))
+        send_invite_email, email, await _org_label(org_row), ROLE_LABELS.get(role_key, role_key), ctx.get("email", "")
+    )
     return {"success": True, "emailed": emailed}
 
 
@@ -3950,12 +4755,16 @@ async def list_org_invites(request: Request):
         status = d.get("status")
         if status == "pending" and d.get("expiresAt") and d["expiresAt"] < now:
             status = "expired"
-        out.append({
-            "id": str(d["_id"]), "email": d.get("email", ""), "roleKey": d.get("roleKey", ""),
-            "status": status,
-            "invitedAt": d.get("createdAt").isoformat() if d.get("createdAt") else None,
-            "expiresAt": d.get("expiresAt").isoformat() if d.get("expiresAt") else None,
-        })
+        out.append(
+            {
+                "id": str(d["_id"]),
+                "email": d.get("email", ""),
+                "roleKey": d.get("roleKey", ""),
+                "status": status,
+                "invitedAt": d.get("createdAt").isoformat() if d.get("createdAt") else None,
+                "expiresAt": d.get("expiresAt").isoformat() if d.get("expiresAt") else None,
+            }
+        )
     return out
 
 
@@ -3975,12 +4784,14 @@ async def revoke_org_invite(request: Request, invite_id: str):
         {"$set": {"status": "revoked"}},
     )
     if result.matched_count:
-        await log_audit(user["userId"], "org.invite_revoked", "organization", str(org_id),
-                        metadata={"inviteId": invite_id})
+        await log_audit(
+            user["userId"], "org.invite_revoked", "organization", str(org_id), metadata={"inviteId": invite_id}
+        )
     return {"success": result.matched_count > 0}
 
 
 # ── Team join: owner approves an email, the person verifies it with an OTP ─────
+
 
 async def _team_user(request: Request):
     """Returns (jwt_user, db_user, error_response). The DB email is the only email we trust."""
@@ -4029,12 +4840,20 @@ async def team_otp_send(request: Request):
     if prev and prev.get("sentAt"):
         elapsed = (now - prev["sentAt"]).total_seconds()
         if elapsed < 60:
-            return JSONResponse(status_code=429, content={"error": f"Please wait {int(60 - elapsed)}s before requesting another code."})
+            return JSONResponse(
+                status_code=429, content={"error": f"Please wait {int(60 - elapsed)}s before requesting another code."}
+            )
     code = f"{secrets.randbelow(1000000):06d}"
     await mongo_db.otp_codes.update_one(
         {"userId": uid},
-        {"$set": {"hash": _otp_hash(code, uid), "expiresAt": now + timedelta(minutes=10),
-                  "attempts": 0, "sentAt": now}},
+        {
+            "$set": {
+                "hash": _otp_hash(code, uid),
+                "expiresAt": now + timedelta(minutes=10),
+                "attempts": 0,
+                "sentAt": now,
+            }
+        },
         upsert=True,
     )
     ok, mail_err = await asyncio.to_thread(send_otp_email, u["email"], code)
@@ -4079,12 +4898,17 @@ async def _my_pending_invites(u: dict) -> list:
             inviter = (iu or {}).get("email", "")
         except Exception:
             pass
-        out.append({
-            "id": str(inv["_id"]), "orgId": str(inv["orgId"]), "orgName": await _org_label(org),
-            "roleKey": inv.get("roleKey", ""), "roleLabel": ROLE_LABELS.get(inv.get("roleKey", ""), inv.get("roleKey", "")),
-            "invitedBy": inviter,
-            "invitedAt": inv["createdAt"].isoformat() if inv.get("createdAt") else None,
-        })
+        out.append(
+            {
+                "id": str(inv["_id"]),
+                "orgId": str(inv["orgId"]),
+                "orgName": await _org_label(org),
+                "roleKey": inv.get("roleKey", ""),
+                "roleLabel": ROLE_LABELS.get(inv.get("roleKey", ""), inv.get("roleKey", "")),
+                "invitedBy": inviter,
+                "invitedAt": inv["createdAt"].isoformat() if inv.get("createdAt") else None,
+            }
+        )
     return out
 
 
@@ -4097,11 +4921,16 @@ async def _workspace_list(uid: str) -> tuple:
     items = []
     for m in ms:
         org = await mongo_db.organizations.find_one({"_id": m["orgId"]}) or {}
-        items.append({
-            "orgId": str(m["orgId"]), "name": await _org_label(org), "personal": _is_personal_org(org, uid),
-            "roleKey": m.get("roleKey", ""), "roleLabel": ROLE_LABELS.get(m.get("roleKey", ""), m.get("roleKey", "")),
-            "active": m["orgId"] == active_id,
-        })
+        items.append(
+            {
+                "orgId": str(m["orgId"]),
+                "name": await _org_label(org),
+                "personal": _is_personal_org(org, uid),
+                "roleKey": m.get("roleKey", ""),
+                "roleLabel": ROLE_LABELS.get(m.get("roleKey", ""), m.get("roleKey", "")),
+                "active": m["orgId"] == active_id,
+            }
+        )
     items.sort(key=lambda w: (not w["personal"], w["name"].lower()))
     return items, active_id
 
@@ -4114,7 +4943,9 @@ async def _accept_invite(uid: str, u: dict, invite: dict):
     if invite.get("email") != email or invite.get("status") != "pending":
         return None, JSONResponse(status_code=404, content={"error": "This invitation is no longer available."})
     if invite.get("expiresAt") and invite["expiresAt"] < datetime.now():
-        return None, JSONResponse(status_code=410, content={"error": "This invitation has expired. Ask the owner to send it again."})
+        return None, JSONResponse(
+            status_code=410, content={"error": "This invitation has expired. Ask the owner to send it again."}
+        )
     org_id = invite["orgId"]
 
     already = await mongo_db.org_members.find_one({"orgId": org_id, "userId": uid, "status": "active"})
@@ -4134,27 +4965,37 @@ async def _accept_invite(uid: str, u: dict, invite: dict):
         # Keep their personal workspace (and move their pre-teams data into it) before they switch teams.
         await _ensure_personal_workspace(uid)
         personal = await mongo_db.org_members.find_one(
-            {"userId": uid, "status": "active", "roleKey": "owner", "orgId": {"$ne": org_id}})
+            {"userId": uid, "status": "active", "roleKey": "owner", "orgId": {"$ne": org_id}}
+        )
         if personal:
             await _stamp_legacy_docs(uid, personal["orgId"])
         await mongo_db.org_members.update_one(
             {"orgId": org_id, "userId": uid},
-            {"$set": {"orgId": org_id, "userId": uid, "roleKey": invite["roleKey"],
-                      "status": "active", "joinedAt": datetime.now()}},
+            {
+                "$set": {
+                    "orgId": org_id,
+                    "userId": uid,
+                    "roleKey": invite["roleKey"],
+                    "status": "active",
+                    "joinedAt": datetime.now(),
+                }
+            },
             upsert=True,
         )
         await mongo_db.org_prefs.update_one(
-            {"userId": uid}, {"$set": {"userId": uid, "activeOrgId": org_id}}, upsert=True)
+            {"userId": uid}, {"$set": {"userId": uid, "activeOrgId": org_id}}, upsert=True
+        )
     except Exception as e:
         print(f"Join failed, reopening invite: {e}")
         await mongo_db.org_invites.update_one(
-            {"_id": invite["_id"]},
-            {"$set": {"status": "pending"}, "$unset": {"acceptedAt": "", "acceptedBy": ""}})
+            {"_id": invite["_id"]}, {"$set": {"status": "pending"}, "$unset": {"acceptedAt": "", "acceptedBy": ""}}
+        )
         return None, JSONResponse(status_code=500, content={"error": "Could not join the team. Please try again."})
 
     _org_cache.pop(uid, None)
-    await log_audit(uid, "org.member_joined", "organization", str(org_id),
-                    metadata={"roleKey": invite["roleKey"], "email": email})
+    await log_audit(
+        uid, "org.member_joined", "organization", str(org_id), metadata={"roleKey": invite["roleKey"], "email": email}
+    )
     org = await mongo_db.organizations.find_one({"_id": org_id}) or {}
     return {
         "success": True,
@@ -4175,7 +5016,8 @@ async def team_join(request: Request):
     if not _is_email_verified(u):
         return JSONResponse(status_code=403, content={"error": "Verify your email first."})
     invite = await mongo_db.org_invites.find_one(
-        {"email": u["email"].strip().lower(), "status": "pending"}, sort=[("createdAt", -1)])
+        {"email": u["email"].strip().lower(), "status": "pending"}, sort=[("createdAt", -1)]
+    )
     if not invite:
         return JSONResponse(status_code=404, content={"error": "No team has added this email yet."})
     payload, e = await _accept_invite(uid, u, invite)
@@ -4207,7 +5049,8 @@ async def team_invite_decline(request: Request, invite_id: str):
     try:
         res = await mongo_db.org_invites.update_one(
             {"_id": ObjectId(invite_id), "email": u["email"].strip().lower(), "status": "pending"},
-            {"$set": {"status": "declined", "declinedAt": datetime.now()}})
+            {"$set": {"status": "declined", "declinedAt": datetime.now()}},
+        )
     except Exception:
         res = None
     if not res or not res.matched_count:
@@ -4272,7 +5115,8 @@ async def leave_workspace(request: Request, org_id: str):
     await mongo_db.org_prefs.delete_one({"userId": uid, "activeOrgId": oid})
     await mongo_db.connections.update_many(
         {"orgId": oid, "type": "sheets", "createdBy": uid},
-        {"$set": {"credentialsEncrypted": "", "status": "needs_reauth"}})
+        {"$set": {"credentialsEncrypted": "", "status": "needs_reauth"}},
+    )
     _org_cache.pop(uid, None)
     await log_audit(uid, "org.member_left", "organization", org_id, severity="warning")
     return {"success": True}
@@ -4292,7 +5136,7 @@ async def team_status(request: Request):
     workspaces, active_id = await _workspace_list(uid)
     out = {
         "emailVerified": verified,
-        "joined": any(not w["personal"] for w in workspaces),   # belongs to at least one team
+        "joined": any(not w["personal"] for w in workspaces),  # belongs to at least one team
         "orgName": await _org_label(org),
         "roleLabel": ROLE_LABELS.get(ctx["roleKey"], ctx["roleKey"]),
         "canManage": bool(ctx["permissions"].get("org.manageMembers")),
@@ -4343,14 +5187,15 @@ AUDIT_ACTION_CATEGORY = {
     "org.invite_sent": "security",
     "org.invite_accepted": "security",
     "org.invite_revoked": "security",
-        "org.email_approved": "security",
-        "org.member_joined": "security",
-        "org.invite_declined": "security",
-        "org.member_left": "security",
-        "org.workspace_switched": "security",
-        "org.settings_updated": "security",
-        "connection.access_updated": "connection",
+    "org.email_approved": "security",
+    "org.member_joined": "security",
+    "org.invite_declined": "security",
+    "org.member_left": "security",
+    "org.workspace_switched": "security",
+    "org.settings_updated": "security",
+    "connection.access_updated": "connection",
 }
+
 
 def _diff_dict(old: dict, new: dict, ignore: set = frozenset()) -> dict | None:
     """Field-level diff between two dicts. Returns None if nothing changed."""
@@ -4363,31 +5208,42 @@ def _diff_dict(old: dict, new: dict, ignore: set = frozenset()) -> dict | None:
             changes[k] = {"from": old_v, "to": new_v}
     return changes or None
 
-async def log_audit(user_id: str, action: str, resource_type: str, resource_id: str = "",
-                    metadata: dict | None = None, status: str = "success",
-                    severity: str = "info", resource_name: str = "",
-                    changes: dict | None = None, correlation_id: str | None = None,
-                    actor_type: str = "user"):
+
+async def log_audit(
+    user_id: str,
+    action: str,
+    resource_type: str,
+    resource_id: str = "",
+    metadata: dict | None = None,
+    status: str = "success",
+    severity: str = "info",
+    resource_name: str = "",
+    changes: dict | None = None,
+    correlation_id: str | None = None,
+    actor_type: str = "user",
+):
     if mongo_db is None:
         return
     try:
-        await mongo_db.audit_logs.insert_one({
-            "userId": user_id,
-            "orgId": await _org_id_for_user(user_id),
-            "actorId": user_id,
-            "actorType": actor_type,
-            "action": action,
-            "category": AUDIT_ACTION_CATEGORY.get(action, resource_type or "other"),
-            "resourceType": resource_type,
-            "resourceId": resource_id,
-            "resourceName": resource_name,
-            "status": status,
-            "severity": severity,
-            "changes": changes,
-            "metadata": metadata or {},
-            "correlationId": correlation_id,
-            "createdAt": datetime.now(),
-        })
+        await mongo_db.audit_logs.insert_one(
+            {
+                "userId": user_id,
+                "orgId": await _org_id_for_user(user_id),
+                "actorId": user_id,
+                "actorType": actor_type,
+                "action": action,
+                "category": AUDIT_ACTION_CATEGORY.get(action, resource_type or "other"),
+                "resourceType": resource_type,
+                "resourceId": resource_id,
+                "resourceName": resource_name,
+                "status": status,
+                "severity": severity,
+                "changes": changes,
+                "metadata": metadata or {},
+                "correlationId": correlation_id,
+                "createdAt": datetime.now(),
+            }
+        )
     except Exception as e:
         print(f"Audit log write failed: {e}")
 
@@ -4479,10 +5335,22 @@ async def export_audit_logs(
     docs = await cursor.to_list(length=5000)
 
     import csv as _csv
+
     buf = io.StringIO()
-    fieldnames = ["createdAt", "action", "category", "status", "severity",
-                "actorId", "resourceType", "resourceId", "resourceName",
-                "correlationId", "metadata", "changes"]
+    fieldnames = [
+        "createdAt",
+        "action",
+        "category",
+        "status",
+        "severity",
+        "actorId",
+        "resourceType",
+        "resourceId",
+        "resourceName",
+        "correlationId",
+        "metadata",
+        "changes",
+    ]
     writer = _csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
     writer.writeheader()
     for d in docs:
@@ -4515,6 +5383,7 @@ async def submit_feedback(
 
     try:
         import resend
+
         resend.api_key = os.getenv("RESEND_API_KEY", "")
 
         email_payload = {
@@ -4530,7 +5399,7 @@ async def submit_feedback(
             <p><b>Feedback:</b></p>
             <p style="background:#f4f4f4;padding:16px;border-radius:8px;white-space:pre-wrap;">{feedback}</p>
             </div>
-            """
+            """,
         }
 
         if attachment and attachment.filename:
@@ -4538,10 +5407,12 @@ async def submit_feedback(
             MAX_ATTACHMENT_SIZE = 8 * 1024 * 1024  # 8MB
             if len(file_bytes) > MAX_ATTACHMENT_SIZE:
                 return {"success": False, "error": "Attachment too large (max 8MB)."}
-            email_payload["attachments"] = [{
-                "filename": attachment.filename,
-                "content": list(file_bytes),
-            }]
+            email_payload["attachments"] = [
+                {
+                    "filename": attachment.filename,
+                    "content": list(file_bytes),
+                }
+            ]
 
         resend.Emails.send(email_payload)
         return {"success": True}
@@ -4565,19 +5436,24 @@ async def submit_contact(request: ContactFormRequest = Body(...)):
     message = message[:3000]
     # Everything below goes into an HTML email, so escape what the visitor typed.
     from html import escape as _esc
+
     safe_name, safe_email = _esc(name), _esc(email[:200])
     safe_message = _esc(message).replace("\n", "<br>")
     heading = "New Quote Request" if is_quote else "New Contact Form Submission"
 
     try:
         import resend
+
         resend.api_key = os.getenv("RESEND_API_KEY", "")
-        resend.Emails.send({
-            "from": "The Gods Tool <noreply@thegodstool.com>",
-            "to": ["contact@thegodstool.com"],
-            "reply_to": email,
-            "subject": (f"Quote request from {name}" if is_quote else f"New contact form message from {name}").replace("\n", " "),
-            "html": f"""
+        resend.Emails.send(
+            {
+                "from": "The Gods Tool <noreply@thegodstool.com>",
+                "to": ["contact@thegodstool.com"],
+                "reply_to": email,
+                "subject": (
+                    f"Quote request from {name}" if is_quote else f"New contact form message from {name}"
+                ).replace("\n", " "),
+                "html": f"""
             <div style="font-family:sans-serif;max-width:600px;background:#f9f9f9;padding:20px;border-radius:8px;">
             <h2 style="color:#333;margin-top:0;">{heading}</h2>
             <p style="margin:10px 0;"><strong>Name:</strong> {safe_name}</p>
@@ -4585,8 +5461,9 @@ async def submit_contact(request: ContactFormRequest = Body(...)):
             <p style="margin:10px 0;"><strong>Message:</strong></p>
             <p style="background:#fff;padding:16px;border-left:4px solid #7c3aed;border-radius:4px;color:#555;margin:10px 0;">{safe_message}</p>
             </div> 
-            """
-        })
+            """,
+            }
+        )
         print(f"✓ Contact form email sent from {email}")
         return {"success": True}
     except Exception as e:
@@ -4634,7 +5511,9 @@ async def _agent_org_middleware(request: Request, call_next):
 _READ_ONLY_START = ("select", "show", "describe", "desc", "explain", "with", "values")
 _WRITE_WORDS = _re.compile(
     r"\b(insert|update|delete|drop|alter|truncate|create|grant|revoke|replace|merge|call|exec|execute|"
-    r"load|copy|attach|detach|vacuum|reindex|lock|set|into)\b", _re.I)
+    r"load|copy|attach|detach|vacuum|reindex|lock|set|into)\b",
+    _re.I,
+)
 
 
 def _is_read_only_sql(sql: str) -> bool:
@@ -4681,29 +5560,37 @@ async def agent_websocket(websocket: WebSocket, token: str = ""):
         await websocket.close(code=4003)
         return
 
-    org_id    = str(doc["orgId"])
-    database  = str(reg.get("database", ""))[:200]
-    host      = str(reg.get("host", ""))[:300]
+    org_id = str(doc["orgId"])
+    database = str(reg.get("database", ""))[:200]
+    host = str(reg.get("host", ""))[:300]
     agent_key = f"{database}@{host}"
     allow_writes = bool(doc.get("allowWrites"))
 
     entry = {
-        "websocket":     websocket,
-        "database":      database,
-        "host":          host,
+        "websocket": websocket,
+        "database": database,
+        "host": host,
         "registered_at": datetime.now().isoformat(),
-        "tokenId":       str(doc["_id"]),
-        "db_type":       str(reg.get("db_type", ""))[:20],
-        "label":         doc.get("label", ""),
-        "allowWrites":   allow_writes,
+        "tokenId": str(doc["_id"]),
+        "db_type": str(reg.get("db_type", ""))[:20],
+        "label": doc.get("label", ""),
+        "allowWrites": allow_writes,
     }
     old = _agent_connections._d.get((org_id, agent_key))
     if old and old.get("tokenId") != entry["tokenId"]:
         # A different computer already serves this exact database. Replacing it would make the two
         # kick each other off forever, so say so and let the owner decide which one stays.
-        await websocket.send_text(json.dumps({"type": "error", "error": (
-            f"Another connected computer (\"{old.get('label') or 'unnamed'}\") already serves {agent_key}. "
-            "Disconnect it in the app first, or use a different host name for this one.")}))
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "error",
+                    "error": (
+                        f"Another connected computer (\"{old.get('label') or 'unnamed'}\") already serves {agent_key}. "
+                        "Disconnect it in the app first, or use a different host name for this one."
+                    ),
+                }
+            )
+        )
         await websocket.close(code=4005)
         return
     _agent_connections.put(org_id, agent_key, entry)
@@ -4712,7 +5599,9 @@ async def agent_websocket(websocket: WebSocket, token: str = ""):
             await old["websocket"].close(code=4000)
         except Exception:
             pass
-    await mongo_db.agent_tokens.update_one({"_id": doc["_id"]}, {"$set": {"lastSeenAt": datetime.utcnow(), "lastTarget": agent_key}})
+    await mongo_db.agent_tokens.update_one(
+        {"_id": doc["_id"]}, {"$set": {"lastSeenAt": datetime.utcnow(), "lastTarget": agent_key}}
+    )
     await websocket.send_text(json.dumps({"type": "registered", "allowWrites": allow_writes}))
     print(f"✓ Agent connected: {agent_key} (org {org_id})")
 
@@ -4746,10 +5635,16 @@ async def _query_via_agent(agent_key: str, sql: str, params: list = None, timeou
     request_id = _secrets.token_hex(16)
     future = asyncio.get_event_loop().create_future()
     _pending_queries[request_id] = future
-    await agent["websocket"].send_text(json.dumps({
-        "type": "query", "request_id": request_id,
-        "sql": sql, "params": params or [],
-    }))
+    await agent["websocket"].send_text(
+        json.dumps(
+            {
+                "type": "query",
+                "request_id": request_id,
+                "sql": sql,
+                "params": params or [],
+            }
+        )
+    )
     try:
         result = await asyncio.wait_for(future, timeout=timeout)
         if "error" in result:
@@ -4767,9 +5662,14 @@ async def _list_tables_via_agent(agent_key: str, timeout: float = 15.0) -> list:
     request_id = _secrets.token_hex(16)
     future = asyncio.get_event_loop().create_future()
     _pending_queries[request_id] = future
-    await agent["websocket"].send_text(json.dumps({
-        "type": "list_tables", "request_id": request_id,
-    }))
+    await agent["websocket"].send_text(
+        json.dumps(
+            {
+                "type": "list_tables",
+                "request_id": request_id,
+            }
+        )
+    )
     try:
         result = await asyncio.wait_for(future, timeout=timeout)
         if "error" in result:
@@ -4783,17 +5683,19 @@ async def _list_tables_via_agent(agent_key: str, timeout: float = 15.0) -> list:
 async def _new_agent_token(ctx: dict, label: str, allow_writes: bool, device: str = "") -> str:
     await _ensure_agent_indexes()
     token = _secrets.token_urlsafe(32)
-    await mongo_db.agent_tokens.insert_one({
-        "tokenHash": _agent_hash(token),
-        "orgId": str(ctx["orgId"]),
-        "label": (label or "my computer")[:80],
-        "allowWrites": bool(allow_writes),
-        "createdBy": ctx["userId"],
-        "createdAt": datetime.utcnow(),
-        "lastSeenAt": None,
-        "revokedAt": None,
-        "device": device[:120],
-    })
+    await mongo_db.agent_tokens.insert_one(
+        {
+            "tokenHash": _agent_hash(token),
+            "orgId": str(ctx["orgId"]),
+            "label": (label or "my computer")[:80],
+            "allowWrites": bool(allow_writes),
+            "createdBy": ctx["userId"],
+            "createdAt": datetime.utcnow(),
+            "lastSeenAt": None,
+            "revokedAt": None,
+            "device": device[:120],
+        }
+    )
     return token
 
 
@@ -4825,15 +5727,17 @@ async def create_pair_code(request: Request, body: dict):
     raw = "".join(_secrets.choice(_PAIR_ALPHABET) for _ in range(8))
     code = f"{raw[:4]}-{raw[4:]}"
     expires = datetime.utcnow() + timedelta(minutes=10)
-    await mongo_db.agent_pair_codes.insert_one({
-        "codeHash": _agent_hash(raw),
-        "orgId": str(ctx["orgId"]),
-        "userId": ctx["userId"],
-        "label": str(body.get("label", "my computer"))[:80],
-        "allowWrites": bool(body.get("allowWrites")),
-        "used": False,
-        "expiresAt": expires,
-    })
+    await mongo_db.agent_pair_codes.insert_one(
+        {
+            "codeHash": _agent_hash(raw),
+            "orgId": str(ctx["orgId"]),
+            "userId": ctx["userId"],
+            "label": str(body.get("label", "my computer"))[:80],
+            "allowWrites": bool(body.get("allowWrites")),
+            "used": False,
+            "expiresAt": expires,
+        }
+    )
     return {"code": code, "expiresInSeconds": 600}
 
 
@@ -4846,7 +5750,9 @@ async def claim_pair_code(request: Request, body: dict):
     now = time.time()
     hits = [t for t in _agent_hits.get(ip, []) if now - t < 600]
     if len(hits) >= 10:
-        return JSONResponse({"error": "Too many attempts. Wait a few minutes and generate a new code."}, status_code=429)
+        return JSONResponse(
+            {"error": "Too many attempts. Wait a few minutes and generate a new code."}, status_code=429
+        )
     hits.append(now)
     _agent_hits[ip] = hits
     await _ensure_agent_indexes()
@@ -4858,9 +5764,13 @@ async def claim_pair_code(request: Request, body: dict):
         {"$set": {"used": True, "usedAt": datetime.utcnow()}},
     )
     if not doc:
-        return JSONResponse({"error": "That code is wrong, already used, or expired. Generate a new one in the app."}, status_code=400)
+        return JSONResponse(
+            {"error": "That code is wrong, already used, or expired. Generate a new one in the app."}, status_code=400
+        )
     ctx = {"orgId": doc["orgId"], "userId": doc["userId"]}
-    token = await _new_agent_token(ctx, doc.get("label", "my computer"), bool(doc.get("allowWrites")), str(body.get("device", "")))
+    token = await _new_agent_token(
+        ctx, doc.get("label", "my computer"), bool(doc.get("allowWrites")), str(body.get("device", ""))
+    )
     return {"token": token, "label": doc.get("label", ""), "allowWrites": bool(doc.get("allowWrites"))}
 
 
@@ -4874,17 +5784,19 @@ async def list_connectors(request: Request):
     out = []
     async for d in mongo_db.agent_tokens.find({"orgId": org, "revokedAt": None}).sort("createdAt", -1):
         e = live.get(str(d["_id"]))
-        out.append({
-            "id": str(d["_id"]),
-            "label": d.get("label", ""),
-            "device": d.get("device", ""),
-            "allowWrites": bool(d.get("allowWrites")),
-            "createdAt": d["createdAt"].isoformat() if d.get("createdAt") else None,
-            "lastSeenAt": d["lastSeenAt"].isoformat() if d.get("lastSeenAt") else None,
-            "online": bool(e),
-            "database": e["database"] if e else None,
-            "host": e["host"] if e else None,
-        })
+        out.append(
+            {
+                "id": str(d["_id"]),
+                "label": d.get("label", ""),
+                "device": d.get("device", ""),
+                "allowWrites": bool(d.get("allowWrites")),
+                "createdAt": d["createdAt"].isoformat() if d.get("createdAt") else None,
+                "lastSeenAt": d["lastSeenAt"].isoformat() if d.get("lastSeenAt") else None,
+                "online": bool(e),
+                "database": e["database"] if e else None,
+                "host": e["host"] if e else None,
+            }
+        )
     return {"connectors": out}
 
 
@@ -4898,7 +5810,8 @@ async def revoke_connector(connector_id: str, request: Request):
     except Exception:
         return JSONResponse({"error": "Not found"}, status_code=404)
     res = await mongo_db.agent_tokens.update_one(
-        {"_id": oid, "orgId": str(ctx["orgId"]), "revokedAt": None}, {"$set": {"revokedAt": datetime.utcnow()}})
+        {"_id": oid, "orgId": str(ctx["orgId"]), "revokedAt": None}, {"$set": {"revokedAt": datetime.utcnow()}}
+    )
     if not res.matched_count:
         return JSONResponse({"error": "Not found"}, status_code=404)
     for (o, k), e in _agent_connections.all_entries():
@@ -4957,20 +5870,22 @@ async def mysql_query_via_agent(request: Request, body: dict):
     except RuntimeError as e:
         return {"rows": [], "error": str(e)}
 
+
 # REPLACE the analyze signature and first lines:
 @app.post("/api/mysql/tables")
 async def mysql_tables(body: dict):
     import asyncio, ssl as ssl_lib
+
     try:
         import aiomysql
     except ImportError:
         return {"tables": [], "error": "aiomysql not installed"}
-    host     = body.get("host", "").strip()
-    port     = int(body.get("port", 3306))
-    user     = body.get("user", "").strip()
+    host = body.get("host", "").strip()
+    port = int(body.get("port", 3306))
+    user = body.get("user", "").strip()
     password = body.get("password", "")
     database = body.get("database", "").strip()
-    use_ssl  = body.get("ssl", False)
+    use_ssl = body.get("ssl", False)
 
     agent_key = f"{database}@{host}"
     if agent_key in _agent_connections:
@@ -4980,11 +5895,12 @@ async def mysql_tables(body: dict):
         except RuntimeError as e:
             return {"tables": [], "error": str(e)}
 
-    ssl_ctx  = ssl_lib.create_default_context() if use_ssl else None
+    ssl_ctx = ssl_lib.create_default_context() if use_ssl else None
     try:
         conn = await asyncio.wait_for(
-            aiomysql.connect(host=host, port=port, user=user,
-                password=password, db=database, ssl=ssl_ctx, connect_timeout=10),
+            aiomysql.connect(
+                host=host, port=port, user=user, password=password, db=database, ssl=ssl_ctx, connect_timeout=10
+            ),
             timeout=12,
         )
         async with conn.cursor() as cur:
@@ -4994,6 +5910,8 @@ async def mysql_tables(body: dict):
         return {"tables": tables}
     except Exception as e:
         return {"tables": [], "error": str(e)}
+
+
 @app.post("/api/mysql/health")
 async def mysql_health(body: dict):
     import asyncio
@@ -5004,12 +5922,12 @@ async def mysql_health(body: dict):
     except ImportError:
         return {"healthy": False, "message": "❌ aiomysql not installed.\n   → Run: pip install aiomysql"}
 
-    host     = body.get("host", "").strip()
-    port     = int(body.get("port", 3306))
-    user     = body.get("user", "").strip()
+    host = body.get("host", "").strip()
+    port = int(body.get("port", 3306))
+    user = body.get("user", "").strip()
     password = body.get("password", "")
     database = body.get("database", "").strip()
-    use_ssl  = body.get("ssl", False)
+    use_ssl = body.get("ssl", False)
 
     if not all([host, user, database]):
         return {"healthy": False, "message": "❌ host, user, and database are all required."}
@@ -5045,7 +5963,7 @@ async def mysql_health(body: dict):
     except asyncio.TimeoutError:
         return {
             "healthy": False,
-            "message": f"❌ Host unreachable or port {port} is blocked.\n   → Your IP may need to be whitelisted on the server firewall.\n   → Check that port {port} is open."
+            "message": f"❌ Host unreachable or port {port} is blocked.\n   → Your IP may need to be whitelisted on the server firewall.\n   → Check that port {port} is open.",
         }
     except Exception as e:
         msg = str(e)
@@ -5066,21 +5984,23 @@ async def mysql_health(body: dict):
             friendly = f"❌ {msg}"
         return {"healthy": False, "message": friendly}
 
+
 @app.post("/api/mysql/fetch-table")
 async def mysql_fetch_table(body: dict):
     import asyncio, ssl as ssl_lib, io as _io
+
     try:
         import aiomysql
     except ImportError:
         return {"error": "aiomysql not installed"}
 
-    host     = body.get("host", "").strip()
-    port     = int(body.get("port", 3306))
-    user     = body.get("user", "").strip()
+    host = body.get("host", "").strip()
+    port = int(body.get("port", 3306))
+    user = body.get("user", "").strip()
     password = body.get("password", "")
     database = body.get("database", "").strip()
-    table    = body.get("table", "").strip() or body.get("_activeTable", "").strip()
-    use_ssl  = body.get("ssl", False)
+    table = body.get("table", "").strip() or body.get("_activeTable", "").strip()
+    use_ssl = body.get("ssl", False)
 
     if not all([host, user, database, table]):
         return {"error": f"Missing required fields. Got: host={host}, user={user}, database={database}, table={table}"}
@@ -5094,7 +6014,12 @@ async def mysql_fetch_table(body: dict):
             filepath = os.path.join(UPLOAD_DIR, filename)
             df.to_csv(filepath, index=False)
             print(f"✅ MySQL fetch-table (via tunnel): {database}.{table} — {len(df)} rows")
-            return {"rows": len(df), "cols": len(df.columns), "download_url": f"/api/download/{filename}", "filename": filename}
+            return {
+                "rows": len(df),
+                "cols": len(df.columns),
+                "download_url": f"/api/download/{filename}",
+                "filename": filename,
+            }
         except RuntimeError as e:
             return {"error": str(e)}
 
@@ -5102,8 +6027,9 @@ async def mysql_fetch_table(body: dict):
 
     try:
         conn = await asyncio.wait_for(
-            aiomysql.connect(host=host, port=port, user=user,
-                password=password, db=database, ssl=ssl_ctx, connect_timeout=10),
+            aiomysql.connect(
+                host=host, port=port, user=user, password=password, db=database, ssl=ssl_ctx, connect_timeout=10
+            ),
             timeout=12,
         )
         async with conn.cursor() as count_cur:
@@ -5133,6 +6059,7 @@ async def mysql_fetch_table(body: dict):
         return {"error": f"Connection timed out reaching {host}:{port}"}
     except Exception as e:
         return {"error": str(e)}
+
 
 @app.post("/api/analyze")
 async def analyze(
@@ -5244,19 +6171,24 @@ async def analyze(
     if pre_contents is not None:
         contents = pre_contents
         filename_for_meta = _pre_name
-    elif source_type == 'postgres' and mysql_host and mysql_user and mysql_database:
+    elif source_type == "postgres" and mysql_host and mysql_user and mysql_database:
         import asyncio, ssl as ssl_lib
+
         try:
             import asyncpg  # type: ignore
         except ImportError:
             return {"error": "asyncpg not installed. Run: pip install asyncpg"}
         try:
-            ssl_ctx = ssl_lib.create_default_context() if mysql_ssl == 'true' else None
+            ssl_ctx = ssl_lib.create_default_context() if mysql_ssl == "true" else None
             conn = await asyncio.wait_for(
                 asyncpg.connect(
-                    host=mysql_host, port=int(mysql_port),
-                    user=mysql_user, password=mysql_password,
-                    database=mysql_database, ssl=ssl_ctx, timeout=10,
+                    host=mysql_host,
+                    port=int(mysql_port),
+                    user=mysql_user,
+                    password=mysql_password,
+                    database=mysql_database,
+                    ssl=ssl_ctx,
+                    timeout=10,
                 ),
                 timeout=12,
             )
@@ -5273,6 +6205,7 @@ async def analyze(
             rows_data = await conn.fetch(f'SELECT * FROM "{table_name}" LIMIT 500000')
             await conn.close()
             import io as _io
+
             df_pg = pd.DataFrame([dict(r) for r in rows_data])
             buf = _io.BytesIO()
             df_pg.to_csv(buf, index=False)
@@ -5280,14 +6213,15 @@ async def analyze(
             filename_for_meta = f"{mysql_database}.{table_name}@{mysql_host}"
         except Exception as e:
             return {"error": f"PostgreSQL query failed: {str(e)}"}
-    elif source_type == 'mysql' and mysql_host and mysql_user and mysql_database:
+    elif source_type == "mysql" and mysql_host and mysql_user and mysql_database:
         import asyncio, ssl as ssl_lib
+
         try:
             import aiomysql
         except ImportError:
             return {"error": "aiomysql not installed. Run: pip install aiomysql"}
         try:
-            ssl_ctx = ssl_lib.create_default_context() if mysql_ssl == 'true' else None
+            ssl_ctx = ssl_lib.create_default_context() if mysql_ssl == "true" else None
             conn = await asyncio.wait_for(
                 aiomysql.connect(
                     host=mysql_host,
@@ -5316,6 +6250,7 @@ async def analyze(
                 rows = await cur.fetchall()
             conn.close()
             import io as _io
+
             df_mysql = pd.DataFrame(list(rows))
             buf = _io.BytesIO()
             df_mysql.to_csv(buf, index=False)
@@ -5323,11 +6258,12 @@ async def analyze(
             filename_for_meta = f"{mysql_database}.{table_name}"
         except Exception as e:
             return {"error": f"MySQL query failed: {str(e)}"}
-    elif source_type == 'bigquery' and bq_key_json and bq_project and bq_dataset and bq_table:
+    elif source_type == "bigquery" and bq_key_json and bq_project and bq_dataset and bq_table:
         try:
             from google.cloud import bigquery as bq_lib
             from google.oauth2 import service_account
             import json as _json, io as _io
+
             info = _json.loads(bq_key_json)
             creds = service_account.Credentials.from_service_account_info(
                 info,
@@ -5342,11 +6278,12 @@ async def analyze(
             filename_for_meta = f"{bq_project}.{bq_dataset}.{bq_table}@bigquery"
         except Exception as e:
             return {"error": f"BigQuery query failed: {str(e)}"}
-    elif source_type == 'mongodb' and mysql_host and mysql_database and mysql_table:
+    elif source_type == "mongodb" and mysql_host and mysql_database and mysql_table:
         try:
             from motor.motor_asyncio import AsyncIOMotorClient
             from datetime import datetime as _dt, date as _date
             from bson import ObjectId as _ObjectId
+
             try:
                 from bson.decimal128 import Decimal128 as _Decimal128
             except Exception:
@@ -5370,7 +6307,7 @@ async def analyze(
                 return value
 
             mongo_uri_val = mysql_host  # stored in mysql_host field
-            mongo_db_val  = mysql_database
+            mongo_db_val = mysql_database
             mongo_coll_val = mysql_table
             client_mg = AsyncIOMotorClient(mongo_uri_val, serverSelectionTimeoutMS=8000)
             db_mg = client_mg[mongo_db_val]
@@ -5389,7 +6326,9 @@ async def analyze(
             df_mg = pd.DataFrame(docs_mg)
             for col in df_mg.columns:
                 if df_mg[col].apply(lambda x: isinstance(x, (dict, list))).any():
-                    df_mg[col] = df_mg[col].apply(lambda x: json.dumps(x, default=str) if isinstance(x, (dict, list)) else x)
+                    df_mg[col] = df_mg[col].apply(
+                        lambda x: json.dumps(x, default=str) if isinstance(x, (dict, list)) else x
+                    )
             buf_mg = io.BytesIO()
             df_mg.to_csv(buf_mg, index=False)
             contents = buf_mg.getvalue()
@@ -5399,7 +6338,7 @@ async def analyze(
     elif file:
         contents = await file.read()
         filename_for_meta = file.filename
-    elif source_type == 'rest' and mysql_host:
+    elif source_type == "rest" and mysql_host:
         # mysql_host = base_url, mysql_table = endpoint, mysql_password = api_key (reusing fields)
         try:
             import aiohttp as aiohttp_lib
@@ -5408,11 +6347,15 @@ async def analyze(
         try:
             base_url_rest = mysql_host  # stored in mysql_host field
             endpoint_rest = mysql_table or "/"
-            api_key_rest  = mysql_password
-            auth_header   = mysql_user or "Authorization"  # stored in mysql_user field
-            verify_ssl_rest = mysql_ssl != 'false'
+            api_key_rest = mysql_password
+            auth_header = mysql_user or "Authorization"  # stored in mysql_user field
+            verify_ssl_rest = mysql_ssl != "false"
 
-            url_rest = endpoint_rest if endpoint_rest.startswith("http") else base_url_rest.rstrip("/") + "/" + endpoint_rest.lstrip("/")
+            url_rest = (
+                endpoint_rest
+                if endpoint_rest.startswith("http")
+                else base_url_rest.rstrip("/") + "/" + endpoint_rest.lstrip("/")
+            )
 
             headers_rest = {}
             if api_key_rest:
@@ -5523,7 +6466,7 @@ async def analyze(
     if date_col:
         try:
             ts_df = df.copy()
-            ts_df[date_col] = pd.to_datetime(ts_df[date_col], errors='coerce')
+            ts_df[date_col] = pd.to_datetime(ts_df[date_col], errors="coerce")
             ts_df = ts_df.dropna(subset=[date_col]).sort_values(date_col)
             numeric_col = ts_df.select_dtypes(include=[np.number]).columns
             if len(numeric_col) > 0:
@@ -5533,7 +6476,7 @@ async def analyze(
                     "value_col": str(value_col),
                     "freq": freq_label,
                     "dates": ts_df[date_col].dt.strftime("%Y-%m-%d").tolist()[:500],
-                    "values": ts_df[value_col].fillna(0).round(2).tolist()[:500]
+                    "values": ts_df[value_col].fillna(0).round(2).tolist()[:500],
                 }
         except Exception as e:
             print(f"TS chart error: {e}")
@@ -5542,16 +6485,18 @@ async def analyze(
 
     col_info = []
     for col in df.columns:
-        col_info.append({
-            "column": col,
-            "dtype": str(df[col].dtype),
-            "non_null": int(df[col].notnull().sum()),
-            "null": int(df[col].isnull().sum()),
-            "unique": int(df[col].nunique()),
-            "sample": str(df[col].dropna().iloc[0]) if df[col].notnull().any() else ""
-        })
+        col_info.append(
+            {
+                "column": col,
+                "dtype": str(df[col].dtype),
+                "non_null": int(df[col].notnull().sum()),
+                "null": int(df[col].isnull().sum()),
+                "unique": int(df[col].nunique()),
+                "sample": str(df[col].dropna().iloc[0]) if df[col].notnull().any() else "",
+            }
+        )
 
-    describe = df.describe(include='all').fillna("").round(2)
+    describe = df.describe(include="all").fillna("").round(2)
     describe_dict = describe.to_dict()
 
     missing_per_col = df.isnull().sum()
@@ -5563,32 +6508,46 @@ async def analyze(
     notifications = []
 
     if missing > 0:
-        worst = top_missing_list[0]['col'] if top_missing_list else 'unknown'
-        notifications.append({
-            "id": str(uuid.uuid4()), "type": "missing",
-            "title": "Missing Values Detected",
-            "message": f"{missing:,} missing values. Worst column: '{worst}'.",
-            "severity": "warning", "link": "problems"
-        })
+        worst = top_missing_list[0]["col"] if top_missing_list else "unknown"
+        notifications.append(
+            {
+                "id": str(uuid.uuid4()),
+                "type": "missing",
+                "title": "Missing Values Detected",
+                "message": f"{missing:,} missing values. Worst column: '{worst}'.",
+                "severity": "warning",
+                "link": "problems",
+            }
+        )
     if duplicates > 0:
-        notifications.append({
-            "id": str(uuid.uuid4()), "type": "duplicate",
-            "title": "Duplicate Rows Detected",
-            "message": f"{duplicates:,} duplicate rows found.",
-            "severity": "error", "link": "problems"
-        })
+        notifications.append(
+            {
+                "id": str(uuid.uuid4()),
+                "type": "duplicate",
+                "title": "Duplicate Rows Detected",
+                "message": f"{duplicates:,} duplicate rows found.",
+                "severity": "error",
+                "link": "problems",
+            }
+        )
     if outlier_cols > 0:
-        notifications.append({
-            "id": str(uuid.uuid4()), "type": "outlier",
-            "title": "Outliers Detected",
-            "message": f"Outliers in {outlier_cols} column(s).",
-            "severity": "warning", "link": "problems"
-        })
+        notifications.append(
+            {
+                "id": str(uuid.uuid4()),
+                "type": "outlier",
+                "title": "Outliers Detected",
+                "message": f"Outliers in {outlier_cols} column(s).",
+                "severity": "warning",
+                "link": "problems",
+            }
+        )
 
     if alert_staleness == "true" and date_col:
         notifications.extend(check_staleness(df, date_col, freq_label, freq_days, filename_for_meta))
     if alert_schema == "true":
-        notifications.extend(await check_schema_drift(df, filename_for_meta, str(analyze_ctx['orgId']) if analyze_ctx else ''))
+        notifications.extend(
+            await check_schema_drift(df, filename_for_meta, str(analyze_ctx["orgId"]) if analyze_ctx else "")
+        )
     if alert_anomalies == "true":
         notifications.extend(check_anomalies(df))
     if alert_flow == "true":
@@ -5609,7 +6568,7 @@ async def analyze(
     else:
         parts = []
         if missing > 0:
-            worst = top_missing_list[0]['col'] if top_missing_list else ''
+            worst = top_missing_list[0]["col"] if top_missing_list else ""
             parts.append(f"{missing:,} missing values (worst: '{worst}')")
         if duplicates > 0:
             parts.append(f"{duplicates:,} duplicate rows")
@@ -5623,19 +6582,14 @@ async def analyze(
         "messy_text": False,
         "fix_dates": False,
         "outliers": outlier_cols > 0,
-        "missing": missing > 0
+        "missing": missing > 0,
     }
     detected = [k for k, v in issues.items() if v]
     top4 = set(detected[:4])
 
     return {
         "shape": [len(df), len(df.columns)],
-        "dataset_info": {
-            "rows": len(df),
-            "columns": len(df.columns),
-            "memory_mb": memory_mb,
-            "missing_total": missing
-        },
+        "dataset_info": {"rows": len(df), "columns": len(df.columns), "memory_mb": memory_mb, "missing_total": missing},
         "quality_score": quality_score,
         "sample_data": df.head(100).fillna("").to_dict("records"),
         "original_preview": df.head(50).fillna("").to_dict("records"),
@@ -5647,11 +6601,7 @@ async def analyze(
         "pii_columns": pii_columns,
         "problems": problems_preview,
         "total_problems": total_problems,
-        "problem_counts": {
-            "missing": missing_count,
-            "duplicates": duplicate_count,
-            "outliers": outlier_count
-        },
+        "problem_counts": {"missing": missing_count, "duplicates": duplicate_count, "outliers": outlier_count},
         "original_file": f"/api/download/{original_filename}",
         "issues": issues,
         "top4_issues": list(top4),
@@ -5660,11 +6610,12 @@ async def analyze(
             "detected": date_col is not None,
             "date_col": date_col,
             "frequency": freq_label,
-            "chart_data": ts_chart_data
+            "chart_data": ts_chart_data,
         },
         "total_rows_in_source": locals().get("analyze_total_rows"),
-        "truncated": locals().get("analyze_total_rows", 0) > len(df) if "analyze_total_rows" in locals() else False
+        "truncated": locals().get("analyze_total_rows", 0) > len(df) if "analyze_total_rows" in locals() else False,
     }
+
 
 @app.post("/api/check-size")
 async def check_source_size(body: dict):
@@ -5678,6 +6629,7 @@ async def check_source_size(body: dict):
     try:
         if source_type == "mysql":
             import asyncio, ssl as ssl_lib, aiomysql
+
             host = body.get("host", "").strip()
             port = int(body.get("port", 3306))
             user = body.get("user", "").strip()
@@ -5686,23 +6638,31 @@ async def check_source_size(body: dict):
             table = body.get("table", "").strip()
             ssl_ctx = ssl_lib.create_default_context() if body.get("ssl") else None
             conn = await asyncio.wait_for(
-                aiomysql.connect(host=host, port=port, user=user, password=password,
-                    db=database, ssl=ssl_ctx, connect_timeout=10), timeout=12,
+                aiomysql.connect(
+                    host=host, port=port, user=user, password=password, db=database, ssl=ssl_ctx, connect_timeout=10
+                ),
+                timeout=12,
             )
             async with conn.cursor() as cur:
                 await cur.execute(
                     "SELECT TABLE_ROWS, DATA_LENGTH, INDEX_LENGTH FROM information_schema.tables "
-                    "WHERE table_schema=%s AND table_name=%s", (database, table)
+                    "WHERE table_schema=%s AND table_name=%s",
+                    (database, table),
                 )
                 row = await cur.fetchone()
             conn.close()
             if not row:
                 return {"supported": True, "size_bytes": 0, "row_estimate": 0}
             rows, data_len, index_len = row
-            return {"supported": True, "size_bytes": int((data_len or 0) + (index_len or 0)), "row_estimate": int(rows or 0)}
+            return {
+                "supported": True,
+                "size_bytes": int((data_len or 0) + (index_len or 0)),
+                "row_estimate": int(rows or 0),
+            }
 
         elif source_type == "postgres":
             import asyncio, ssl as ssl_lib, asyncpg
+
             host = body.get("host", "").strip()
             port = int(body.get("port", 5432))
             user = body.get("user", "").strip()
@@ -5711,8 +6671,10 @@ async def check_source_size(body: dict):
             table = body.get("table", "").strip()
             ssl_ctx = ssl_lib.create_default_context() if body.get("ssl") else None
             conn = await asyncio.wait_for(
-                asyncpg.connect(host=host, port=port, user=user, password=password,
-                    database=database, ssl=ssl_ctx, timeout=10), timeout=12,
+                asyncpg.connect(
+                    host=host, port=port, user=user, password=password, database=database, ssl=ssl_ctx, timeout=10
+                ),
+                timeout=12,
             )
             size_bytes = await conn.fetchval("SELECT pg_total_relation_size($1)", table)
             row_estimate = await conn.fetchval("SELECT reltuples::bigint FROM pg_class WHERE relname = $1", table)
@@ -5721,23 +6683,30 @@ async def check_source_size(body: dict):
 
         elif source_type == "mongodb":
             from motor.motor_asyncio import AsyncIOMotorClient
+
             uri = body.get("mongo_uri", "").strip()
             database = body.get("mongo_database", "").strip()
             collection = body.get("mongo_collection", "").strip()
             client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=8000)
             stats = await client[database].command("collStats", collection)
             client.close()
-            return {"supported": True, "size_bytes": int(stats.get("size", 0)), "row_estimate": int(stats.get("count", 0))}
+            return {
+                "supported": True,
+                "size_bytes": int(stats.get("size", 0)),
+                "row_estimate": int(stats.get("count", 0)),
+            }
 
         elif source_type == "bigquery":
             from google.cloud import bigquery as bq_lib
             from google.oauth2 import service_account
+
             info = json.loads(body.get("bq_key_json", "{}"))
             project = body.get("bq_project", "").strip()
             dataset = body.get("bq_dataset", "").strip()
             table = body.get("bq_table", "").strip()
             creds = service_account.Credentials.from_service_account_info(
-                info, scopes=["https://www.googleapis.com/auth/bigquery"])
+                info, scopes=["https://www.googleapis.com/auth/bigquery"]
+            )
             client = bq_lib.Client(project=project, credentials=creds)
             tbl = client.get_table(f"{project}.{dataset}.{table}")
             return {"supported": True, "size_bytes": int(tbl.num_bytes or 0), "row_estimate": int(tbl.num_rows or 0)}
@@ -5745,12 +6714,14 @@ async def check_source_size(body: dict):
         elif source_type == "gcs":
             from google.cloud import storage as gcs_lib
             from google.oauth2 import service_account
+
             info = json.loads(body.get("gcs_key_json", "{}"))
             project = body.get("gcs_project", "").strip()
             bucket = body.get("gcs_bucket", "").strip()
             file_path = body.get("gcs_file", "").strip()
             creds = service_account.Credentials.from_service_account_info(
-                info, scopes=["https://www.googleapis.com/auth/devstorage.read_only"])
+                info, scopes=["https://www.googleapis.com/auth/devstorage.read_only"]
+            )
             client = gcs_lib.Client(project=project, credentials=creds)
             blob = client.bucket(bucket).get_blob(file_path)
             if not blob:
@@ -5759,6 +6730,7 @@ async def check_source_size(body: dict):
 
         elif source_type == "aws":
             import boto3
+
             aws_service = body.get("aws_service", "")
             region = body.get("aws_region", "us-east-1")
             access_key_id = body.get("aws_access_key_id", "").strip()
@@ -5767,42 +6739,61 @@ async def check_source_size(body: dict):
             if aws_service == "s3":
                 bucket = body.get("aws_bucket", "").strip()
                 key = body.get("aws_table", "").strip()
-                s3 = boto3.client("s3", region_name=region,
-                    aws_access_key_id=access_key_id, aws_secret_access_key=secret_key)
+                s3 = boto3.client(
+                    "s3", region_name=region, aws_access_key_id=access_key_id, aws_secret_access_key=secret_key
+                )
                 head = s3.head_object(Bucket=bucket, Key=key)
                 return {"supported": True, "size_bytes": int(head.get("ContentLength", 0)), "row_estimate": None}
 
             elif aws_service == "dynamodb":
                 table = body.get("aws_table", "").strip()
-                dynamo = boto3.client("dynamodb", region_name=region,
-                    aws_access_key_id=access_key_id, aws_secret_access_key=secret_key)
+                dynamo = boto3.client(
+                    "dynamodb", region_name=region, aws_access_key_id=access_key_id, aws_secret_access_key=secret_key
+                )
                 desc = dynamo.describe_table(TableName=table)["Table"]
-                return {"supported": True, "size_bytes": int(desc.get("TableSizeBytes", 0)), "row_estimate": int(desc.get("ItemCount", 0))}
+                return {
+                    "supported": True,
+                    "size_bytes": int(desc.get("TableSizeBytes", 0)),
+                    "row_estimate": int(desc.get("ItemCount", 0)),
+                }
 
             elif aws_service == "rds-mysql":
-                return await check_source_size({
-                    "source_type": "mysql", "host": body.get("host", ""), "port": body.get("port", 3306),
-                    "user": body.get("user", ""), "password": body.get("password", ""),
-                    "database": body.get("database", ""), "table": body.get("aws_table", ""),
-                    "ssl": body.get("ssl", True),
-                })
+                return await check_source_size(
+                    {
+                        "source_type": "mysql",
+                        "host": body.get("host", ""),
+                        "port": body.get("port", 3306),
+                        "user": body.get("user", ""),
+                        "password": body.get("password", ""),
+                        "database": body.get("database", ""),
+                        "table": body.get("aws_table", ""),
+                        "ssl": body.get("ssl", True),
+                    }
+                )
             elif aws_service in ("rds-postgres", "redshift"):
-                return await check_source_size({
-                    "source_type": "postgres", "host": body.get("host", ""),
-                    "port": body.get("port", 5432 if aws_service == "rds-postgres" else 5439),
-                    "user": body.get("user", ""), "password": body.get("password", ""),
-                    "database": body.get("database", ""), "table": body.get("aws_table", ""),
-                    "ssl": body.get("ssl", True),
-                })
+                return await check_source_size(
+                    {
+                        "source_type": "postgres",
+                        "host": body.get("host", ""),
+                        "port": body.get("port", 5432 if aws_service == "rds-postgres" else 5439),
+                        "user": body.get("user", ""),
+                        "password": body.get("password", ""),
+                        "database": body.get("database", ""),
+                        "table": body.get("aws_table", ""),
+                        "ssl": body.get("ssl", True),
+                    }
+                )
             return {"supported": False, "reason": f"No size check for AWS service '{aws_service}'"}
 
         elif source_type == "cloudsql":
             db_type = body.get("db_type", "postgres")
-            return await check_source_size({
-                **body,
-                "source_type": "mysql" if db_type == "mysql" else "postgres",
-                "host": body.get("host", ""),
-            })
+            return await check_source_size(
+                {
+                    **body,
+                    "source_type": "mysql" if db_type == "mysql" else "postgres",
+                    "host": body.get("host", ""),
+                }
+            )
 
         else:
             return {"supported": False, "reason": f"No size check for '{source_type}'"}
@@ -5849,31 +6840,38 @@ async def preview_transform(
         df = df.dropna(subset=non_meta, how="all")
     if standardize_text == "true":
         for col in df.select_dtypes(include="object").columns:
-            if col.startswith("__"): continue
+            if col.startswith("__"):
+                continue
             df[col] = df[col].str.lower().str.strip()
     if fill_missing == "true":
         for col in df.select_dtypes(include=[np.number]).columns:
-            if col.startswith("__"): continue
+            if col.startswith("__"):
+                continue
             df[col] = df[col].fillna(df[col].median())
         for col in df.select_dtypes(include="object").columns:
-            if col.startswith("__"): continue
+            if col.startswith("__"):
+                continue
             df[col] = df[col].fillna(df[col].mode()[0] if not df[col].mode().empty else "unknown")
     if handle_outliers == "true":
         for col in df.select_dtypes(include=[np.number]).columns:
-            if col.startswith("__"): continue
+            if col.startswith("__"):
+                continue
             col_data = df[col].dropna()
-            if len(col_data) == 0: continue
+            if len(col_data) == 0:
+                continue
             median = col_data.median()
             mad = np.median(np.abs(col_data - median))
-            if mad == 0: continue
+            if mad == 0:
+                continue
             lower = median - (3.5 * mad / 0.6745)
             upper = median + (3.5 * mad / 0.6745)
             df[col] = df[col].clip(lower, upper)
     if fix_dates == "true":
         for col in df.select_dtypes(include="object").columns:
-            if col.startswith("__"): continue
+            if col.startswith("__"):
+                continue
             try:
-                parsed = pd.to_datetime(df[col], infer_datetime_format=True, errors='coerce')
+                parsed = pd.to_datetime(df[col], infer_datetime_format=True, errors="coerce")
                 if parsed.notna().sum() > len(df) * 0.5:
                     df[col] = parsed.dt.strftime("%Y-%m-%d")
             except Exception:
@@ -5881,11 +6879,13 @@ async def preview_transform(
 
     # Mark which rows were actually changed
     original_source = source_df.drop(columns=["__source__"])
-    cleaned_source  = df.drop(columns=["__source__"])
+    cleaned_source = df.drop(columns=["__source__"])
     cleaned_source["__original_row_number"] = range(1, len(cleaned_source) + 1)
     cleaned_source["__affected"] = False
 
-    compare_cleaned = cleaned_source.drop(columns=["__original_row_number", "__affected"], errors="ignore").reset_index(drop=True)
+    compare_cleaned = cleaned_source.drop(columns=["__original_row_number", "__affected"], errors="ignore").reset_index(
+        drop=True
+    )
     compare_original = original_source.reset_index(drop=True)
     for i in range(min(len(compare_original), len(compare_cleaned))):
         try:
@@ -5915,7 +6915,7 @@ async def preview_transform(
     else:
         combined = cleaned_source
 
-    total_rows = len(combined)  
+    total_rows = len(combined)
     rows_affected = int(combined["__affected"].sum()) + rows_removed_from_source
 
     # Build preview — affected rows only if requested, else first 100
@@ -5937,6 +6937,7 @@ async def preview_transform(
         "rows_affected": rows_affected,
         "showing": len(preview),
     }
+
 
 @app.post("/api/clean-data")
 async def clean_data(
@@ -6029,7 +7030,7 @@ async def clean_data(
         for col in df.select_dtypes(include=[np.number]).columns:
             df[col] = df[col].interpolate(method="index", limit_direction="both")
 
-# ── AI Clean: if flagged, run all smart transforms automatically ──
+    # ── AI Clean: if flagged, run all smart transforms automatically ──
     if ai_clean == "true":
         df = df.drop_duplicates()
         df = df.dropna(how="all")
@@ -6044,6 +7045,7 @@ async def clean_data(
     # ── AI Custom Rules: execute each user-described transformation ──
     if ai_custom_instructions and ai_custom_instructions != "[]":
         import anthropic
+
         try:
             instructions_list = json.loads(ai_custom_instructions)
         except Exception:
@@ -6061,9 +7063,10 @@ async def clean_data(
                 message = client.messages.create(
                     model="claude-haiku-4-5",
                     max_tokens=1024,
-                    messages=[{
-                        "role": "user",
-                        "content": f"""You are a pandas data cleaning expert. Given this DataFrame info and instruction, write ONLY the pandas Python code to apply the transformation.
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": f"""You are a pandas data cleaning expert. Given this DataFrame info and instruction, write ONLY the pandas Python code to apply the transformation.
 
 {_ai_data_block(df)}
 Instruction: {instr}
@@ -6075,8 +7078,9 @@ Rules:
 - If replacing a value in a numeric column with a non-numeric value, convert the column to string first (df['col'] = df['col'].astype(str))
 - Keep it simple and safe
 
-Reply with ONLY the Python code, nothing else, no markdown, no backticks."""
-                    }]
+Reply with ONLY the Python code, nothing else, no markdown, no backticks.""",
+                        }
+                    ],
                 )
                 code = message.content[0].text.strip()
                 code = code.replace("```python", "").replace("```", "").strip()
@@ -6121,8 +7125,9 @@ Reply with ONLY the Python code, nothing else, no markdown, no backticks."""
             "handle_outliers": handle_outliers == "true",
             "fill_missing": fill_missing == "true",
             "imputation_method": imputation_method if imputation_method != "none" else None,
-        }
+        },
     }
+
 
 @app.post("/api/sql-clean")
 async def sql_clean(
@@ -6143,10 +7148,28 @@ async def sql_clean(
     stripped = _no_line_comments.strip().lstrip("(").strip()
     lowered = stripped.lower()
     if not (lowered.startswith("select") or lowered.startswith("with")):
-        return {"success": False, "error": "Only SELECT / WITH queries are allowed. Statements like INSERT, DELETE, DROP, ATTACH, COPY, or PRAGMA are blocked."}
-    blocked = ["attach ", "pragma ", "copy ", "install ", "load ", "create ", "insert ", "update ", "delete ", "drop ", "call "]
+        return {
+            "success": False,
+            "error": "Only SELECT / WITH queries are allowed. Statements like INSERT, DELETE, DROP, ATTACH, COPY, or PRAGMA are blocked.",
+        }
+    blocked = [
+        "attach ",
+        "pragma ",
+        "copy ",
+        "install ",
+        "load ",
+        "create ",
+        "insert ",
+        "update ",
+        "delete ",
+        "drop ",
+        "call ",
+    ]
     if any(b in lowered for b in blocked):
-        return {"success": False, "error": "Query contains a disallowed keyword. Only read-only SELECT queries are permitted."}
+        return {
+            "success": False,
+            "error": "Query contains a disallowed keyword. Only read-only SELECT queries are permitted.",
+        }
 
     contents = await file.read()
     try:
@@ -6158,7 +7181,7 @@ async def sql_clean(
 
     try:
         con = duckdb.connect(database=":memory:")
-        con.register("source", df)   # the table name your SQL should query: FROM source
+        con.register("source", df)  # the table name your SQL should query: FROM source
         result_df = con.execute(sql).fetchdf()
         con.close()
     except Exception as e:
@@ -6186,6 +7209,7 @@ async def sql_clean(
         "preview_columns": list(result_df.columns),
         "options_used": {"sql_custom": True},
     }
+
 
 @app.get("/api/download/{filename}")
 def download(filename: str):
@@ -6232,8 +7256,10 @@ def download_install_ps1():
 # These serve the FlowPage.tsx component.
 # Data is persisted in META_DIR as JSON files keyed by pipeline_id.
 
+
 def _rules_path(pipeline_id: str) -> str:
     return os.path.join(META_DIR, f"rules_{hashlib.md5(pipeline_id.encode()).hexdigest()}.json")
+
 
 def _baseline_path(pipeline_id: str) -> str:
     return os.path.join(META_DIR, f"baseline_{hashlib.md5(pipeline_id.encode()).hexdigest()}.json")
@@ -6252,8 +7278,12 @@ def get_pipeline_run(pipeline_id: str):
     # If no data yet, return a clean GREEN run so the UI loads
     if not os.path.exists(schema_path):
         return {
-            "status": "GREEN", "driftScore": 0, "issues": [],
-            "previewRows": 0, "profileRows": 0, "totalRows": 0,
+            "status": "GREEN",
+            "driftScore": 0,
+            "issues": [],
+            "previewRows": 0,
+            "profileRows": 0,
+            "totalRows": 0,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
@@ -6268,38 +7298,62 @@ def get_pipeline_run(pipeline_id: str):
             baseline_data = json.load(f)
         prev_schema = baseline_data.get("schema", {})
 
-        added   = [c for c in current_schema if c not in prev_schema]
-        removed = [c for c in prev_schema   if c not in current_schema]
+        added = [c for c in current_schema if c not in prev_schema]
+        removed = [c for c in prev_schema if c not in current_schema]
         changed = [c for c in current_schema if c in prev_schema and current_schema[c] != prev_schema[c]]
 
         for col in added:
-            issues.append({"id": str(uuid.uuid4()), "column": col, "kind": "added",
-                "severity": "RED", "confidence": 70, "autoFix": False,
-                "description": f"Column '{col}' not in baseline contract.",
-                "suggestion":  "Add to contract as optional, or reject run."})
+            issues.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "column": col,
+                    "kind": "added",
+                    "severity": "RED",
+                    "confidence": 70,
+                    "autoFix": False,
+                    "description": f"Column '{col}' not in baseline contract.",
+                    "suggestion": "Add to contract as optional, or reject run.",
+                }
+            )
         for col in removed:
-            issues.append({"id": str(uuid.uuid4()), "column": col, "kind": "removed",
-                "severity": "RED", "confidence": 95, "autoFix": False,
-                "description": f"Expected column '{col}' is missing.",
-                "suggestion":  "Check upstream source for schema change."})
+            issues.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "column": col,
+                    "kind": "removed",
+                    "severity": "RED",
+                    "confidence": 95,
+                    "autoFix": False,
+                    "description": f"Expected column '{col}' is missing.",
+                    "suggestion": "Check upstream source for schema change.",
+                }
+            )
         for col in changed:
-            issues.append({"id": str(uuid.uuid4()), "column": col, "kind": "type_change",
-                "severity": "YELLOW", "confidence": 85, "autoFix": False,
-                "description": f"Type changed: {prev_schema[col]} → {current_schema[col]}.",
-                "suggestion":  "Cast back to original type or update baseline."})
+            issues.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "column": col,
+                    "kind": "type_change",
+                    "severity": "YELLOW",
+                    "confidence": 85,
+                    "autoFix": False,
+                    "description": f"Type changed: {prev_schema[col]} → {current_schema[col]}.",
+                    "suggestion": "Cast back to original type or update baseline.",
+                }
+            )
 
         drift_score = min(100, round(len(issues) / max(len(prev_schema), 1) * 100))
 
     status = "GREEN" if drift_score == 0 else ("RED" if any(i["severity"] == "RED" for i in issues) else "YELLOW")
 
     return {
-        "status":      status,
-        "driftScore":  drift_score,
-        "issues":      issues,
+        "status": status,
+        "driftScore": drift_score,
+        "issues": issues,
         "previewRows": 10,
         "profileRows": 250,
-        "totalRows":   0,
-        "timestamp":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "totalRows": 0,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
 
@@ -6312,9 +7366,9 @@ def get_baseline(pipeline_id: str):
     with open(path) as f:
         data = json.load(f)
     return {
-        "columns":   data.get("columns", []),
+        "columns": data.get("columns", []),
         "updatedAt": data.get("updatedAt", "unknown"),
-        "runCount":  data.get("runCount", 0),
+        "runCount": data.get("runCount", 0),
     }
 
 
@@ -6360,15 +7414,17 @@ async def approve_fixes(pipeline_id: str, body: dict):
                 if r["pattern"] == pattern:
                     r["usedCount"] = r.get("usedCount", 0) + 1
             continue
-        new_rules.append({
-            "id":         str(uuid.uuid4()),
-            "pipeline":   pipeline_id,
-            "pattern":    pattern,
-            "fix":        issue["suggestion"],
-            "confidence": issue["confidence"],
-            "usedCount":  1,
-            "approvedAt": datetime.now().strftime("%Y-%m-%d"),
-        })
+        new_rules.append(
+            {
+                "id": str(uuid.uuid4()),
+                "pipeline": pipeline_id,
+                "pattern": pattern,
+                "fix": issue["suggestion"],
+                "confidence": issue["confidence"],
+                "usedCount": 1,
+                "approvedAt": datetime.now().strftime("%Y-%m-%d"),
+            }
+        )
         existing_patterns.add(pattern)
 
     rules.extend(new_rules)
@@ -6382,9 +7438,9 @@ async def approve_fixes(pipeline_id: str, body: dict):
             current_schema = json.load(f)
         bl_path = _baseline_path(pipeline_id)
         baseline = json.load(open(bl_path)) if os.path.exists(bl_path) else {"columns": [], "runCount": 0}
-        baseline["schema"]    = current_schema
+        baseline["schema"] = current_schema
         baseline["updatedAt"] = datetime.now().strftime("%Y-%m-%d")
-        baseline["runCount"]  = baseline.get("runCount", 0) + 1
+        baseline["runCount"] = baseline.get("runCount", 0) + 1
         with open(bl_path, "w") as f:
             json.dump(baseline, f, indent=2)
 
@@ -6404,7 +7460,9 @@ def rollback_rule(pipeline_id: str, rule_id: str):
         json.dump(rules, f, indent=2)
     return {"deleted": True}
 
+
 # ── GOOGLE OAUTH ROUTES ────────────────────────────────────────────────────────
+
 
 @app.get("/api/auth/google/url")
 async def get_google_auth_url(request: Request, response: Response):
@@ -6424,19 +7482,21 @@ async def get_google_auth_url(request: Request, response: Response):
         session_id = secrets.token_urlsafe(32)
 
     flow = Flow.from_client_config(
-        {"web": {
-            "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
-            "redirect_uris": [GOOGLE_REDIRECT_URI],
-        }},
+        {
+            "web": {
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "redirect_uris": [GOOGLE_REDIRECT_URI],
+            }
+        },
         scopes=[
-    "https://www.googleapis.com/auth/spreadsheets",
-    "openid",
-    "https://www.googleapis.com/auth/userinfo.email",
-    "https://www.googleapis.com/auth/drive.file",
-],
+            "https://www.googleapis.com/auth/spreadsheets",
+            "openid",
+            "https://www.googleapis.com/auth/userinfo.email",
+            "https://www.googleapis.com/auth/drive.file",
+        ],
     )
     flow.redirect_uri = GOOGLE_REDIRECT_URI
     auth_url, state = flow.authorization_url(
@@ -6449,15 +7509,11 @@ async def get_google_auth_url(request: Request, response: Response):
     tokens["state"] = state
     tokens["userId"] = ctx["userId"]
     tokens["orgId"] = str(ctx["orgId"])
-    tokens["code_verifier"] = getattr(flow, 'code_verifier', "")
+    tokens["code_verifier"] = getattr(flow, "code_verifier", "")
     await _save_session_tokens(session_id, tokens)
 
     response.set_cookie(
-        key="datapro_session",
-        value=session_id,
-        max_age=60*60*24*30,
-        httponly=False,
-        samesite="lax"
+        key="datapro_session", value=session_id, max_age=60 * 60 * 24 * 30, httponly=False, samesite="lax"
     )
     return {"url": auth_url, "session_id": session_id}
 
@@ -6482,23 +7538,28 @@ async def google_callback(request: Request, code: str, state: str):
                 pass
     if not session_id:
         from fastapi.responses import HTMLResponse
-        return HTMLResponse("<html><body><p>Session expired. Please close and try again.</p></body></html>", status_code=400)
+
+        return HTMLResponse(
+            "<html><body><p>Session expired. Please close and try again.</p></body></html>", status_code=400
+        )
 
     session_tokens = await _get_session_tokens(session_id)
     flow = Flow.from_client_config(
-        {"web": {
-            "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
-            "redirect_uris": [GOOGLE_REDIRECT_URI],
-        }},
-scopes=[
-    "https://www.googleapis.com/auth/spreadsheets",
-    "openid",
-    "https://www.googleapis.com/auth/userinfo.email",
-    "https://www.googleapis.com/auth/drive.file",
-],
+        {
+            "web": {
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "redirect_uris": [GOOGLE_REDIRECT_URI],
+            }
+        },
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "openid",
+            "https://www.googleapis.com/auth/userinfo.email",
+            "https://www.googleapis.com/auth/drive.file",
+        ],
         state=state,
     )
     flow.redirect_uri = GOOGLE_REDIRECT_URI
@@ -6510,22 +7571,23 @@ scopes=[
             flow.fetch_token(code=code)
     except Exception as e:
         from fastapi.responses import HTMLResponse
+
         return HTMLResponse(f"<html><body><p>Auth failed: {e}</p></body></html>", status_code=400)
 
     creds = flow.credentials
-    session_tokens["access_token"]  = creds.token
+    session_tokens["access_token"] = creds.token
     session_tokens["refresh_token"] = creds.refresh_token
-    session_tokens["token_uri"]     = creds.token_uri
-    session_tokens["client_id"]     = creds.client_id
+    session_tokens["token_uri"] = creds.token_uri
+    session_tokens["client_id"] = creds.client_id
     session_tokens["client_secret"] = creds.client_secret
-    session_tokens["scopes"]        = list(creds.scopes) if creds.scopes else []
+    session_tokens["scopes"] = list(creds.scopes) if creds.scopes else []
     session_tokens.pop("code_verifier", None)
 
     import requests as pyrequests
+
     try:
         resp = pyrequests.get(
-            "https://www.googleapis.com/oauth2/v2/userinfo",
-            headers={"Authorization": f"Bearer {creds.token}"}
+            "https://www.googleapis.com/oauth2/v2/userinfo", headers={"Authorization": f"Bearer {creds.token}"}
         )
         session_tokens["email"] = resp.json().get("email", "")
     except Exception:
@@ -6534,6 +7596,7 @@ scopes=[
     await _save_session_tokens(session_id, session_tokens)
 
     from fastapi.responses import HTMLResponse
+
     return HTMLResponse(content=f"""
         <html><body>
         <script>
@@ -6545,6 +7608,7 @@ scopes=[
         <p>Authentication successful. You can close this tab.</p>
         </body></html>
     """)
+
 
 @app.get("/api/auth/google/picker-token")
 async def get_picker_token(request: Request):
@@ -6613,17 +7677,22 @@ async def list_google_sheets(request: Request):
         # Do NOT call spreadsheets().get() per file — costs 1 read quota each.
         # Return Sheet1 as default tab; real tabs load only when user picks a sheet.
         for f in files:
-            sheets.append({
-                "id": f["id"], "name": f["name"],
-                "modifiedTime": f.get("modifiedTime", ""),
-                "tabs": ["Sheet1"], "tabCount": 1,
-            })
+            sheets.append(
+                {
+                    "id": f["id"],
+                    "name": f["name"],
+                    "modifiedTime": f.get("modifiedTime", ""),
+                    "tabs": ["Sheet1"],
+                    "tabCount": 1,
+                }
+            )
         # Cache per session (stored inside that user's token file)
         tokens["_sheets_cache"] = sheets
         await _save_session_tokens(session_id, tokens)
         return {"sheets": sheets, "email": tokens.get("email", "")}
     except Exception as e:
         return {"error": str(e), "sheets": []}
+
 
 @app.post("/api/sheets/to-csv")
 async def sheet_to_csv(request: Request, body: dict):
@@ -6633,8 +7702,8 @@ async def sheet_to_csv(request: Request, body: dict):
     _own_sid, _own_tokens = await _owned_google_session(request, ctx)
     if not _own_sid:
         return {"error": "Not authenticated"}
-    sheet_id   = body.get("sheetId", "")
-    tab        = body.get("tab", "Sheet1")
+    sheet_id = body.get("sheetId", "")
+    tab = body.get("tab", "Sheet1")
     sheet_name = body.get("sheetName", "unnamed")
 
     session_id = _get_session_id(request)
@@ -6664,20 +7733,22 @@ async def sheet_to_csv(request: Request, body: dict):
         service = build("sheets", "v4", credentials=creds)
 
         try:
-            meta = service.spreadsheets().get(
-                spreadsheetId=sheet_id,
-                fields="sheets.properties.title"
-            ).execute()
+            meta = service.spreadsheets().get(spreadsheetId=sheet_id, fields="sheets.properties.title").execute()
             available_tabs = [s["properties"]["title"] for s in meta.get("sheets", [])]
             if tab not in available_tabs and available_tabs:
                 tab = available_tabs[0]
         except Exception:
             pass
 
-        result = service.spreadsheets().values().get(
-            spreadsheetId=sheet_id,
-            range=tab,
-        ).execute()
+        result = (
+            service.spreadsheets()
+            .values()
+            .get(
+                spreadsheetId=sheet_id,
+                range=tab,
+            )
+            .execute()
+        )
         values = result.get("values", [])
         if not values:
             return {"error": "Sheet is empty"}
@@ -6733,10 +7804,15 @@ async def get_sheet_data(request: Request, sheet_id: str, tab: str = "Sheet1"):
             return {"error": "Not authenticated"}
 
         service = build("sheets", "v4", credentials=creds)
-        result = service.spreadsheets().values().get(
-            spreadsheetId=sheet_id,
-            range=tab,
-        ).execute()
+        result = (
+            service.spreadsheets()
+            .values()
+            .get(
+                spreadsheetId=sheet_id,
+                range=tab,
+            )
+            .execute()
+        )
         values = result.get("values", [])
         if not values:
             return {"rows": 0, "cols": 0, "preview": []}
@@ -6746,12 +7822,12 @@ async def get_sheet_data(request: Request, sheet_id: str, tab: str = "Sheet1"):
             padded = row + [""] * (len(headers) - len(row))
             rows.append(dict(zip(headers, padded)))
         return {
-            "rows":    len(values) - 1,
-            "cols":    len(headers),
+            "rows": len(values) - 1,
+            "cols": len(headers),
             "headers": headers,
             "preview": rows[:5],
             "sheet_id": sheet_id,
-            "tab":     tab,
+            "tab": tab,
         }
     except Exception as e:
         return {"error": str(e)}
@@ -6800,18 +7876,21 @@ async def import_sheet_as_source(request: Request, sheet_id: str, tab: str = "Sh
         # Do NOT call spreadsheets().get() here — it costs a Sheets read quota
         # Verify tab exists — one lightweight metadata call, only on actual import
         try:
-            meta = service.spreadsheets().get(
-                spreadsheetId=sheet_id, fields="sheets.properties.title"
-            ).execute()
+            meta = service.spreadsheets().get(spreadsheetId=sheet_id, fields="sheets.properties.title").execute()
             available_tabs = [s["properties"]["title"] for s in meta.get("sheets", [])]
             if tab not in available_tabs and available_tabs:
                 tab = available_tabs[0]
         except Exception:
             pass  # quota hit or error — use whatever tab was passed in
-        result = service.spreadsheets().values().get(
-            spreadsheetId=sheet_id,
-            range=tab,
-        ).execute()
+        result = (
+            service.spreadsheets()
+            .values()
+            .get(
+                spreadsheetId=sheet_id,
+                range=tab,
+            )
+            .execute()
+        )
         values = result.get("values", [])
         if not values:
             return {"error": "Sheet is empty"}
@@ -6828,16 +7907,17 @@ async def import_sheet_as_source(request: Request, sheet_id: str, tab: str = "Sh
         filepath = os.path.join(UPLOAD_DIR, filename)
         df.to_csv(filepath, index=False)
         return {
-            "filename":   filename,
+            "filename": filename,
             "sheet_name": sheet_name,
-            "tab":        tab,
-            "rows":       len(df),
-            "cols":       len(df.columns),
-            "headers":    headers,
+            "tab": tab,
+            "rows": len(df),
+            "cols": len(df.columns),
+            "headers": headers,
             "download_url": f"/api/download/{filename}",
         }
     except Exception as e:
         return {"error": str(e)}
+
 
 @app.get("/api/auth/google/logout")
 async def google_logout(request: Request, response: Response):
@@ -6855,6 +7935,7 @@ async def google_logout(request: Request, response: Response):
     response.delete_cookie("datapro_session")
     return {"logged_out": True}
 
+
 @app.get("/api/auth/google/check")
 async def check_and_refresh_google(request: Request):
     session_id = _get_session_id(request)
@@ -6866,8 +7947,9 @@ async def check_and_refresh_google(request: Request):
     return {
         "authenticated": True,
         "email": tokens.get("email", ""),
-        "has_refresh_token": bool(tokens.get("refresh_token"))
+        "has_refresh_token": bool(tokens.get("refresh_token")),
     }
+
 
 @app.get("/api/auth/google/sheets/cached")
 async def get_cached_sheets(request: Request):
@@ -6880,11 +7962,13 @@ async def get_cached_sheets(request: Request):
         return {"sheets": cached, "email": tokens.get("email", ""), "cached": True}
     return {"sheets": [], "cached": False}
 
+
 # ── MONGODB ROUTES ────────────────────────────────────────────────────────────
+
 
 @app.post("/api/mongo/health")
 async def mongo_health(body: dict):
-    uri      = body.get("uri", "").strip()
+    uri = body.get("uri", "").strip()
     database = body.get("database", "").strip()
 
     for key in _agent_connections:
@@ -6926,7 +8010,7 @@ async def mongo_health(body: dict):
 
 @app.post("/api/mongo/collections")
 async def mongo_collections(body: dict):
-    uri      = body.get("uri", "").strip()
+    uri = body.get("uri", "").strip()
     database = body.get("database", "").strip()
 
     for key in _agent_connections:
@@ -6954,19 +8038,31 @@ async def mongo_collections(body: dict):
 
 @app.post("/api/mongo/fetch-collection")
 async def mongo_fetch_collection(body: dict):
-    uri        = body.get("uri", "").strip()
-    database   = body.get("database", "").strip()
+    uri = body.get("uri", "").strip()
+    database = body.get("database", "").strip()
     collection = body.get("collection", "").strip()
 
     for key in _agent_connections:
-        if key.startswith(f"{database}@") and collection and _agent_connections[key].get("db_type", "") in ("mongodb", ""):
+        if (
+            key.startswith(f"{database}@")
+            and collection
+            and _agent_connections[key].get("db_type", "") in ("mongodb", "")
+        ):
             try:
                 request_id = _secrets.token_hex(16)
                 future = asyncio.get_event_loop().create_future()
                 _pending_queries[request_id] = future
-                await _agent_connections[key]["websocket"].send_text(json.dumps({
-                    "type": "query", "request_id": request_id, "collection": collection, "filter": {}, "limit": 50000,
-                }))
+                await _agent_connections[key]["websocket"].send_text(
+                    json.dumps(
+                        {
+                            "type": "query",
+                            "request_id": request_id,
+                            "collection": collection,
+                            "filter": {},
+                            "limit": 50000,
+                        }
+                    )
+                )
                 result = await asyncio.wait_for(future, timeout=30.0)
                 if "error" in result:
                     return {"error": result["error"]}
@@ -6978,7 +8074,12 @@ async def mongo_fetch_collection(body: dict):
                 filepath = os.path.join(UPLOAD_DIR, filename)
                 df.to_csv(filepath, index=False)
                 print(f"✅ MongoDB fetch-collection (via tunnel): {database}.{collection} — {len(df)} docs")
-                return {"rows": len(df), "cols": len(df.columns), "download_url": f"/api/download/{filename}", "filename": filename}
+                return {
+                    "rows": len(df),
+                    "cols": len(df.columns),
+                    "download_url": f"/api/download/{filename}",
+                    "filename": filename,
+                }
             except Exception as e:
                 return {"error": str(e)}
 
@@ -7032,11 +8133,11 @@ async def mongo_write_collection(body: dict):
     except ImportError:
         return {"success": False, "error": "motor not installed. Run: pip install motor"}
 
-    uri        = body.get("uri", "").strip()
-    database   = body.get("database", "").strip()
+    uri = body.get("uri", "").strip()
+    database = body.get("database", "").strip()
     collection = body.get("collection", "").strip()
-    csv_data   = body.get("csvData", "")
-    mode       = body.get("mode", "replace")
+    csv_data = body.get("csvData", "")
+    mode = body.get("mode", "replace")
 
     if not csv_data:
         return {"success": False, "error": "No CSV data provided"}
@@ -7083,7 +8184,9 @@ async def mongo_write_collection(body: dict):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+
 # ── GOOGLE ANALYTICS 4 ROUTES ────────────────────────────────────────────────
+
 
 @app.post("/api/ga4/health")
 async def ga4_health(body: dict):
@@ -7092,9 +8195,12 @@ async def ga4_health(body: dict):
         from google.analytics.data_v1beta.types import RunReportRequest, DateRange, Metric, Dimension
         from google.oauth2 import service_account
     except ImportError:
-        return {"healthy": False, "message": "❌ google-analytics-data not installed.\n   → Run: pip install google-analytics-data"}
+        return {
+            "healthy": False,
+            "message": "❌ google-analytics-data not installed.\n   → Run: pip install google-analytics-data",
+        }
 
-    key_json    = body.get("key_json", "")
+    key_json = body.get("key_json", "")
     property_id = body.get("property_id", "").strip()
 
     if not key_json or not property_id:
@@ -7102,6 +8208,7 @@ async def ga4_health(body: dict):
 
     try:
         import json as _json
+
         info = _json.loads(key_json)
         creds = service_account.Credentials.from_service_account_info(
             info,
@@ -7124,7 +8231,9 @@ async def ga4_health(body: dict):
         if "403" in msg or "PERMISSION_DENIED" in msg:
             friendly = "❌ Permission denied.\n   → Add the service account email as a Viewer in GA4: Admin → Property Access Management."
         elif "404" in msg or "not found" in msg.lower():
-            friendly = f"❌ Property '{property_id}' not found.\n   → Check the Property ID (numbers only, e.g. 123456789)."
+            friendly = (
+                f"❌ Property '{property_id}' not found.\n   → Check the Property ID (numbers only, e.g. 123456789)."
+            )
         elif "invalid_grant" in msg or "credentials" in msg.lower():
             friendly = "❌ Invalid credentials.\n   → Check the service account key JSON is not expired or revoked."
         elif "INVALID_ARGUMENT" in msg:
@@ -7143,20 +8252,21 @@ async def ga4_fetch_report(body: dict):
     except ImportError:
         return {"error": "google-analytics-data not installed. Run: pip install google-analytics-data"}
 
-    key_json    = body.get("key_json", "")
+    key_json = body.get("key_json", "")
     property_id = body.get("property_id", "").strip()
     metrics_str = body.get("metrics", "sessions,activeUsers,newUsers,screenPageViews,bounceRate,averageSessionDuration")
-    dims_str    = body.get("dimensions", "date,sessionDefaultChannelGroup")
-    start_date  = body.get("start_date", "30daysAgo").strip()
-    end_date    = body.get("end_date", "today").strip()
+    dims_str = body.get("dimensions", "date,sessionDefaultChannelGroup")
+    start_date = body.get("start_date", "30daysAgo").strip()
+    end_date = body.get("end_date", "today").strip()
     report_name = body.get("report_name", "").strip()
-    row_limit   = int(body.get("limit", 50000))
+    row_limit = int(body.get("limit", 50000))
 
     if not key_json or not property_id:
         return {"error": "key_json and property_id are required"}
 
     try:
         import json as _json
+
         info = _json.loads(key_json)
         creds = service_account.Credentials.from_service_account_info(
             info,
@@ -7164,7 +8274,7 @@ async def ga4_fetch_report(body: dict):
         )
         client = BetaAnalyticsDataClient(credentials=creds)
 
-        metric_list    = [m.strip() for m in metrics_str.split(",") if m.strip()]
+        metric_list = [m.strip() for m in metrics_str.split(",") if m.strip()]
         dimension_list = [d.strip() for d in dims_str.split(",") if d.strip()]
 
         all_rows = []
@@ -7194,7 +8304,7 @@ async def ga4_fetch_report(body: dict):
                     if i < len(metric_list):
                         try:
                             val = float(metric_val.value)
-                            record[metric_list[i]] = round(val, 4) if '.' in metric_val.value else int(val)
+                            record[metric_list[i]] = round(val, 4) if "." in metric_val.value else int(val)
                         except ValueError:
                             record[metric_list[i]] = metric_val.value
                 all_rows.append(record)
@@ -7207,18 +8317,22 @@ async def ga4_fetch_report(body: dict):
                 break
 
         if not all_rows:
-            return {"error": f"No data returned for property {property_id} in date range {start_date} to {end_date}. Check that your GA4 property has data."}
+            return {
+                "error": f"No data returned for property {property_id} in date range {start_date} to {end_date}. Check that your GA4 property has data."
+            }
 
         ga4_truncated = ga4_total_rows > len(all_rows)
 
         df = pd.DataFrame(all_rows)
 
-        if 'date' in df.columns:
-            df['date'] = pd.to_datetime(df['date'], format='%Y%m%d', errors='coerce')
-            df = df.sort_values('date')
-            df['date'] = df['date'].dt.strftime('%Y-%m-%d')
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], format="%Y%m%d", errors="coerce")
+            df = df.sort_values("date")
+            df["date"] = df["date"].dt.strftime("%Y-%m-%d")
 
-        safe_report = report_name.replace(':', '_').replace('/', '_').replace(' ', '_')[:40] if report_name else 'report'
+        safe_report = (
+            report_name.replace(":", "_").replace("/", "_").replace(" ", "_")[:40] if report_name else "report"
+        )
         filename = f"ga4_{property_id}_{safe_report}_{uuid.uuid4().hex[:6]}.csv"
         filepath = os.path.join(UPLOAD_DIR, filename)
         df.to_csv(filepath, index=False)
@@ -7238,14 +8352,20 @@ async def ga4_fetch_report(body: dict):
     except Exception as e:
         err_str = str(e)
         if "PERMISSION_DENIED" in err_str or "403" in err_str:
-            return {"error": f"Permission denied for property {property_id}. Add the service account as a Viewer in GA4 Admin → Property Access Management."}
+            return {
+                "error": f"Permission denied for property {property_id}. Add the service account as a Viewer in GA4 Admin → Property Access Management."
+            }
         if "not found" in err_str.lower() or "404" in err_str:
-            return {"error": f"Property {property_id} not found. Verify the numeric Property ID in GA4 Admin → Property Settings."}
+            return {
+                "error": f"Property {property_id} not found. Verify the numeric Property ID in GA4 Admin → Property Settings."
+            }
         return {"error": err_str}
+
 
 # ── Analysis Results persistence (metadata only — never raw rows) ─────────
 
 MAX_ANALYSIS_HISTORY = 20
+
 
 def _analysis_source_key(connection_id: str, source_name: str) -> str:
     """connection_id wins when present (DB/API sources); falls back to the
@@ -7275,36 +8395,35 @@ async def save_analysis_result(request: Request, body: dict):
         return err
     user = ctx
 
-    source_name   = body.get("source_name", "").strip()
+    source_name = body.get("source_name", "").strip()
     connection_id = body.get("connection_id", "").strip()
-    result        = body.get("result", {})
+    result = body.get("result", {})
 
     if not source_name or not result:
         return {"error": "source_name and result are required"}
 
-    source_key = (str(body.get("source_key") or "").strip()
-                  or _analysis_source_key(connection_id, source_name))
+    source_key = str(body.get("source_key") or "").strip() or _analysis_source_key(connection_id, source_name)
     now = datetime.now()
 
     history_entry = {
-        "timestamp":      now,
-        "quality_score":  result.get("quality_score"),
+        "timestamp": now,
+        "quality_score": result.get("quality_score"),
         "total_problems": result.get("total_problems"),
-        "rows":           result.get("dataset_info", {}).get("rows"),
-        "columns":        result.get("dataset_info", {}).get("columns"),
+        "rows": result.get("dataset_info", {}).get("rows"),
+        "columns": result.get("dataset_info", {}).get("columns"),
     }
 
     await mongo_db.analysis_results.update_one(
         {"orgId": ctx["orgId"], "sourceKey": source_key},
         {
             "$set": {
-                "userId":       user["userId"],
-                "orgId":        ctx["orgId"],
-                "sourceKey":    source_key,
-                "sourceName":   source_name,
+                "userId": user["userId"],
+                "orgId": ctx["orgId"],
+                "sourceKey": source_key,
+                "sourceName": source_name,
                 "connectionId": connection_id or None,
-                "result":       result,
-                "updatedAt":    now,
+                "result": result,
+                "updatedAt": now,
             },
             "$setOnInsert": {"createdAt": now},
             "$push": {
@@ -7316,8 +8435,13 @@ async def save_analysis_result(request: Request, body: dict):
         },
         upsert=True,
     )
-    await log_audit(user["userId"], "analysis.saved", "analysis_result", source_key,
-                    {"sourceName": source_name, "qualityScore": history_entry["quality_score"]})
+    await log_audit(
+        user["userId"],
+        "analysis.saved",
+        "analysis_result",
+        source_key,
+        {"sourceName": source_name, "qualityScore": history_entry["quality_score"]},
+    )
     return {"success": True, "sourceKey": source_key}
 
 
@@ -7334,20 +8458,22 @@ async def get_analysis_result(request: Request, source_key: str):
     if err:
         return err
 
-    doc = await mongo_db.analysis_results.find_one({
-        "orgId": ctx["orgId"],
-        "sourceKey": source_key,
-    })
+    doc = await mongo_db.analysis_results.find_one(
+        {
+            "orgId": ctx["orgId"],
+            "sourceKey": source_key,
+        }
+    )
     if not doc:
         return {"found": False}
 
     return {
-        "found":        True,
-        "sourceName":   doc.get("sourceName", ""),
+        "found": True,
+        "sourceName": doc.get("sourceName", ""),
         "connectionId": doc.get("connectionId"),
-        "result":       doc.get("result", {}),
-        "history":      doc.get("history", []),
-        "updatedAt":    doc.get("updatedAt").isoformat() if doc.get("updatedAt") else None,
+        "result": doc.get("result", {}),
+        "history": doc.get("history", []),
+        "updatedAt": doc.get("updatedAt").isoformat() if doc.get("updatedAt") else None,
     }
 
 
@@ -7366,25 +8492,33 @@ async def list_analysis_results(request: Request):
 
     cursor = mongo_db.analysis_results.find(
         {"orgId": ctx["orgId"]},
-        {"sourceKey": 1, "sourceName": 1, "connectionId": 1, "updatedAt": 1,
-        "result.quality_score": 1, "result.total_problems": 1, "result.dataset_info": 1}
+        {
+            "sourceKey": 1,
+            "sourceName": 1,
+            "connectionId": 1,
+            "updatedAt": 1,
+            "result.quality_score": 1,
+            "result.total_problems": 1,
+            "result.dataset_info": 1,
+        },
     )
     docs = await cursor.to_list(length=1000)
     return [
         {
-            "sourceKey":    d.get("sourceKey", ""),
-            "sourceName":   d.get("sourceName", ""),
+            "sourceKey": d.get("sourceKey", ""),
+            "sourceName": d.get("sourceName", ""),
             "connectionId": d.get("connectionId"),
-            "updatedAt":    d.get("updatedAt").isoformat() if d.get("updatedAt") else None,
+            "updatedAt": d.get("updatedAt").isoformat() if d.get("updatedAt") else None,
             "qualityScore": d.get("result", {}).get("quality_score"),
             "totalProblems": d.get("result", {}).get("total_problems"),
-            "rows":         d.get("result", {}).get("dataset_info", {}).get("rows"),
+            "rows": d.get("result", {}).get("dataset_info", {}).get("rows"),
         }
         for d in docs
     ]
 
 
 # ── Data Catalog persistence (user-authored overlay on analysis_results) ───
+
 
 @app.post("/api/catalog")
 async def save_catalog_metadata(request: Request, body: dict):
@@ -7421,22 +8555,21 @@ async def save_catalog_metadata(request: Request, body: dict):
         if denied:
             return denied
 
-    source_name   = body.get("source_name", "").strip()
+    source_name = body.get("source_name", "").strip()
     connection_id = body.get("connection_id", "").strip()
     if not source_name:
         return {"error": "source_name is required"}
 
-    source_key = (str(body.get("source_key") or "").strip()
-                  or _analysis_source_key(connection_id, source_name))
+    source_key = str(body.get("source_key") or "").strip() or _analysis_source_key(connection_id, source_name)
     now = datetime.now()
 
     set_fields: dict = {
-        "userId":       user["userId"],
-        "orgId":        ctx["orgId"],
-        "sourceKey":    source_key,
-        "sourceName":   source_name,
+        "userId": user["userId"],
+        "orgId": ctx["orgId"],
+        "sourceKey": source_key,
+        "sourceName": source_name,
         "connectionId": connection_id or None,
-        "updatedAt":    now,
+        "updatedAt": now,
     }
     if "description" in body:
         set_fields["description"] = body.get("description", "")
@@ -7471,8 +8604,7 @@ async def save_catalog_metadata(request: Request, body: dict):
         {"$set": set_fields, "$setOnInsert": {"createdAt": now}},
         upsert=True,
     )
-    await log_audit(user["userId"], "catalog.updated", "catalog_metadata", source_key,
-                    {"sourceName": source_name})
+    await log_audit(user["userId"], "catalog.updated", "catalog_metadata", source_key, {"sourceName": source_name})
     return {"success": True, "sourceKey": source_key}
 
 
@@ -7485,22 +8617,20 @@ async def get_catalog_metadata(request: Request, source_key: str):
     if err:
         return err
 
-    catalog_doc = await mongo_db.catalog_metadata.find_one(
-        {"orgId": ctx["orgId"], "sourceKey": source_key})
-    analysis_doc = await mongo_db.analysis_results.find_one(
-        {"orgId": ctx["orgId"], "sourceKey": source_key})
+    catalog_doc = await mongo_db.catalog_metadata.find_one({"orgId": ctx["orgId"], "sourceKey": source_key})
+    analysis_doc = await mongo_db.analysis_results.find_one({"orgId": ctx["orgId"], "sourceKey": source_key})
 
     return {
-        "found":           catalog_doc is not None,
-        "sourceKey":       source_key,
-        "description":     (catalog_doc or {}).get("description", ""),
-        "tags":            (catalog_doc or {}).get("tags", []),
-        "owner":           (catalog_doc or {}).get("owner", ""),
+        "found": catalog_doc is not None,
+        "sourceKey": source_key,
+        "description": (catalog_doc or {}).get("description", ""),
+        "tags": (catalog_doc or {}).get("tags", []),
+        "owner": (catalog_doc or {}).get("owner", ""),
         "columnOverrides": (catalog_doc or {}).get("columnOverrides", {}),
-        "colInfo":         (analysis_doc or {}).get("result", {}).get("col_info", []),
-        "piiColumns":      (analysis_doc or {}).get("result", {}).get("pii_columns", {}),
-        "qualityScore":    (analysis_doc or {}).get("result", {}).get("quality_score"),
-        "updatedAt":       catalog_doc.get("updatedAt").isoformat() if catalog_doc and catalog_doc.get("updatedAt") else None,
+        "colInfo": (analysis_doc or {}).get("result", {}).get("col_info", []),
+        "piiColumns": (analysis_doc or {}).get("result", {}).get("pii_columns", {}),
+        "qualityScore": (analysis_doc or {}).get("result", {}).get("quality_score"),
+        "updatedAt": catalog_doc.get("updatedAt").isoformat() if catalog_doc and catalog_doc.get("updatedAt") else None,
     }
 
 
@@ -7520,7 +8650,14 @@ async def list_catalog_metadata(request: Request):
     catalog_docs = await mongo_db.catalog_metadata.find({"orgId": ctx["orgId"]}).to_list(length=1000)
     analysis_docs = await mongo_db.analysis_results.find(
         {"orgId": ctx["orgId"]},
-        {"sourceKey": 1, "sourceName": 1, "result.quality_score": 1, "result.col_info": 1, "result.dataset_info": 1, "result.pii_columns": 1}
+        {
+            "sourceKey": 1,
+            "sourceName": 1,
+            "result.quality_score": 1,
+            "result.col_info": 1,
+            "result.dataset_info": 1,
+            "result.pii_columns": 1,
+        },
     ).to_list(length=1000)
     analysis_by_key = {d.get("sourceKey", ""): d for d in analysis_docs}
 
@@ -7530,36 +8667,40 @@ async def list_catalog_metadata(request: Request):
         key = d.get("sourceKey", "")
         seen_keys.add(key)
         a = analysis_by_key.get(key, {})
-        out.append({
-            "sourceKey":       key,
-            "sourceName":      d.get("sourceName", ""),
-            "description":     d.get("description", ""),
-            "tags":            d.get("tags", []),
-            "owner":           d.get("owner", ""),
-            "columnOverrides": d.get("columnOverrides", {}),
-            "colInfo":         a.get("result", {}).get("col_info", []),
-            "piiColumns":      a.get("result", {}).get("pii_columns", {}),
-            "qualityScore":    a.get("result", {}).get("quality_score"),
-            "rows":            a.get("result", {}).get("dataset_info", {}).get("rows"),
-        })
+        out.append(
+            {
+                "sourceKey": key,
+                "sourceName": d.get("sourceName", ""),
+                "description": d.get("description", ""),
+                "tags": d.get("tags", []),
+                "owner": d.get("owner", ""),
+                "columnOverrides": d.get("columnOverrides", {}),
+                "colInfo": a.get("result", {}).get("col_info", []),
+                "piiColumns": a.get("result", {}).get("pii_columns", {}),
+                "qualityScore": a.get("result", {}).get("quality_score"),
+                "rows": a.get("result", {}).get("dataset_info", {}).get("rows"),
+            }
+        )
 
     # Sources with analysis history but no catalog doc yet still get a
     # lightweight entry so the frontend has col_info before anyone edits.
     for key, a in analysis_by_key.items():
         if key in seen_keys or not key:
             continue
-        out.append({
-            "sourceKey":       key,
-            "sourceName":      a.get("sourceName", ""),
-            "description":     "",
-            "tags":            [],
-            "owner":           "",
-            "columnOverrides": {},
-            "colInfo":         a.get("result", {}).get("col_info", []),
-            "piiColumns":      a.get("result", {}).get("pii_columns", {}),
-            "qualityScore":    a.get("result", {}).get("quality_score"),
-            "rows":            a.get("result", {}).get("dataset_info", {}).get("rows"),
-        })
+        out.append(
+            {
+                "sourceKey": key,
+                "sourceName": a.get("sourceName", ""),
+                "description": "",
+                "tags": [],
+                "owner": "",
+                "columnOverrides": {},
+                "colInfo": a.get("result", {}).get("col_info", []),
+                "piiColumns": a.get("result", {}).get("pii_columns", {}),
+                "qualityScore": a.get("result", {}).get("quality_score"),
+                "rows": a.get("result", {}).get("dataset_info", {}).get("rows"),
+            }
+        )
 
     return out
 
@@ -7571,8 +8712,7 @@ async def delete_catalog_metadata(request: Request, source_key: str):
     ctx, err = await _auth(request, "catalog.delete")
     if err:
         return err
-    result = await mongo_db.catalog_metadata.delete_one(
-        {"orgId": ctx["orgId"], "sourceKey": source_key})
+    result = await mongo_db.catalog_metadata.delete_one({"orgId": ctx["orgId"], "sourceKey": source_key})
     return {"success": True, "deleted": result.deleted_count > 0}
 
 
@@ -7613,9 +8753,10 @@ async def ai_custom_clean_route(
         message = client.messages.create(
             model="claude-haiku-4-5",
             max_tokens=1024,
-            messages=[{
-                "role": "user",
-                "content": f"""You are a pandas data cleaning expert. Given this DataFrame info and instruction, write ONLY the pandas Python code to apply the transformation.
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"""You are a pandas data cleaning expert. Given this DataFrame info and instruction, write ONLY the pandas Python code to apply the transformation.
 
 {_ai_data_block(df)}
 Instruction: {instruction}
@@ -7627,8 +8768,9 @@ Rules:
 - Keep it simple and safe
 - Example: df = df[df['age'] <= 100]
 
-Reply with ONLY the Python code, nothing else, no markdown, no backticks."""
-            }]
+Reply with ONLY the Python code, nothing else, no markdown, no backticks.""",
+                }
+            ],
         )
         code = message.content[0].text.strip()
         code = code.replace("```python", "").replace("```", "").strip()
@@ -7660,6 +8802,7 @@ async def ai_clean_route(request: Request, body: dict):
         return JSONResponse(status_code=401, content={"success": False, "error": "Not authenticated"})
     await _load_ai_share_for_request(request)
     import anthropic
+
     csv_preview = body.get("csv_preview", "")[:3000]
     # Private mode: only a structure summary (starts with PROFILE:) may reach the AI, never raw rows.
     if _ai_private_mode() and not csv_preview.startswith("PROFILE:"):
@@ -7678,19 +8821,17 @@ async def ai_clean_route(request: Request, body: dict):
                 model="claude-haiku-4-5",
                 max_tokens=512,
                 system=system_override,
-                messages=[{
-                    "role": "user",
-                    "content": f"Instructions: {instructions}\n\nCSV sample:\n{csv_preview}"
-                }]
+                messages=[{"role": "user", "content": f"Instructions: {instructions}\n\nCSV sample:\n{csv_preview}"}],
             )
             text = message.content[0].text.strip()
             return {"success": True, "steps": [], "explanation": text}
         message = client.messages.create(
             model="claude-haiku-4-5",
             max_tokens=512,
-            messages=[{
-                "role": "user",
-                "content": f"""You are a data cleaning assistant. Based on this CSV data and instructions, decide which cleaning steps to apply.
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"""You are a data cleaning assistant. Based on this CSV data and instructions, decide which cleaning steps to apply.
 
 CSV sample:
 {csv_preview}
@@ -7700,20 +8841,26 @@ User instruction: {instructions if instructions else 'Apply smart automatic clea
 Reply ONLY with valid JSON, no markdown, no extra text:
 {{"steps": ["remove_duplicates"], "explanation": "reason here"}}
 
-Available steps: remove_duplicates, fill_missing, standardize_text, cap_outliers, remove_empty_rows, fix_dates"""
-            }]
+Available steps: remove_duplicates, fill_missing, standardize_text, cap_outliers, remove_empty_rows, fix_dates""",
+                }
+            ],
         )
         text = message.content[0].text.strip()
         result = json.loads(text)
         return {"success": True, "steps": result.get("steps", []), "explanation": result.get("explanation", "")}
     except json.JSONDecodeError:
-        return {"success": True, "steps": ["remove_duplicates", "fill_missing"],
-                "explanation": "Applied standard cleaning"}
+        return {
+            "success": True,
+            "steps": ["remove_duplicates", "fill_missing"],
+            "explanation": "Applied standard cleaning",
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+
 # ── ALERT EMAIL PERSISTENCE ──────────────────────────────────────────────────
 ALERT_EMAILS_FILE = Path(__file__).parent / "alert_emails.json"
+
 
 def _load_alert_emails() -> dict:
     if ALERT_EMAILS_FILE.exists():
@@ -7723,8 +8870,10 @@ def _load_alert_emails() -> dict:
             return {}
     return {}
 
+
 def _save_alert_emails(data: dict):
     ALERT_EMAILS_FILE.write_text(json.dumps(data, indent=2))
+
 
 @app.post("/api/save-alert-email")
 async def save_alert_email(body: dict):
@@ -7749,6 +8898,7 @@ async def get_alert_email(source_name: str = "default"):
 # ── ALERT EMAIL PERSISTENCE ──────────────────────────────────────────────────
 ALERT_EMAILS_FILE = Path(__file__).parent / "alert_emails.json"
 
+
 def _load_alert_emails() -> dict:
     if ALERT_EMAILS_FILE.exists():
         try:
@@ -7757,8 +8907,10 @@ def _load_alert_emails() -> dict:
             return {}
     return {}
 
+
 def _save_alert_emails(data: dict):
     ALERT_EMAILS_FILE.write_text(json.dumps(data, indent=2))
+
 
 @app.post("/api/save-alert-email")
 async def save_alert_email(body: dict):
@@ -7783,20 +8935,21 @@ async def get_alert_email(source_name: str = "default"):
 @app.post("/api/mysql/write-table")
 async def mysql_write_table(body: dict):
     import asyncio, ssl as ssl_lib, io as _io
+
     try:
         import aiomysql
     except ImportError:
         return {"success": False, "error": "aiomysql not installed. Run: pip install aiomysql"}
 
-    host     = body.get("host", "").strip()
-    port     = int(body.get("port", 3306))
-    user     = body.get("user", "").strip()
+    host = body.get("host", "").strip()
+    port = int(body.get("port", 3306))
+    user = body.get("user", "").strip()
     password = body.get("password", "")
     database = body.get("database", "").strip()
-    table    = body.get("table", "").strip()
+    table = body.get("table", "").strip()
     csv_data = body.get("csvData", "")
-    mode     = body.get("mode", "replace")
-    use_ssl  = body.get("ssl", False)
+    mode = body.get("mode", "replace")
+    use_ssl = body.get("ssl", False)
 
     if not csv_data:
         return {"success": False, "error": "No CSV data provided"}
@@ -7817,8 +8970,9 @@ async def mysql_write_table(body: dict):
 
     try:
         conn = await asyncio.wait_for(
-            aiomysql.connect(host=host, port=port, user=user,
-                password=password, db=database, ssl=ssl_ctx, connect_timeout=10),
+            aiomysql.connect(
+                host=host, port=port, user=user, password=password, db=database, ssl=ssl_ctx, connect_timeout=10
+            ),
             timeout=12,
         )
         async with conn.cursor() as cur:
@@ -7827,7 +8981,7 @@ async def mysql_write_table(body: dict):
 
             col_defs = []
             for col in df.columns:
-                safe_col = col.replace('`', '').replace("'", "")[:64]
+                safe_col = col.replace("`", "").replace("'", "")[:64]
                 if pd.api.types.is_integer_dtype(df[col]):
                     col_defs.append(f"`{safe_col}` BIGINT")
                 elif pd.api.types.is_float_dtype(df[col]):
@@ -7835,10 +8989,7 @@ async def mysql_write_table(body: dict):
                 else:
                     col_defs.append(f"`{safe_col}` TEXT")
 
-            create_sql = (
-                f"CREATE TABLE IF NOT EXISTS `{dest_table}` "
-                f"({', '.join(col_defs)})"
-            )
+            create_sql = f"CREATE TABLE IF NOT EXISTS `{dest_table}` " f"({', '.join(col_defs)})"
             await cur.execute(create_sql)
 
             if mode == "replace":
@@ -7846,10 +8997,7 @@ async def mysql_write_table(body: dict):
 
             placeholders = ", ".join(["%s"] * len(df.columns))
             insert_sql = f"INSERT INTO `{dest_table}` VALUES ({placeholders})"
-            rows_to_insert = [
-                tuple(None if pd.isna(v) else str(v) for v in row)
-                for row in df.itertuples(index=False)
-            ]
+            rows_to_insert = [tuple(None if pd.isna(v) else str(v) for v in row) for row in df.itertuples(index=False)]
             if rows_to_insert:
                 await cur.executemany(insert_sql, rows_to_insert)
             await conn.commit()
@@ -7860,16 +9008,18 @@ async def mysql_write_table(body: dict):
         return {"success": False, "error": f"Connection timed out reaching {host}:{port}"}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
 @app.post("/api/postgres/health")
 async def postgres_health(body: dict):
     import asyncio, ssl as ssl_lib
 
-    host     = body.get("host", "").strip()
-    port     = int(body.get("port", 5432))
-    user     = body.get("user", "").strip()
+    host = body.get("host", "").strip()
+    port = int(body.get("port", 5432))
+    user = body.get("user", "").strip()
     password = body.get("password", "")
     database = body.get("database", "").strip()
-    use_ssl  = body.get("ssl", False)
+    use_ssl = body.get("ssl", False)
 
     agent_key = f"{database}@{host}"
     if agent_key in _agent_connections:
@@ -7892,9 +9042,13 @@ async def postgres_health(body: dict):
     try:
         conn = await asyncio.wait_for(
             asyncpg.connect(
-                host=host, port=port, user=user,
-                password=password, database=database,
-                ssl=ssl_ctx, timeout=10,
+                host=host,
+                port=port,
+                user=user,
+                password=password,
+                database=database,
+                ssl=ssl_ctx,
+                timeout=10,
             ),
             timeout=12,
         )
@@ -7904,7 +9058,7 @@ async def postgres_health(body: dict):
     except asyncio.TimeoutError:
         return {
             "healthy": False,
-            "message": f"❌ Host unreachable or port {port} is blocked.\n   → Your IP may need to be whitelisted on the server firewall.\n   → Check that port {port} is open."
+            "message": f"❌ Host unreachable or port {port} is blocked.\n   → Your IP may need to be whitelisted on the server firewall.\n   → Check that port {port} is open.",
         }
     except Exception as e:
         msg = str(e)
@@ -7927,12 +9081,12 @@ async def postgres_health(body: dict):
 async def postgres_tables(body: dict):
     import asyncio, ssl as ssl_lib
 
-    host     = body.get("host", "").strip()
-    port     = int(body.get("port", 5432))
-    user     = body.get("user", "").strip()
+    host = body.get("host", "").strip()
+    port = int(body.get("port", 5432))
+    user = body.get("user", "").strip()
     password = body.get("password", "")
     database = body.get("database", "").strip()
-    use_ssl  = body.get("ssl", False)
+    use_ssl = body.get("ssl", False)
 
     agent_key = f"{database}@{host}"
     if agent_key in _agent_connections:
@@ -7947,14 +9101,18 @@ async def postgres_tables(body: dict):
     except ImportError:
         return {"tables": [], "error": "asyncpg not installed. Run: pip install asyncpg"}
 
-    ssl_ctx  = ssl_lib.create_default_context() if use_ssl else None
+    ssl_ctx = ssl_lib.create_default_context() if use_ssl else None
 
     try:
         conn = await asyncio.wait_for(
             asyncpg.connect(
-                host=host, port=port, user=user,
-                password=password, database=database,
-                ssl=ssl_ctx, timeout=10,
+                host=host,
+                port=port,
+                user=user,
+                password=password,
+                database=database,
+                ssl=ssl_ctx,
+                timeout=10,
             ),
             timeout=12,
         )
@@ -7973,13 +9131,13 @@ async def postgres_tables(body: dict):
 async def postgres_fetch_table(body: dict):
     import asyncio, ssl as ssl_lib, io as _io
 
-    host     = body.get("host", "").strip()
-    port     = int(body.get("port", 5432))
-    user     = body.get("user", "").strip()
+    host = body.get("host", "").strip()
+    port = int(body.get("port", 5432))
+    user = body.get("user", "").strip()
     password = body.get("password", "")
     database = body.get("database", "").strip()
-    table    = body.get("table", "").strip()
-    use_ssl  = body.get("ssl", False)
+    table = body.get("table", "").strip()
+    use_ssl = body.get("ssl", False)
 
     if not all([host, user, database, table]):
         return {"error": f"Missing required fields. Got: host={host}, user={user}, database={database}, table={table}"}
@@ -7993,7 +9151,12 @@ async def postgres_fetch_table(body: dict):
             filepath = os.path.join(UPLOAD_DIR, filename)
             df.to_csv(filepath, index=False)
             print(f"✅ PostgreSQL fetch-table (via tunnel): {database}.{table} — {len(df)} rows")
-            return {"rows": len(df), "cols": len(df.columns), "download_url": f"/api/download/{filename}", "filename": filename}
+            return {
+                "rows": len(df),
+                "cols": len(df.columns),
+                "download_url": f"/api/download/{filename}",
+                "filename": filename,
+            }
         except RuntimeError as e:
             return {"error": str(e)}
 
@@ -8007,9 +9170,13 @@ async def postgres_fetch_table(body: dict):
     try:
         conn = await asyncio.wait_for(
             asyncpg.connect(
-                host=host, port=port, user=user,
-                password=password, database=database,
-                ssl=ssl_ctx, timeout=10,
+                host=host,
+                port=port,
+                user=user,
+                password=password,
+                database=database,
+                ssl=ssl_ctx,
+                timeout=10,
             ),
             timeout=12,
         )
@@ -8052,20 +9219,21 @@ async def postgres_fetch_table(body: dict):
 @app.post("/api/postgres/write-table")
 async def postgres_write_table(body: dict):
     import asyncio, ssl as ssl_lib, io as _io
+
     try:
         import asyncpg
     except ImportError:
         return {"success": False, "error": "asyncpg not installed. Run: pip install asyncpg"}
 
-    host     = body.get("host", "").strip()
-    port     = int(body.get("port", 5432))
-    user     = body.get("user", "").strip()
+    host = body.get("host", "").strip()
+    port = int(body.get("port", 5432))
+    user = body.get("user", "").strip()
     password = body.get("password", "")
     database = body.get("database", "").strip()
-    table    = body.get("table", "").strip()
+    table = body.get("table", "").strip()
     csv_data = body.get("csvData", "")
-    mode     = body.get("mode", "replace")
-    use_ssl  = body.get("ssl", False)
+    mode = body.get("mode", "replace")
+    use_ssl = body.get("ssl", False)
 
     if not csv_data:
         return {"success": False, "error": "No CSV data provided"}
@@ -8086,9 +9254,13 @@ async def postgres_write_table(body: dict):
     try:
         conn = await asyncio.wait_for(
             asyncpg.connect(
-                host=host, port=port, user=user,
-                password=password, database=database,
-                ssl=ssl_ctx, timeout=10,
+                host=host,
+                port=port,
+                user=user,
+                password=password,
+                database=database,
+                ssl=ssl_ctx,
+                timeout=10,
             ),
             timeout=12,
         )
@@ -8096,7 +9268,7 @@ async def postgres_write_table(body: dict):
         # Build column definitions
         col_defs = []
         for col in df.columns:
-            safe_col = col.replace('"', '').replace("'", "")[:63]
+            safe_col = col.replace('"', "").replace("'", "")[:63]
             if pd.api.types.is_integer_dtype(df[col]):
                 col_defs.append(f'"{safe_col}" BIGINT')
             elif pd.api.types.is_float_dtype(df[col]):
@@ -8107,10 +9279,7 @@ async def postgres_write_table(body: dict):
         if mode == "replace":
             await conn.execute(f'DROP TABLE IF EXISTS "{table}"')
 
-        create_sql = (
-            f'CREATE TABLE IF NOT EXISTS "{table}" '
-            f'({", ".join(col_defs)})'
-        )
+        create_sql = f'CREATE TABLE IF NOT EXISTS "{table}" ' f'({", ".join(col_defs)})'
         await conn.execute(create_sql)
 
         if mode == "replace":
@@ -8139,10 +9308,11 @@ async def postgres_write_table(body: dict):
 
 # ── BIGQUERY ROUTES ───────────────────────────────────────────────────────────
 
+
 @app.post("/api/bigquery/health")
 async def bigquery_health(body: dict):
     key_json = body.get("key_json", "")
-    project  = body.get("project", "").strip()
+    project = body.get("project", "").strip()
 
     agent_key = f"{project}@bigquery.googleapis.com"
     if agent_key in _agent_connections:
@@ -8156,13 +9326,17 @@ async def bigquery_health(body: dict):
         from google.cloud import bigquery as bq
         from google.oauth2 import service_account
     except ImportError:
-        return {"healthy": False, "message": "❌ google-cloud-bigquery not installed.\n   → Run: pip install google-cloud-bigquery"}
+        return {
+            "healthy": False,
+            "message": "❌ google-cloud-bigquery not installed.\n   → Run: pip install google-cloud-bigquery",
+        }
 
     if not key_json or not project:
         return {"healthy": False, "message": "❌ service account key JSON and project ID are required."}
 
     try:
         import json as _json
+
         info = _json.loads(key_json)
         creds = service_account.Credentials.from_service_account_info(
             info,
@@ -8176,7 +9350,9 @@ async def bigquery_health(body: dict):
     except Exception as e:
         msg = str(e)
         if "403" in msg or "Permission" in msg:
-            friendly = "❌ Permission denied.\n   → Make sure the service account has BigQuery Data Viewer + Job User roles."
+            friendly = (
+                "❌ Permission denied.\n   → Make sure the service account has BigQuery Data Viewer + Job User roles."
+            )
         elif "404" in msg or "not found" in msg.lower():
             friendly = f"❌ Project '{project}' not found or not accessible."
         elif "invalid_grant" in msg or "credentials" in msg.lower():
@@ -8189,8 +9365,8 @@ async def bigquery_health(body: dict):
 @app.post("/api/bigquery/tables")
 async def bigquery_tables(body: dict):
     key_json = body.get("key_json", "")
-    project  = body.get("project", "").strip()
-    dataset  = body.get("dataset", "").strip()
+    project = body.get("project", "").strip()
+    dataset = body.get("dataset", "").strip()
 
     agent_key = f"{project}@bigquery.googleapis.com"
     if agent_key in _agent_connections and dataset:
@@ -8208,6 +9384,7 @@ async def bigquery_tables(body: dict):
 
     try:
         import json as _json
+
         info = _json.loads(key_json)
         creds = service_account.Credentials.from_service_account_info(
             info,
@@ -8228,9 +9405,9 @@ async def bigquery_tables(body: dict):
 @app.post("/api/bigquery/fetch-table")
 async def bigquery_fetch_table(body: dict):
     key_json = body.get("key_json", "")
-    project  = body.get("project", "").strip()
-    dataset  = body.get("dataset", "").strip()
-    table    = body.get("table", "").strip()
+    project = body.get("project", "").strip()
+    dataset = body.get("dataset", "").strip()
+    table = body.get("table", "").strip()
 
     agent_key = f"{project}@bigquery.googleapis.com"
     if agent_key in _agent_connections and table:
@@ -8242,7 +9419,12 @@ async def bigquery_fetch_table(body: dict):
             filepath = os.path.join(UPLOAD_DIR, filename)
             df.to_csv(filepath, index=False)
             print(f"✅ BigQuery fetch-table (via tunnel): {project}.{dataset}.{table} — {len(df)} rows")
-            return {"rows": len(df), "cols": len(df.columns), "download_url": f"/api/download/{filename}", "filename": filename}
+            return {
+                "rows": len(df),
+                "cols": len(df.columns),
+                "download_url": f"/api/download/{filename}",
+                "filename": filename,
+            }
         except RuntimeError as e:
             return {"error": str(e)}
 
@@ -8257,6 +9439,7 @@ async def bigquery_fetch_table(body: dict):
 
     try:
         import json as _json
+
         info = _json.loads(key_json)
         creds = service_account.Credentials.from_service_account_info(
             info,
@@ -8291,14 +9474,17 @@ async def bigquery_write_table(body: dict):
         from google.oauth2 import service_account
         from google.api_core.exceptions import NotFound
     except ImportError:
-        return {"success": False, "error": "google-cloud-bigquery not installed. Run: pip install google-cloud-bigquery"}
+        return {
+            "success": False,
+            "error": "google-cloud-bigquery not installed. Run: pip install google-cloud-bigquery",
+        }
 
     key_json = body.get("key_json", "")
-    project  = body.get("project", "").strip()
-    dataset  = body.get("dataset", "").strip()
-    table    = body.get("table", "").strip()
+    project = body.get("project", "").strip()
+    dataset = body.get("dataset", "").strip()
+    table = body.get("table", "").strip()
     csv_data = body.get("csvData", "")
-    mode     = body.get("mode", "replace")
+    mode = body.get("mode", "replace")
 
     if not csv_data:
         return {"success": False, "error": "No CSV data provided"}
@@ -8310,6 +9496,7 @@ async def bigquery_write_table(body: dict):
         return rl
 
     import io as _io
+
     try:
         df = pd.read_csv(_io.StringIO(csv_data))
     except Exception as e:
@@ -8317,6 +9504,7 @@ async def bigquery_write_table(body: dict):
 
     try:
         import json as _json
+
         info = _json.loads(key_json)
         creds = service_account.Credentials.from_service_account_info(
             info,
@@ -8339,26 +9527,33 @@ async def bigquery_write_table(body: dict):
 
         # ── AWS ROUTES ─────────────────────────────────────────────────────────────────
 
+
 # ── CLOUD SQL ROUTES (delegate to mysql/postgres handlers) ────────────────────
 def _csql_payload(body: dict) -> dict:
     return {
         "host": body.get("instanceConnectionName", ""),
         "port": body.get("port") or (3306 if body.get("dbType") == "mysql" else 5432),
-        "user": body.get("user", ""), "password": body.get("password", ""),
-        "database": body.get("database", ""), "ssl": True,
+        "user": body.get("user", ""),
+        "password": body.get("password", ""),
+        "database": body.get("database", ""),
+        "ssl": True,
     }
+
 
 @app.post("/api/cloudsql/health")
 async def cloudsql_health(body: dict):
     fn = mysql_health if body.get("dbType") == "mysql" else postgres_health
     return await fn(_csql_payload(body))
 
+
 @app.post("/api/cloudsql/tables")
 async def cloudsql_tables(body: dict):
     fn = mysql_tables if body.get("dbType") == "mysql" else postgres_tables
     return await fn(_csql_payload(body))
 
+
 # ── GOOGLE CLOUD STORAGE (GCS) ROUTES ─────────────────────────────────────────
+
 
 @app.post("/api/gcs/health")
 async def gcs_health(body: dict):
@@ -8366,11 +9561,14 @@ async def gcs_health(body: dict):
         from google.cloud import storage as gcs_lib
         from google.oauth2 import service_account
     except ImportError:
-        return {"healthy": False, "message": "❌ google-cloud-storage not installed.\n   → Run: pip install google-cloud-storage"}
+        return {
+            "healthy": False,
+            "message": "❌ google-cloud-storage not installed.\n   → Run: pip install google-cloud-storage",
+        }
 
     key_json = body.get("key_json", "")
-    project  = body.get("project", "").strip()
-    bucket   = body.get("bucket", "").strip()
+    project = body.get("project", "").strip()
+    bucket = body.get("bucket", "").strip()
 
     if not key_json or not project or not bucket:
         return {"healthy": False, "message": "❌ Service account key JSON, project, and bucket are all required."}
@@ -8408,9 +9606,9 @@ async def gcs_list_files(body: dict):
         return {"files": [], "error": "google-cloud-storage not installed"}
 
     key_json = body.get("key_json", "")
-    project  = body.get("project", "").strip()
-    bucket   = body.get("bucket", "").strip()
-    prefix   = body.get("prefix", "").strip()
+    project = body.get("project", "").strip()
+    bucket = body.get("bucket", "").strip()
+    prefix = body.get("prefix", "").strip()
 
     try:
         info = json.loads(key_json)
@@ -8420,7 +9618,7 @@ async def gcs_list_files(body: dict):
         )
         client = gcs_lib.Client(project=project, credentials=creds)
         blobs = client.list_blobs(bucket, prefix=prefix or None)
-        files = [b.name for b in blobs if b.name.lower().endswith(('.csv', '.tsv')) ][:100]
+        files = [b.name for b in blobs if b.name.lower().endswith((".csv", ".tsv"))][:100]
         return {"files": files}
     except Exception as e:
         return {"files": [], "error": str(e)}
@@ -8435,8 +9633,8 @@ async def gcs_fetch_file(body: dict):
         return {"error": "google-cloud-storage not installed. Run: pip install google-cloud-storage"}
 
     key_json = body.get("key_json", "")
-    project  = body.get("project", "").strip()
-    bucket   = body.get("bucket", "").strip()
+    project = body.get("project", "").strip()
+    bucket = body.get("bucket", "").strip()
     file_path = body.get("file", "").strip()
 
     if not all([key_json, project, bucket, file_path]):
@@ -8470,7 +9668,9 @@ async def gcs_fetch_file(body: dict):
     except Exception as e:
         err_str = str(e)
         if "403" in err_str or "Permission" in err_str:
-            return {"error": f"Permission denied reading '{file_path}' from bucket '{bucket}'. Check service account roles."}
+            return {
+                "error": f"Permission denied reading '{file_path}' from bucket '{bucket}'. Check service account roles."
+            }
         if "404" in err_str or "not found" in err_str.lower():
             return {"error": f"File '{file_path}' not found in bucket '{bucket}'."}
         return {"error": err_str}
@@ -8485,11 +9685,11 @@ async def gcs_write_file(body: dict):
         return {"success": False, "error": "google-cloud-storage not installed. Run: pip install google-cloud-storage"}
 
     key_json = body.get("key_json", "")
-    project  = body.get("project", "").strip()
-    bucket   = body.get("bucket", "").strip()
+    project = body.get("project", "").strip()
+    bucket = body.get("bucket", "").strip()
     file_path = body.get("file", "").strip()
-    csv_data  = body.get("csvData", "")
-    mode      = body.get("mode", "replace")
+    csv_data = body.get("csvData", "")
+    mode = body.get("mode", "replace")
 
     if not csv_data:
         return {"success": False, "error": "No CSV data provided"}
@@ -8531,17 +9731,21 @@ async def gcs_write_file(body: dict):
     except Exception as e:
         err_str = str(e)
         if "403" in err_str or "Permission" in err_str:
-            return {"success": False, "error": f"Permission denied writing to '{file_path}' in bucket '{bucket}'. Grant Storage Object Admin."}
+            return {
+                "success": False,
+                "error": f"Permission denied writing to '{file_path}' in bucket '{bucket}'. Grant Storage Object Admin.",
+            }
         return {"success": False, "error": err_str}
 
 
 # ── DATABRICKS ROUTES ─────────────────────────────────────────────────────────
 
+
 @app.post("/api/databricks/health")
 async def databricks_health(body: dict):
-    host      = body.get("host", "").strip()
+    host = body.get("host", "").strip()
     http_path = body.get("httpPath", "").strip()
-    token     = body.get("token", "").strip()
+    token = body.get("token", "").strip()
 
     if not all([host, http_path, token]):
         return {"healthy": False, "message": "❌ host, httpPath, and token are all required."}
@@ -8561,16 +9765,21 @@ async def databricks_health(body: dict):
     try:
         from databricks import sql as databricks_sql
     except ImportError:
-        return {"healthy": False, "message": "❌ databricks-sql-connector not installed.\n   → Run: pip install databricks-sql-connector"}
+        return {
+            "healthy": False,
+            "message": "❌ databricks-sql-connector not installed.\n   → Run: pip install databricks-sql-connector",
+        }
 
     try:
         loop = asyncio.get_event_loop()
+
         def _check():
             conn = databricks_sql.connect(server_hostname=host, http_path=http_path, access_token=token)
             cursor = conn.cursor()
             cursor.execute("SELECT 1")
             cursor.close()
             conn.close()
+
         await loop.run_in_executor(None, _check)
         return {"healthy": True, "message": "✅ Databricks connection healthy."}
     except Exception as e:
@@ -8586,10 +9795,10 @@ async def databricks_health(body: dict):
 
 @app.post("/api/databricks/tables")
 async def databricks_tables(body: dict):
-    host      = body.get("host", "").strip()
+    host = body.get("host", "").strip()
     http_path = body.get("httpPath", "").strip()
-    token     = body.get("token", "").strip()
-    schema    = body.get("schema", "default").strip()
+    token = body.get("token", "").strip()
+    schema = body.get("schema", "default").strip()
 
     for key in _agent_connections:
         if key.endswith(f"@{host}"):
@@ -8606,6 +9815,7 @@ async def databricks_tables(body: dict):
 
     try:
         loop = asyncio.get_event_loop()
+
         def _list():
             conn = databricks_sql.connect(server_hostname=host, http_path=http_path, access_token=token)
             cursor = conn.cursor()
@@ -8614,6 +9824,7 @@ async def databricks_tables(body: dict):
             cursor.close()
             conn.close()
             return tables
+
         tables = await loop.run_in_executor(None, _list)
         return {"tables": tables}
     except Exception as e:
@@ -8622,12 +9833,12 @@ async def databricks_tables(body: dict):
 
 @app.post("/api/databricks/fetch-table")
 async def databricks_fetch_table(body: dict):
-    host      = body.get("host", "").strip()
+    host = body.get("host", "").strip()
     http_path = body.get("httpPath", "").strip()
-    token     = body.get("token", "").strip()
-    catalog   = body.get("catalog", "hive_metastore").strip()
-    schema    = body.get("schema", "default").strip()
-    table     = body.get("table", "").strip()
+    token = body.get("token", "").strip()
+    catalog = body.get("catalog", "hive_metastore").strip()
+    schema = body.get("schema", "default").strip()
+    table = body.get("table", "").strip()
 
     if not table:
         return {"error": "table is required"}
@@ -8642,7 +9853,12 @@ async def databricks_fetch_table(body: dict):
                 filepath = os.path.join(UPLOAD_DIR, filename)
                 df.to_csv(filepath, index=False)
                 print(f" Databricks fetch-table (via tunnel): {schema}.{table} — {len(df)} rows")
-                return {"rows": len(df), "cols": len(df.columns), "download_url": f"/api/download/{filename}", "filename": filename}
+                return {
+                    "rows": len(df),
+                    "cols": len(df.columns),
+                    "download_url": f"/api/download/{filename}",
+                    "filename": filename,
+                }
             except RuntimeError as e:
                 return {"error": str(e)}
 
@@ -8653,6 +9869,7 @@ async def databricks_fetch_table(body: dict):
 
     try:
         loop = asyncio.get_event_loop()
+
         def _fetch():
             conn = databricks_sql.connect(server_hostname=host, http_path=http_path, access_token=token)
             cursor = conn.cursor()
@@ -8664,6 +9881,7 @@ async def databricks_fetch_table(body: dict):
             cursor.close()
             conn.close()
             return rows, db_total_rows
+
         rows, db_total_rows = await loop.run_in_executor(None, _fetch)
         df = pd.DataFrame(rows)
         db_truncated = db_total_rows > len(df)
@@ -8682,22 +9900,27 @@ async def databricks_fetch_table(body: dict):
     except Exception as e:
         return {"error": str(e)}
 
+
 @app.post("/api/databricks/write-table")
 async def databricks_write_table(body: dict):
     import io as _io
+
     try:
         from databricks import sql as databricks_sql
     except ImportError:
-        return {"success": False, "error": "databricks-sql-connector not installed. Run: pip install databricks-sql-connector"}
+        return {
+            "success": False,
+            "error": "databricks-sql-connector not installed. Run: pip install databricks-sql-connector",
+        }
 
-    host      = body.get("host", "").strip()
+    host = body.get("host", "").strip()
     http_path = body.get("httpPath", "").strip()
-    token     = body.get("token", "").strip()
-    catalog   = body.get("catalog", "hive_metastore").strip()
-    schema    = body.get("schema", "default").strip()
-    table     = body.get("table", "").strip()
-    csv_data  = body.get("csvData", "")
-    mode      = body.get("mode", "replace")
+    token = body.get("token", "").strip()
+    catalog = body.get("catalog", "hive_metastore").strip()
+    schema = body.get("schema", "default").strip()
+    table = body.get("table", "").strip()
+    csv_data = body.get("csvData", "")
+    mode = body.get("mode", "replace")
 
     if not csv_data:
         return {"success": False, "error": "No CSV data provided"}
@@ -8717,6 +9940,7 @@ async def databricks_write_table(body: dict):
 
     try:
         loop = asyncio.get_event_loop()
+
         def _write():
             conn = databricks_sql.connect(server_hostname=host, http_path=http_path, access_token=token)
             cursor = conn.cursor()
@@ -8726,7 +9950,7 @@ async def databricks_write_table(body: dict):
 
             col_defs = []
             for col in df.columns:
-                safe_col = col.replace('`', '').replace(' ', '_')[:255]
+                safe_col = col.replace("`", "").replace(" ", "_")[:255]
                 if pd.api.types.is_integer_dtype(df[col]):
                     col_defs.append(f"`{safe_col}` BIGINT")
                 elif pd.api.types.is_float_dtype(df[col]):
@@ -8741,10 +9965,7 @@ async def databricks_write_table(body: dict):
 
             placeholders = ", ".join(["?"] * len(df.columns))
             insert_sql = f"INSERT INTO {full_table} VALUES ({placeholders})"
-            rows_to_insert = [
-                tuple(None if pd.isna(v) else str(v) for v in row)
-                for row in df.itertuples(index=False)
-            ]
+            rows_to_insert = [tuple(None if pd.isna(v) else str(v) for v in row) for row in df.itertuples(index=False)]
             for row in rows_to_insert:
                 cursor.execute(insert_sql, row)
 
@@ -8758,7 +9979,9 @@ async def databricks_write_table(body: dict):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+
 # ── REST API ROUTES ───────────────────────────────────────────────────────────
+
 
 @app.post("/api/rest/health")
 async def rest_health(body: dict):
@@ -8767,10 +9990,10 @@ async def rest_health(body: dict):
     except ImportError:
         return {"healthy": False, "message": "❌ aiohttp not installed.\n   → Run: pip install aiohttp"}
 
-    base_url    = body.get("base_url", "").strip()
-    headers     = body.get("headers", {})
-    verify_ssl  = body.get("verify_ssl", True)
-    test_path   = body.get("test_path", "/").strip()
+    base_url = body.get("base_url", "").strip()
+    headers = body.get("headers", {})
+    verify_ssl = body.get("verify_ssl", True)
+    test_path = body.get("test_path", "/").strip()
     timeout_val = int(body.get("timeout", 10))
 
     if not base_url:
@@ -8813,17 +10036,26 @@ async def rest_health(body: dict):
     except aiohttp_lib.ClientConnectorError as e:
         return {"healthy": False, "message": f"❌ Cannot connect: {str(e)}\n   → Check the URL and network access."}
     except aiohttp_lib.ClientSSLError as e:
-        return {"healthy": False, "message": f"❌ SSL error: {str(e)}\n   → Try disabling SSL verification for self-signed certs."}
+        return {
+            "healthy": False,
+            "message": f"❌ SSL error: {str(e)}\n   → Try disabling SSL verification for self-signed certs.",
+        }
     except aiohttp_lib.ClientResponseError as e:
         if e.status in (401, 403):
-            return {"healthy": False, "message": f"❌ HTTP {e.status} — Authentication failed.\n   → Check your API key / token."}
+            return {
+                "healthy": False,
+                "message": f"❌ HTTP {e.status} — Authentication failed.\n   → Check your API key / token.",
+            }
         return {"healthy": False, "message": f"❌ HTTP {e.status}: {str(e)}"}
     except Exception as e:
         msg = str(e)
         if "Name or service not known" in msg or "getaddrinfo" in msg:
             return {"healthy": False, "message": "❌ Host not found.\n   → Check URL for typos."}
         if "timed out" in msg.lower() or "timeout" in msg.lower():
-            return {"healthy": False, "message": f"❌ Request timed out after {timeout_val}s.\n   → Try increasing timeout or check network."}
+            return {
+                "healthy": False,
+                "message": f"❌ Request timed out after {timeout_val}s.\n   → Try increasing timeout or check network.",
+            }
         return {"healthy": False, "message": f"❌ {msg}"}
 
 
@@ -8835,11 +10067,11 @@ async def rest_endpoints(body: dict):
     except ImportError:
         return {"endpoints": [], "error": "aiohttp not installed. Run: pip install aiohttp"}
 
-    base_url    = body.get("base_url", "").strip()
-    headers     = body.get("headers", {})
-    verify_ssl  = body.get("verify_ssl", True)
+    base_url = body.get("base_url", "").strip()
+    headers = body.get("headers", {})
+    verify_ssl = body.get("verify_ssl", True)
     timeout_val = int(body.get("timeout", 10))
-    endpoints   = body.get("endpoints", [])
+    endpoints = body.get("endpoints", [])
 
     if not base_url:
         return {"endpoints": [], "error": "Base URL is required."}
@@ -8865,12 +10097,14 @@ async def rest_endpoints(body: dict):
                     ssl=verify_ssl,
                 ) as response:
                     status = response.status
-                    results.append({
-                        "endpoint": ep,
-                        "url": url,
-                        "status": status,
-                        "ok": status < 400,
-                    })
+                    results.append(
+                        {
+                            "endpoint": ep,
+                            "url": url,
+                            "status": status,
+                            "ok": status < 400,
+                        }
+                    )
             except Exception as e:
                 results.append({"endpoint": ep, "url": url, "status": 0, "ok": False, "error": str(e)})
 
@@ -8885,20 +10119,20 @@ async def rest_fetch_endpoint(body: dict):
     except ImportError:
         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
 
-    base_url      = body.get("base_url", "").strip()
-    endpoint      = body.get("endpoint", body.get("table", "/")).strip()
-    headers       = body.get("headers", {})
-    method        = body.get("method", "GET").upper()
-    query_params  = body.get("query_params", {})
-    request_body  = body.get("request_body", None)
-    verify_ssl    = body.get("verify_ssl", True)
-    timeout_val   = int(body.get("timeout", 30))
-    data_path     = body.get("data_path", "")  # e.g. "data.results" to dig into nested JSON
-    pagination    = body.get("pagination", False)
-    page_param    = body.get("page_param", "page")
+    base_url = body.get("base_url", "").strip()
+    endpoint = body.get("endpoint", body.get("table", "/")).strip()
+    headers = body.get("headers", {})
+    method = body.get("method", "GET").upper()
+    query_params = body.get("query_params", {})
+    request_body = body.get("request_body", None)
+    verify_ssl = body.get("verify_ssl", True)
+    timeout_val = int(body.get("timeout", 30))
+    data_path = body.get("data_path", "")  # e.g. "data.results" to dig into nested JSON
+    pagination = body.get("pagination", False)
+    page_param = body.get("page_param", "page")
     page_size_param = body.get("page_size_param", "per_page")
-    page_size     = int(body.get("page_size", 100))
-    max_pages     = int(body.get("max_pages", 10))
+    page_size = int(body.get("page_size", 100))
+    max_pages = int(body.get("max_pages", 10))
 
     if not base_url and not endpoint.startswith("http"):
         return {"error": "Base URL is required."}
@@ -8912,11 +10146,20 @@ async def rest_fetch_endpoint(body: dict):
             request_id = _secrets.token_hex(16)
             future = asyncio.get_event_loop().create_future()
             _pending_queries[request_id] = future
-            await _agent_connections[agent_key]["websocket"].send_text(json.dumps({
-                "type": "query", "request_id": request_id, "endpoint": url,
-                "method": method, "headers": headers, "params": query_params,
-                "body": request_body, "timeout": timeout_val,
-            }))
+            await _agent_connections[agent_key]["websocket"].send_text(
+                json.dumps(
+                    {
+                        "type": "query",
+                        "request_id": request_id,
+                        "endpoint": url,
+                        "method": method,
+                        "headers": headers,
+                        "params": query_params,
+                        "body": request_body,
+                        "timeout": timeout_val,
+                    }
+                )
+            )
             result = await asyncio.wait_for(future, timeout=timeout_val + 5)
             if "error" in result:
                 return {"error": result["error"]}
@@ -8928,7 +10171,14 @@ async def rest_fetch_endpoint(body: dict):
             filepath_agent = os.path.join(UPLOAD_DIR, filename_agent)
             df_agent.to_csv(filepath_agent, index=False)
             print(f"✅ REST API fetch (via tunnel): {url} — {len(df_agent)} rows")
-            return {"rows": len(df_agent), "cols": len(df_agent.columns), "download_url": f"/api/download/{filename_agent}", "filename": filename_agent, "endpoint": endpoint, "url": url}
+            return {
+                "rows": len(df_agent),
+                "cols": len(df_agent.columns),
+                "download_url": f"/api/download/{filename_agent}",
+                "filename": filename_agent,
+                "endpoint": endpoint,
+                "url": url,
+            }
         except Exception as e:
             return {"error": str(e)}
 
@@ -9009,6 +10259,7 @@ async def rest_fetch_endpoint(body: dict):
                             # Try CSV
                             if "\n" in text and "," in text:
                                 import io as _io
+
                                 try:
                                     df_csv = pd.read_csv(_io.StringIO(text))
                                     all_rows = df_csv.to_dict("records")
@@ -9071,15 +10322,15 @@ async def rest_write_endpoint(body: dict):
     except ImportError:
         return {"success": False, "error": "aiohttp not installed. Run: pip install aiohttp"}
 
-    base_url     = body.get("base_url", "").strip()
-    endpoint     = body.get("endpoint", body.get("table", "/")).strip()
-    headers_in   = body.get("headers", {})
-    method       = body.get("method", "POST").upper()
-    verify_ssl   = body.get("verify_ssl", True)
-    timeout_val  = int(body.get("timeout", 30))
-    csv_data     = body.get("csvData", "")
-    mode         = body.get("mode", "replace")
-    send_as      = body.get("send_as", "json")  # "json" or "csv"
+    base_url = body.get("base_url", "").strip()
+    endpoint = body.get("endpoint", body.get("table", "/")).strip()
+    headers_in = body.get("headers", {})
+    method = body.get("method", "POST").upper()
+    verify_ssl = body.get("verify_ssl", True)
+    timeout_val = int(body.get("timeout", 30))
+    csv_data = body.get("csvData", "")
+    mode = body.get("mode", "replace")
+    send_as = body.get("send_as", "json")  # "json" or "csv"
 
     if not csv_data:
         return {"success": False, "error": "No CSV data provided"}
@@ -9088,6 +10339,7 @@ async def rest_write_endpoint(body: dict):
 
     try:
         import io as _io
+
         df = pd.read_csv(_io.StringIO(csv_data))
     except Exception as e:
         return {"success": False, "error": f"Could not parse CSV: {e}"}
@@ -9130,15 +10382,16 @@ async def rest_write_endpoint(body: dict):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+
 @app.post("/api/aws/cost-explorer")
 async def aws_cost_explorer(body: dict):
-    access_key_id   = body.get("accessKeyId", "").strip()
-    secret_key      = body.get("secretAccessKey", "").strip()
-    region          = body.get("region", "us-east-1").strip()
-    start_date      = body.get("startDate", "").strip()
-    end_date        = body.get("endDate", "").strip()
-    granularity     = body.get("granularity", "MONTHLY").strip().upper()
-    group_by_key    = body.get("groupBy", "SERVICE").strip().upper()
+    access_key_id = body.get("accessKeyId", "").strip()
+    secret_key = body.get("secretAccessKey", "").strip()
+    region = body.get("region", "us-east-1").strip()
+    start_date = body.get("startDate", "").strip()
+    end_date = body.get("endDate", "").strip()
+    granularity = body.get("granularity", "MONTHLY").strip().upper()
+    group_by_key = body.get("groupBy", "SERVICE").strip().upper()
 
     if not all([access_key_id, secret_key, start_date, end_date]):
         return {"error": "accessKeyId, secretAccessKey, startDate, and endDate are all required."}
@@ -9185,37 +10438,43 @@ async def aws_cost_explorer(body: dict):
         rows = []
         for period in all_results:
             time_start = period["TimePeriod"]["Start"]
-            time_end   = period["TimePeriod"]["End"]
+            time_end = period["TimePeriod"]["End"]
             if period.get("Groups"):
                 for group in period["Groups"]:
                     key_val = group["Keys"][0] if group.get("Keys") else ""
-                    cost    = group["Metrics"].get("UnblendedCost", {}).get("Amount", "0")
-                    unit    = group["Metrics"].get("UnblendedCost", {}).get("Unit", "USD")
-                    usage   = group["Metrics"].get("UsageQuantity", {}).get("Amount", "0")
-                    rows.append({
-                        "start_date":    time_start,
-                        "end_date":      time_end,
-                        group_by_key.lower(): key_val,
-                        "cost_amount":   round(float(cost), 6),
-                        "cost_unit":     unit,
-                        "usage_quantity": round(float(usage), 6),
-                    })
+                    cost = group["Metrics"].get("UnblendedCost", {}).get("Amount", "0")
+                    unit = group["Metrics"].get("UnblendedCost", {}).get("Unit", "USD")
+                    usage = group["Metrics"].get("UsageQuantity", {}).get("Amount", "0")
+                    rows.append(
+                        {
+                            "start_date": time_start,
+                            "end_date": time_end,
+                            group_by_key.lower(): key_val,
+                            "cost_amount": round(float(cost), 6),
+                            "cost_unit": unit,
+                            "usage_quantity": round(float(usage), 6),
+                        }
+                    )
             else:
                 total = period.get("Total", {})
-                cost  = total.get("UnblendedCost", {}).get("Amount", "0")
-                unit  = total.get("UnblendedCost", {}).get("Unit", "USD")
+                cost = total.get("UnblendedCost", {}).get("Amount", "0")
+                unit = total.get("UnblendedCost", {}).get("Unit", "USD")
                 usage = total.get("UsageQuantity", {}).get("Amount", "0")
-                rows.append({
-                    "start_date":    time_start,
-                    "end_date":      time_end,
-                    group_by_key.lower(): "TOTAL",
-                    "cost_amount":   round(float(cost), 6),
-                    "cost_unit":     unit,
-                    "usage_quantity": round(float(usage), 6),
-                })
+                rows.append(
+                    {
+                        "start_date": time_start,
+                        "end_date": time_end,
+                        group_by_key.lower(): "TOTAL",
+                        "cost_amount": round(float(cost), 6),
+                        "cost_unit": unit,
+                        "usage_quantity": round(float(usage), 6),
+                    }
+                )
 
         if not rows:
-            return {"error": "No cost data found for the selected date range. Check that costs exist for this period in your AWS account."}
+            return {
+                "error": "No cost data found for the selected date range. Check that costs exist for this period in your AWS account."
+            }
 
         return {"rows": rows, "row_count": len(rows)}
 
@@ -9223,13 +10482,19 @@ async def aws_cost_explorer(body: dict):
         return {"error": "❌ Invalid AWS credentials.\n   → Check your Access Key ID and Secret Access Key."}
     except ClientError as e:
         code = e.response["Error"]["Code"]
-        msg  = e.response["Error"]["Message"]
+        msg = e.response["Error"]["Message"]
         if code in ("AccessDeniedException", "AuthorizationError"):
-            return {"error": f"❌ Access denied.\n   → Attach a policy with ce:GetCostAndUsage to your IAM user.\n   → {msg}"}
+            return {
+                "error": f"❌ Access denied.\n   → Attach a policy with ce:GetCostAndUsage to your IAM user.\n   → {msg}"
+            }
         elif code == "InvalidParameterException":
-            return {"error": f"❌ Invalid parameter: {msg}\n   → Check that your start/end dates are in YYYY-MM-DD format and start < end."}
+            return {
+                "error": f"❌ Invalid parameter: {msg}\n   → Check that your start/end dates are in YYYY-MM-DD format and start < end."
+            }
         elif "DataUnavailableException" in code:
-            return {"error": "❌ Cost data not available for this period.\n   → Cost Explorer must be enabled in your AWS account (Billing → Cost Explorer → Enable)."}
+            return {
+                "error": "❌ Cost data not available for this period.\n   → Cost Explorer must be enabled in your AWS account (Billing → Cost Explorer → Enable)."
+            }
         return {"error": f"❌ AWS error ({code}): {msg}"}
     except Exception as e:
         return {"error": f"❌ {str(e)}"}
@@ -9237,10 +10502,10 @@ async def aws_cost_explorer(body: dict):
 
 @app.post("/api/aws/health")
 async def aws_health(body: dict):
-    service         = body.get("service", "rds-mysql")
-    region          = body.get("region", "us-east-1")
-    access_key_id   = body.get("accessKeyId", "").strip()
-    secret_key      = body.get("secretAccessKey", "").strip()
+    service = body.get("service", "rds-mysql")
+    region = body.get("region", "us-east-1")
+    access_key_id = body.get("accessKeyId", "").strip()
+    secret_key = body.get("secretAccessKey", "").strip()
 
     if not access_key_id or not secret_key:
         return {"healthy": False, "message": "❌ AWS Access Key ID and Secret Access Key are required."}
@@ -9248,12 +10513,12 @@ async def aws_health(body: dict):
     import asyncio, ssl as ssl_lib
 
     if service in ("rds-mysql", "rds-postgres", "redshift"):
-        host     = body.get("host", "").strip()
+        host = body.get("host", "").strip()
         port_raw = body.get("port", "")
-        user     = body.get("user", "").strip()
+        user = body.get("user", "").strip()
         password = body.get("password", "")
         database = body.get("database", "").strip()
-        use_ssl  = body.get("ssl", True)
+        use_ssl = body.get("ssl", True)
 
         if not all([host, user, database]):
             return {"healthy": False, "message": "❌ host, user, and database are required."}
@@ -9279,8 +10544,9 @@ async def aws_health(body: dict):
                 return {"healthy": False, "message": "❌ aiomysql not installed. Run: pip install aiomysql"}
             try:
                 conn = await asyncio.wait_for(
-                    aiomysql.connect(host=host, port=port, user=user,
-                        password=password, db=database, ssl=ssl_ctx, connect_timeout=10),
+                    aiomysql.connect(
+                        host=host, port=port, user=user, password=password, db=database, ssl=ssl_ctx, connect_timeout=10
+                    ),
                     timeout=12,
                 )
                 async with conn.cursor() as cur:
@@ -9297,8 +10563,9 @@ async def aws_health(body: dict):
                 return {"healthy": False, "message": "❌ asyncpg not installed. Run: pip install asyncpg"}
             try:
                 conn = await asyncio.wait_for(
-                    asyncpg.connect(host=host, port=port, user=user,
-                        password=password, database=database, ssl=ssl_ctx, timeout=10),
+                    asyncpg.connect(
+                        host=host, port=port, user=user, password=password, database=database, ssl=ssl_ctx, timeout=10
+                    ),
                     timeout=12,
                 )
                 await conn.fetchval("SELECT 1")
@@ -9318,9 +10585,9 @@ async def aws_health(body: dict):
         except ImportError:
             return {"healthy": False, "message": "❌ boto3 not installed. Run: pip install boto3"}
         try:
-            s3 = boto3.client("s3", region_name=region,
-                aws_access_key_id=access_key_id,
-                aws_secret_access_key=secret_key)
+            s3 = boto3.client(
+                "s3", region_name=region, aws_access_key_id=access_key_id, aws_secret_access_key=secret_key
+            )
             s3.head_bucket(Bucket=bucket)
             return {"healthy": True, "message": f"✅ AWS S3 bucket '{bucket}' accessible."}
         except ClientError as e:
@@ -9345,9 +10612,9 @@ async def aws_health(body: dict):
         except ImportError:
             return {"healthy": False, "message": "❌ boto3 not installed. Run: pip install boto3"}
         try:
-            dynamo = boto3.client("dynamodb", region_name=region,
-                aws_access_key_id=access_key_id,
-                aws_secret_access_key=secret_key)
+            dynamo = boto3.client(
+                "dynamodb", region_name=region, aws_access_key_id=access_key_id, aws_secret_access_key=secret_key
+            )
             dynamo.describe_table(TableName=table_name)
             return {"healthy": True, "message": f"✅ DynamoDB table '{table_name}' accessible."}
         except ClientError as e:
@@ -9364,7 +10631,7 @@ async def aws_health(body: dict):
 
     elif service == "cost-explorer":
         start_date = body.get("costStartDate", "")
-        end_date   = body.get("costEndDate", "")
+        end_date = body.get("costEndDate", "")
         if not start_date or not end_date:
             return {"healthy": False, "message": "❌ Start date and end date are required."}
         try:
@@ -9380,8 +10647,10 @@ async def aws_health(body: dict):
                 aws_secret_access_key=secret_key,
             )
             # Lightweight check: just get the first day's data
-            check_end = start_date[:-2] + str(int(start_date[-2:]) + 1).zfill(2) if start_date[-2:] != "28" else (
-                start_date[:8] + "02" if start_date[5:7] != "12" else str(int(start_date[:4]) + 1) + "-01-02"
+            check_end = (
+                start_date[:-2] + str(int(start_date[-2:]) + 1).zfill(2)
+                if start_date[-2:] != "28"
+                else (start_date[:8] + "02" if start_date[5:7] != "12" else str(int(start_date[:4]) + 1) + "-01-02")
             )
             ce.get_cost_and_usage(
                 TimePeriod={"Start": start_date, "End": end_date},
@@ -9392,14 +10661,20 @@ async def aws_health(body: dict):
         except ClientError as e:
             code = e.response["Error"]["Code"]
             if code in ("AccessDeniedException", "AuthFailure"):
-                return {"healthy": False, "message": "❌ Access denied.\n   → Add AWSBillingReadOnlyAccess or ce:GetCostAndUsage to your IAM user.\n   → Also make sure Cost Explorer is enabled in your AWS Billing Console."}
+                return {
+                    "healthy": False,
+                    "message": "❌ Access denied.\n   → Add AWSBillingReadOnlyAccess or ce:GetCostAndUsage to your IAM user.\n   → Also make sure Cost Explorer is enabled in your AWS Billing Console.",
+                }
             return {"healthy": False, "message": f"❌ {e.response['Error']['Message']}"}
         except NoCredentialsError:
             return {"healthy": False, "message": "❌ Invalid AWS credentials."}
         except Exception as e:
             msg = str(e)
             if "OptInRequired" in msg or "not subscribed" in msg.lower():
-                return {"healthy": False, "message": "❌ Cost Explorer not enabled.\n   → Go to AWS Console → Billing → Cost Explorer → click 'Enable Cost Explorer'."}
+                return {
+                    "healthy": False,
+                    "message": "❌ Cost Explorer not enabled.\n   → Go to AWS Console → Billing → Cost Explorer → click 'Enable Cost Explorer'.",
+                }
             return {"healthy": False, "message": f"❌ {msg}"}
 
     return {"healthy": False, "message": f"❌ Unknown service: {service}"}
@@ -9407,26 +10682,28 @@ async def aws_health(body: dict):
 
 @app.post("/api/aws/tables")
 async def aws_tables(body: dict):
-    service       = body.get("service", "rds-mysql")
-    region        = body.get("region", "us-east-1")
+    service = body.get("service", "rds-mysql")
+    region = body.get("region", "us-east-1")
     access_key_id = body.get("accessKeyId", "").strip()
-    secret_key    = body.get("secretAccessKey", "").strip()
+    secret_key = body.get("secretAccessKey", "").strip()
 
     import asyncio, ssl as ssl_lib
 
     if service == "rds-mysql":
-        host     = body.get("host", "").strip()
-        port     = int(body.get("port", 3306))
-        user     = body.get("user", "").strip()
+        host = body.get("host", "").strip()
+        port = int(body.get("port", 3306))
+        user = body.get("user", "").strip()
         password = body.get("password", "")
         database = body.get("database", "").strip()
-        use_ssl  = body.get("ssl", True)
-        ssl_ctx  = ssl_lib.create_default_context() if use_ssl else None
+        use_ssl = body.get("ssl", True)
+        ssl_ctx = ssl_lib.create_default_context() if use_ssl else None
         try:
             import aiomysql
+
             conn = await asyncio.wait_for(
-                aiomysql.connect(host=host, port=port, user=user,
-                    password=password, db=database, ssl=ssl_ctx, connect_timeout=10),
+                aiomysql.connect(
+                    host=host, port=port, user=user, password=password, db=database, ssl=ssl_ctx, connect_timeout=10
+                ),
                 timeout=12,
             )
             async with conn.cursor() as cur:
@@ -9438,12 +10715,12 @@ async def aws_tables(body: dict):
             return {"tables": [], "error": str(e)}
 
     elif service in ("rds-postgres", "redshift"):
-        host     = body.get("host", "").strip()
-        port     = int(body.get("port", 5432 if service == "rds-postgres" else 5439))
-        user     = body.get("user", "").strip()
+        host = body.get("host", "").strip()
+        port = int(body.get("port", 5432 if service == "rds-postgres" else 5439))
+        user = body.get("user", "").strip()
         password = body.get("password", "")
         database = body.get("database", "").strip()
-        use_ssl  = body.get("ssl", True)
+        use_ssl = body.get("ssl", True)
 
         if service == "redshift":
             agent_key = f"{database}@{host}"
@@ -9454,12 +10731,14 @@ async def aws_tables(body: dict):
                 except RuntimeError as e:
                     return {"tables": [], "error": str(e)}
 
-        ssl_ctx  = ssl_lib.create_default_context() if use_ssl else None
+        ssl_ctx = ssl_lib.create_default_context() if use_ssl else None
         try:
             import asyncpg
+
             conn = await asyncio.wait_for(
-                asyncpg.connect(host=host, port=port, user=user,
-                    password=password, database=database, ssl=ssl_ctx, timeout=10),
+                asyncpg.connect(
+                    host=host, port=port, user=user, password=password, database=database, ssl=ssl_ctx, timeout=10
+                ),
                 timeout=12,
             )
             schema = "public" if service == "rds-postgres" else "public"
@@ -9478,9 +10757,10 @@ async def aws_tables(body: dict):
         prefix = body.get("prefix", "").strip()
         try:
             import boto3
-            s3 = boto3.client("s3", region_name=region,
-                aws_access_key_id=access_key_id,
-                aws_secret_access_key=secret_key)
+
+            s3 = boto3.client(
+                "s3", region_name=region, aws_access_key_id=access_key_id, aws_secret_access_key=secret_key
+            )
             paginator = s3.get_paginator("list_objects_v2")
             csv_files = []
             for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
@@ -9499,9 +10779,10 @@ async def aws_tables(body: dict):
     elif service == "dynamodb":
         try:
             import boto3
-            dynamo = boto3.client("dynamodb", region_name=region,
-                aws_access_key_id=access_key_id,
-                aws_secret_access_key=secret_key)
+
+            dynamo = boto3.client(
+                "dynamodb", region_name=region, aws_access_key_id=access_key_id, aws_secret_access_key=secret_key
+            )
             tables = []
             paginator = dynamo.get_paginator("list_tables")
             for page in paginator.paginate():
@@ -9511,14 +10792,15 @@ async def aws_tables(body: dict):
             return {"tables": [], "error": str(e)}
 
     elif service == "cost-explorer":
-        start_date   = body.get("costStartDate", "")
-        end_date     = body.get("costEndDate", "")
-        granularity  = body.get("costGranularity", "MONTHLY")
-        group_by     = body.get("costGroupBy", "SERVICE")
+        start_date = body.get("costStartDate", "")
+        end_date = body.get("costEndDate", "")
+        granularity = body.get("costGranularity", "MONTHLY")
+        group_by = body.get("costGroupBy", "SERVICE")
         if not start_date or not end_date:
             return {"tables": [], "error": "Start date and end date are required."}
         try:
             import boto3
+
             ce = boto3.client(
                 "ce",
                 region_name="us-east-1",
@@ -9550,26 +10832,28 @@ async def aws_tables(body: dict):
 
 @app.post("/api/aws/fetch-table")
 async def aws_fetch_table(body: dict):
-    service       = body.get("service", "rds-mysql")
-    region        = body.get("region", "us-east-1")
+    service = body.get("service", "rds-mysql")
+    region = body.get("region", "us-east-1")
     access_key_id = body.get("accessKeyId", "").strip()
-    secret_key    = body.get("secretAccessKey", "").strip()
-    table         = body.get("table", "").strip()
+    secret_key = body.get("secretAccessKey", "").strip()
+    table = body.get("table", "").strip()
     import asyncio, ssl as ssl_lib, io as _io
 
     if service == "rds-mysql":
-        host     = body.get("host", "").strip()
-        port     = int(body.get("port", 3306))
-        user     = body.get("user", "").strip()
+        host = body.get("host", "").strip()
+        port = int(body.get("port", 3306))
+        user = body.get("user", "").strip()
         password = body.get("password", "")
         database = body.get("database", "").strip()
-        use_ssl  = body.get("ssl", True)
-        ssl_ctx  = ssl_lib.create_default_context() if use_ssl else None
+        use_ssl = body.get("ssl", True)
+        ssl_ctx = ssl_lib.create_default_context() if use_ssl else None
         try:
             import aiomysql
+
             conn = await asyncio.wait_for(
-                aiomysql.connect(host=host, port=port, user=user,
-                    password=password, db=database, ssl=ssl_ctx, connect_timeout=10),
+                aiomysql.connect(
+                    host=host, port=port, user=user, password=password, db=database, ssl=ssl_ctx, connect_timeout=10
+                ),
                 timeout=12,
             )
             async with conn.cursor() as count_cur:
@@ -9585,12 +10869,12 @@ async def aws_fetch_table(body: dict):
             return {"error": str(e)}
 
     elif service in ("rds-postgres", "redshift"):
-        host     = body.get("host", "").strip()
-        port     = int(body.get("port", 5432 if service == "rds-postgres" else 5439))
-        user     = body.get("user", "").strip()
+        host = body.get("host", "").strip()
+        port = int(body.get("port", 5432 if service == "rds-postgres" else 5439))
+        user = body.get("user", "").strip()
         password = body.get("password", "")
         database = body.get("database", "").strip()
-        use_ssl  = body.get("ssl", True)
+        use_ssl = body.get("ssl", True)
 
         if service == "redshift":
             agent_key = f"{database}@{host}"
@@ -9602,16 +10886,23 @@ async def aws_fetch_table(body: dict):
                     filepath_agent = os.path.join(UPLOAD_DIR, filename_agent)
                     df_agent.to_csv(filepath_agent, index=False)
                     print(f"✅ AWS Redshift fetch-table (via tunnel): {table} — {len(df_agent)} rows")
-                    return {"rows": len(df_agent), "cols": len(df_agent.columns), "download_url": f"/api/download/{filename_agent}", "filename": filename_agent}
+                    return {
+                        "rows": len(df_agent),
+                        "cols": len(df_agent.columns),
+                        "download_url": f"/api/download/{filename_agent}",
+                        "filename": filename_agent,
+                    }
                 except RuntimeError as e:
                     return {"error": str(e)}
 
-        ssl_ctx  = ssl_lib.create_default_context() if use_ssl else None
+        ssl_ctx = ssl_lib.create_default_context() if use_ssl else None
         try:
             import asyncpg
+
             conn = await asyncio.wait_for(
-                asyncpg.connect(host=host, port=port, user=user,
-                    password=password, database=database, ssl=ssl_ctx, timeout=10),
+                asyncpg.connect(
+                    host=host, port=port, user=user, password=password, database=database, ssl=ssl_ctx, timeout=10
+                ),
                 timeout=12,
             )
             aws_total_rows = await conn.fetchval(f'SELECT COUNT(*) FROM "{table}"')
@@ -9638,9 +10929,10 @@ async def aws_fetch_table(body: dict):
         # table here is the S3 key (CSV file path)
         try:
             import boto3
-            s3 = boto3.client("s3", region_name=region,
-                aws_access_key_id=access_key_id,
-                aws_secret_access_key=secret_key)
+
+            s3 = boto3.client(
+                "s3", region_name=region, aws_access_key_id=access_key_id, aws_secret_access_key=secret_key
+            )
             response = s3.get_object(Bucket=bucket, Key=table)
             csv_bytes = response["Body"].read()
             df = pd.read_csv(_io.BytesIO(csv_bytes), nrows=50000)
@@ -9650,9 +10942,10 @@ async def aws_fetch_table(body: dict):
     elif service == "dynamodb":
         try:
             import boto3
-            dynamo = boto3.resource("dynamodb", region_name=region,
-                aws_access_key_id=access_key_id,
-                aws_secret_access_key=secret_key)
+
+            dynamo = boto3.resource(
+                "dynamodb", region_name=region, aws_access_key_id=access_key_id, aws_secret_access_key=secret_key
+            )
             dyn_table = dynamo.Table(table)
             items = []
             scan_kwargs = {"Limit": 500000}
@@ -9675,16 +10968,17 @@ async def aws_fetch_table(body: dict):
             return {"error": str(e)}
 
     elif service == "cost-explorer":
-        start_date   = body.get("costStartDate", body.get("cost_start_date", ""))
-        end_date     = body.get("costEndDate",   body.get("cost_end_date", ""))
-        granularity  = body.get("costGranularity", "MONTHLY")
-        group_by     = body.get("costGroupBy", "SERVICE")
+        start_date = body.get("costStartDate", body.get("cost_start_date", ""))
+        end_date = body.get("costEndDate", body.get("cost_end_date", ""))
+        granularity = body.get("costGranularity", "MONTHLY")
+        group_by = body.get("costGroupBy", "SERVICE")
         # `table` here is the selected group value (e.g. "Amazon EC2") — used to filter or label
         filter_group = table  # may be empty string if user picks "all"
         if not start_date or not end_date:
             return {"error": "costStartDate and costEndDate are required for Cost Explorer"}
         try:
             import boto3
+
             ce = boto3.client(
                 "ce",
                 region_name="us-east-1",
@@ -9703,21 +10997,23 @@ async def aws_fetch_table(body: dict):
                 response = ce.get_cost_and_usage(**kwargs)
                 for result in response.get("ResultsByTime", []):
                     period_start = result["TimePeriod"]["Start"]
-                    period_end   = result["TimePeriod"]["End"]
+                    period_end = result["TimePeriod"]["End"]
                     for group in result.get("Groups", []):
                         group_key = group["Keys"][0] if group.get("Keys") else "Unknown"
-                        cost  = float(group["Metrics"]["UnblendedCost"]["Amount"])
+                        cost = float(group["Metrics"]["UnblendedCost"]["Amount"])
                         usage = float(group["Metrics"]["UsageQuantity"]["Amount"])
-                        unit  = group["Metrics"]["UnblendedCost"]["Unit"]
-                        rows_ce.append({
-                            "period_start":   period_start,
-                            "period_end":     period_end,
-                            group_by.lower(): group_key,
-                            "cost_usd":       round(cost, 6),
-                            "usage_quantity": round(usage, 4),
-                            "currency":       unit,
-                            "granularity":    granularity,
-                        })
+                        unit = group["Metrics"]["UnblendedCost"]["Unit"]
+                        rows_ce.append(
+                            {
+                                "period_start": period_start,
+                                "period_end": period_end,
+                                group_by.lower(): group_key,
+                                "cost_usd": round(cost, 6),
+                                "usage_quantity": round(usage, 4),
+                                "currency": unit,
+                                "granularity": granularity,
+                            }
+                        )
                 next_token = response.get("NextPageToken")
                 if not next_token:
                     break
@@ -9752,13 +11048,13 @@ async def aws_fetch_table(body: dict):
 
 @app.post("/api/aws/write-table")
 async def aws_write_table(body: dict):
-    service       = body.get("service", "rds-mysql")
-    region        = body.get("region", "us-east-1")
+    service = body.get("service", "rds-mysql")
+    region = body.get("region", "us-east-1")
     access_key_id = body.get("accessKeyId", "").strip()
-    secret_key    = body.get("secretAccessKey", "").strip()
-    table         = body.get("table", "").strip()
-    csv_data      = body.get("csvData", "")
-    mode          = body.get("mode", "replace")
+    secret_key = body.get("secretAccessKey", "").strip()
+    table = body.get("table", "").strip()
+    csv_data = body.get("csvData", "")
+    mode = body.get("mode", "replace")
     import asyncio, ssl as ssl_lib, io as _io
 
     if not csv_data:
@@ -9773,18 +11069,20 @@ async def aws_write_table(body: dict):
         return rl
 
     if service == "rds-mysql":
-        host     = body.get("host", "").strip()
-        port     = int(body.get("port", 3306))
-        user     = body.get("user", "").strip()
+        host = body.get("host", "").strip()
+        port = int(body.get("port", 3306))
+        user = body.get("user", "").strip()
         password = body.get("password", "")
         database = body.get("database", "").strip()
-        use_ssl  = body.get("ssl", True)
-        ssl_ctx  = ssl_lib.create_default_context() if use_ssl else None
+        use_ssl = body.get("ssl", True)
+        ssl_ctx = ssl_lib.create_default_context() if use_ssl else None
         try:
             import aiomysql
+
             conn = await asyncio.wait_for(
-                aiomysql.connect(host=host, port=port, user=user,
-                    password=password, db=database, ssl=ssl_ctx, connect_timeout=10),
+                aiomysql.connect(
+                    host=host, port=port, user=user, password=password, db=database, ssl=ssl_ctx, connect_timeout=10
+                ),
                 timeout=12,
             )
             async with conn.cursor() as cur:
@@ -9792,7 +11090,7 @@ async def aws_write_table(body: dict):
                     await cur.execute(f"DROP TABLE IF EXISTS `{table}`")
                 col_defs = []
                 for col in df.columns:
-                    safe = col.replace('`', '')[:64]
+                    safe = col.replace("`", "")[:64]
                     if pd.api.types.is_integer_dtype(df[col]):
                         col_defs.append(f"`{safe}` BIGINT")
                     elif pd.api.types.is_float_dtype(df[col]):
@@ -9814,23 +11112,25 @@ async def aws_write_table(body: dict):
             return {"success": False, "error": str(e)}
 
     elif service in ("rds-postgres", "redshift"):
-        host     = body.get("host", "").strip()
-        port     = int(body.get("port", 5432 if service == "rds-postgres" else 5439))
-        user     = body.get("user", "").strip()
+        host = body.get("host", "").strip()
+        port = int(body.get("port", 5432 if service == "rds-postgres" else 5439))
+        user = body.get("user", "").strip()
         password = body.get("password", "")
         database = body.get("database", "").strip()
-        use_ssl  = body.get("ssl", True)
-        ssl_ctx  = ssl_lib.create_default_context() if use_ssl else None
+        use_ssl = body.get("ssl", True)
+        ssl_ctx = ssl_lib.create_default_context() if use_ssl else None
         try:
             import asyncpg
+
             conn = await asyncio.wait_for(
-                asyncpg.connect(host=host, port=port, user=user,
-                    password=password, database=database, ssl=ssl_ctx, timeout=10),
+                asyncpg.connect(
+                    host=host, port=port, user=user, password=password, database=database, ssl=ssl_ctx, timeout=10
+                ),
                 timeout=12,
             )
             col_defs = []
             for col in df.columns:
-                safe = col.replace('"', '')[:63]
+                safe = col.replace('"', "")[:63]
                 if pd.api.types.is_integer_dtype(df[col]):
                     col_defs.append(f'"{safe}" BIGINT')
                 elif pd.api.types.is_float_dtype(df[col]):
@@ -9855,12 +11155,13 @@ async def aws_write_table(body: dict):
 
     elif service == "s3":
         bucket = body.get("bucket", "").strip()
-        key    = table  # table is the S3 key/path
+        key = table  # table is the S3 key/path
         try:
             import boto3
-            s3 = boto3.client("s3", region_name=region,
-                aws_access_key_id=access_key_id,
-                aws_secret_access_key=secret_key)
+
+            s3 = boto3.client(
+                "s3", region_name=region, aws_access_key_id=access_key_id, aws_secret_access_key=secret_key
+            )
             if mode == "append":
                 try:
                     existing = s3.get_object(Bucket=bucket, Key=key)
@@ -9882,15 +11183,16 @@ async def aws_write_table(body: dict):
         try:
             import boto3
             from decimal import Decimal
-            dynamo = boto3.resource("dynamodb", region_name=region,
-                aws_access_key_id=access_key_id,
-                aws_secret_access_key=secret_key)
+
+            dynamo = boto3.resource(
+                "dynamodb", region_name=region, aws_access_key_id=access_key_id, aws_secret_access_key=secret_key
+            )
             dyn_table = dynamo.Table(table)
             if mode == "replace":
                 # Scan and delete all items (best-effort for small tables)
-                scan = dyn_table.scan(ProjectionExpression=",".join(
-                    [attr["AttributeName"] for attr in dyn_table.key_schema]
-                ))
+                scan = dyn_table.scan(
+                    ProjectionExpression=",".join([attr["AttributeName"] for attr in dyn_table.key_schema])
+                )
                 with dyn_table.batch_writer() as batch:
                     for item in scan.get("Items", []):
                         batch.delete_item(Key=item)
@@ -9913,6 +11215,7 @@ async def aws_write_table(body: dict):
         return {"success": False, "error": "AWS Cost Explorer is read-only. Write-back is not supported."}
 
     return {"success": False, "error": f"Unknown service: {service}"}
+
 
 @app.post("/api/write-to-source")
 async def write_to_source(
@@ -9953,9 +11256,13 @@ async def write_to_source(
     target: str = Form(""),
 ):
     import io as _io
+
     if not _is_paid(await _plan_from_request(request)) and (connection_id or source_type != "sheets"):
-        return _upgrade_response("write_back", "Sending cleaned data back to databases and cloud destinations is part "
-                                 "of the paid plans. Downloading it, or writing back to a Google Sheet, stays free.")
+        return _upgrade_response(
+            "write_back",
+            "Sending cleaned data back to databases and cloud destinations is part "
+            "of the paid plans. Downloading it, or writing back to a Google Sheet, stays free.",
+        )
     contents = await file.read()
     csv_text = contents.decode("utf-8", errors="replace")
 
@@ -9980,9 +11287,15 @@ async def write_to_source(
         try:
             _df = pd.read_csv(io.BytesIO(contents))
             _res = await _write_destination_df(_c["type"], _cfg, _c.get("credentials", {}), _df, "replace")
-            await log_audit(ctx["userId"], "destination.write", "connection", connection_id,
-                            metadata={"target": target, "rows": len(_df), "via": "analysis_save_to_source"},
-                            resource_name=_c.get("name", ""), severity="warning")
+            await log_audit(
+                ctx["userId"],
+                "destination.write",
+                "connection",
+                connection_id,
+                metadata={"target": target, "rows": len(_df), "via": "analysis_save_to_source"},
+                resource_name=_c.get("name", ""),
+                severity="warning",
+            )
             return {"success": True, "rows_written": _res.get("rows_written", len(_df))}
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -10029,52 +11342,84 @@ async def write_to_source(
             return {"success": False, "error": str(e)}
 
     elif source_type in ("mysql", "cloudsql"):
-        result = await mysql_write_table({
-            "host": mysql_host, "port": mysql_port, "user": mysql_user,
-            "password": mysql_password, "database": mysql_database,
-            "ssl": mysql_ssl == "true", "table": mysql_table,
-            "csvData": csv_text, "mode": "replace",
-        })
+        result = await mysql_write_table(
+            {
+                "host": mysql_host,
+                "port": mysql_port,
+                "user": mysql_user,
+                "password": mysql_password,
+                "database": mysql_database,
+                "ssl": mysql_ssl == "true",
+                "table": mysql_table,
+                "csvData": csv_text,
+                "mode": "replace",
+            }
+        )
         return result
 
     elif source_type == "postgres":
-        result = await postgres_write_table({
-            "host": mysql_host, "port": mysql_port, "user": mysql_user,
-            "password": mysql_password, "database": mysql_database,
-            "ssl": mysql_ssl == "true", "table": mysql_table,
-            "csvData": csv_text, "mode": "replace",
-        })
+        result = await postgres_write_table(
+            {
+                "host": mysql_host,
+                "port": mysql_port,
+                "user": mysql_user,
+                "password": mysql_password,
+                "database": mysql_database,
+                "ssl": mysql_ssl == "true",
+                "table": mysql_table,
+                "csvData": csv_text,
+                "mode": "replace",
+            }
+        )
         return result
 
     elif source_type == "bigquery":
-        result = await bigquery_write_table({
-            "key_json": bq_key_json, "project": bq_project,
-            "dataset": bq_dataset, "table": bq_table,
-            "csvData": csv_text, "mode": "replace",
-        })
+        result = await bigquery_write_table(
+            {
+                "key_json": bq_key_json,
+                "project": bq_project,
+                "dataset": bq_dataset,
+                "table": bq_table,
+                "csvData": csv_text,
+                "mode": "replace",
+            }
+        )
         return result
 
     elif source_type == "mongodb":
-        result = await mongo_write_collection({
-            "uri": mongo_uri, "database": mongo_database,
-            "collection": mongo_collection,
-            "csvData": csv_text, "mode": "replace",
-        })
+        result = await mongo_write_collection(
+            {
+                "uri": mongo_uri,
+                "database": mongo_database,
+                "collection": mongo_collection,
+                "csvData": csv_text,
+                "mode": "replace",
+            }
+        )
         return result
 
     elif source_type == "aws":
-        result = await aws_write_table({
-            "service": aws_service, "region": aws_region,
-            "accessKeyId": aws_access_key_id,
-            "secretAccessKey": aws_secret_access_key,
-            "bucket": aws_bucket, "host": aws_host,
-            "port": aws_port, "user": aws_user,
-            "password": aws_password, "database": aws_database,
-            "table": aws_table, "csvData": csv_text, "mode": "replace",
-        })
+        result = await aws_write_table(
+            {
+                "service": aws_service,
+                "region": aws_region,
+                "accessKeyId": aws_access_key_id,
+                "secretAccessKey": aws_secret_access_key,
+                "bucket": aws_bucket,
+                "host": aws_host,
+                "port": aws_port,
+                "user": aws_user,
+                "password": aws_password,
+                "database": aws_database,
+                "table": aws_table,
+                "csvData": csv_text,
+                "mode": "replace",
+            }
+        )
         return result
 
     return {"success": False, "error": f"Unsupported source type: {source_type}"}
+
 
 @app.post("/api/update-gsheet")
 async def update_gsheet(request: Request, body: dict):
@@ -10084,9 +11429,9 @@ async def update_gsheet(request: Request, body: dict):
     _sid, _own = await _owned_google_session(request, ctx, body.get("sessionId", ""))
     if "access_token" not in _own:
         return {"error": "Not authenticated"}
-    sheet_id   = body.get("sheetId", "")
+    sheet_id = body.get("sheetId", "")
     sheet_name = body.get("sheetName", "")
-    csv_data   = body.get("csvData", "")
+    csv_data = body.get("csvData", "")
     session_id = _sid
     tokens = await _get_session_tokens(session_id) if session_id else {}
     if "access_token" not in tokens:
@@ -10115,11 +11460,15 @@ async def update_gsheet(request: Request, body: dict):
         # ── Resolve sheet ID from name if not provided
         if not sheet_id:
             drive = build("drive", "v3", credentials=creds)
-            results = drive.files().list(
-                q=f"name='{sheet_name}' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
-                fields="files(id, name)",
-                pageSize=1,
-            ).execute()
+            results = (
+                drive.files()
+                .list(
+                    q=f"name='{sheet_name}' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
+                    fields="files(id, name)",
+                    pageSize=1,
+                )
+                .execute()
+            )
             files = results.get("files", [])
             if not files:
                 return {"error": f"Sheet '{sheet_name}' not found in Drive"}
@@ -10144,7 +11493,7 @@ async def update_gsheet(request: Request, body: dict):
 
         # ── Use batchUpdate (single API call) instead of clear+update ─────
         # This halves the quota usage per write
-# Get the first tab name dynamically so it works on any sheet
+        # Get the first tab name dynamically so it works on any sheet
         first_tab = "Sheet1"
 
         # First clear the sheet, then write fresh data
