@@ -11,6 +11,8 @@ import re
 
 import pdfplumber
 
+from pdf_open import open_pdf
+
 MAX_PAGES = 60
 MAX_TABLES = 12
 MAX_ROWS = 20000
@@ -120,12 +122,10 @@ def _page_tables(page) -> list[list[list[str]]]:
     return [rows] if _good(rows) else []
 
 
-def extract_tables(data: bytes, max_pages: int = MAX_PAGES) -> dict:
-    try:
-        pdf = pdfplumber.open(io.BytesIO(data))
-    except Exception as e:
-        return {"ok": False, "code": "unreadable", "error": f"This PDF could not be opened ({type(e).__name__}). "
-                                                              "If it is password-protected, remove the password first."}
+def extract_tables(data: bytes, max_pages: int = MAX_PAGES, password: str | None = None) -> dict:
+    pdf, err = open_pdf(data, password)
+    if err:
+        return err
     with pdf:
         n_pages = len(pdf.pages)
         if n_pages == 0:
