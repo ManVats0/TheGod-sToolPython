@@ -28,6 +28,8 @@ from decimal import Decimal, InvalidOperation
 
 import pdfplumber
 
+from pdf_open import open_pdf
+
 MAX_PAGES = 60
 CENT = Decimal("0.005")
 
@@ -710,12 +712,11 @@ def _fmt(d: Decimal | None) -> str | None:
     return None if d is None else f"{d:.2f}"
 
 
-def extract_statement(data: bytes, date_order: str | None = None, with_images: bool = True) -> dict:
-    try:
-        pdf = pdfplumber.open(io.BytesIO(data))
-    except Exception as e:  # corrupt / encrypted
-        return {"ok": False, "code": "unreadable", "error": f"This PDF could not be opened ({type(e).__name__}). "
-                                                              "If it is password-protected, remove the password first."}
+def extract_statement(data: bytes, date_order: str | None = None, with_images: bool = True,
+                      password: str | None = None) -> dict:
+    pdf, err = open_pdf(data, password)
+    if err:
+        return err
     with pdf:
         if len(pdf.pages) == 0:
             return {"ok": False, "code": "unreadable", "error": "This PDF has no pages."}

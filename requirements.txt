@@ -52,3 +52,4 @@ PyJWT
 motor
 cryptography
 pdfplumber
+openpyxl

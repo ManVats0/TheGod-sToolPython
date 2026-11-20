@@ -1207,7 +1207,7 @@ async def create_connection(request: Request, body: dict):
 
 # ── PDF bank statement -> checked table (paid plans; no AI is used, so nothing leaves this server) ─────────
 @app.post("/api/pdf/extract")
-async def pdf_extract(request: Request, file: UploadFile = File(...), date_order: str = Form("")):
+async def pdf_extract(request: Request, file: UploadFile = File(...), date_order: str = Form(""), password: str = Form("")):
     ctx, err = await _auth(request)
     if err:
         return err
@@ -1222,13 +1222,13 @@ async def pdf_extract(request: Request, file: UploadFile = File(...), date_order
     from starlette.concurrency import run_in_threadpool
     import pdf_statement
     try:
-        return await run_in_threadpool(pdf_statement.extract_statement, data, order or None)
+        return await run_in_threadpool(pdf_statement.extract_statement, data, order or None, True, password or None)
     except Exception as e:  # never leak a stack trace; the file itself is not stored anywhere
         print(f"⚠ pdf_extract failed: {type(e).__name__}: {e}")
         return JSONResponse(status_code=500, content={"error": "This PDF could not be read. Try the original PDF from your bank."})
 
 @app.post("/api/pdf/tables")
-async def pdf_tables(request: Request, file: UploadFile = File(...)):
+async def pdf_tables(request: Request, file: UploadFile = File(...), password: str = Form("")):
     """Any text-based PDF -> the tables in it, as plain rows. Same plan gate as the other /api/pdf routes."""
     ctx, err = await _auth(request)
     if err:
@@ -1241,10 +1241,29 @@ async def pdf_tables(request: Request, file: UploadFile = File(...)):
     from starlette.concurrency import run_in_threadpool
     import pdf_tables
     try:
-        return await run_in_threadpool(pdf_tables.extract_tables, data)
+        return await run_in_threadpool(pdf_tables.extract_tables, data, password=password or None)
     except Exception as e:
         print(f"⚠ pdf_tables failed: {type(e).__name__}: {e}")
         return JSONResponse(status_code=500, content={"error": "This PDF could not be read. Try the original PDF, not a scan."})
+
+@app.post("/api/pdf/xlsx")
+async def pdf_xlsx(request: Request):
+    """Turn the rows shown on screen into a formatted Excel file. Nothing is stored. Same plan gate as /api/pdf/."""
+    ctx, err = await _auth(request)
+    if err:
+        return err
+    try:
+        body = await request.json()
+        columns, rows = body["columns"], body["rows"]
+        if not isinstance(columns, list) or not isinstance(rows, list):
+            raise ValueError
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Send the columns and rows to put in the file."})
+    from starlette.concurrency import run_in_threadpool
+    import export_xlsx
+    data = await run_in_threadpool(export_xlsx.build_workbook, columns, rows, str(body.get("sheet", "Data")))
+    return Response(content=data, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": 'attachment; filename="export.xlsx"'})
 
 # ── Free try: one small PDF or CSV, no account. Limits live in free_try.py ──────────────────────────────────
 _free_try_slots = asyncio.Semaphore(2)
